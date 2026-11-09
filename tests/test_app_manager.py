@@ -349,6 +349,58 @@ class AppManagerTests(unittest.TestCase):
 
 
 class InfrastructureConfigurationTests(unittest.TestCase):
+    def test_cockpit_manifest_registers_menu_entry_and_installed_assets(self):
+        project = Path(__file__).resolve().parent.parent
+        cockpit_dir = project / "cockpit"
+        manifest_path = cockpit_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        menu_entry = manifest["menu"]["app-manager"]
+        html_path = cockpit_dir / menu_entry["path"]
+        html = html_path.read_text(encoding="utf-8")
+        installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
+
+        self.assertEqual(manifest["name"], "app-manager")
+        self.assertEqual(menu_entry["label"], "App Manager")
+        self.assertEqual(menu_entry["path"], "index.html")
+        self.assertEqual(menu_entry["order"], 60)
+        self.assertTrue(html_path.is_file())
+        self.assertTrue((cockpit_dir / "app-manager.css").is_file())
+        self.assertTrue((cockpit_dir / "app-manager.js").is_file())
+        self.assertIn('<script src="app-manager.js" defer></script>', html)
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/manifest.json" "$PLUGIN_DEST/manifest.json"',
+            installer,
+        )
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/index.html" "$PLUGIN_DEST/index.html"',
+            installer,
+        )
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.css" "$PLUGIN_DEST/app-manager.css"',
+            installer,
+        )
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.js" "$PLUGIN_DEST/app-manager.js"',
+            installer,
+        )
+        self.assertIn('<link rel="stylesheet" href="app-manager.css">', html)
+        frontend = (cockpit_dir / "app-manager.js").read_text(encoding="utf-8")
+        self.assertIn("cockpit.spawn([BACKEND, command, ...args]", frontend)
+        self.assertIn('const BACKEND = "/usr/libexec/cockpit/app-manager/app-manager";', frontend)
+        for action in ("deploy", "pull", "edit", "health", "restart", "stop", "start", "logs", "remove", "rollback"):
+            self.assertIn(f'data-action="{action}"', frontend)
+        for endpoint in (
+            'callBackend("add", [JSON.stringify(payload)])',
+            'callBackend("edit", [app.id, JSON.stringify(payload)])',
+            'callBackend("logs", [appId, "--lines", "200"])',
+            'callBackend("health", [appId])',
+            'callBackend("rollback", [appId, releaseId])',
+            'callBackend("remove", [appId])',
+            '() => callBackend(action, [appId])',
+        ):
+            self.assertIn(endpoint, frontend)
+        self.assertIn('target="_blank" rel="noopener noreferrer"', frontend)
+
     def test_generated_service_has_no_network_capability_and_is_hardened(self):
         config = manager._default_config()
         config["production_root"] = "/opt/webapps"
@@ -630,14 +682,9 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             'BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"',
             uninstaller,
         )
-        self.assertIn(
-            'cockpit.spawn(["/usr/libexec/cockpit/app-manager/app-manager"',
-            cockpit_page,
-        )
-        self.assertNotIn(
-            'cockpit.spawn(["/usr/libexec/cockpit/app-manager",',
-            cockpit_page,
-        )
+        frontend = (project / "cockpit" / "app-manager.js").read_text(encoding="utf-8")
+        self.assertIn('const BACKEND = "/usr/libexec/cockpit/app-manager/app-manager";', frontend)
+        self.assertNotIn("/usr/libexec/cockpit/app-manager\", command", frontend)
         self.assertIn(
             'remove_owned_file "${BACKEND_DEST}/app-manager" \'APP_NAME = "app-manager"\'',
             uninstaller,
@@ -654,7 +701,9 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('"$STATE_ROOT/apps.json" "$STATE_ROOT/config.json"', installer)
         self.assertIn('chmod 0600 "$STATE_ROOT/apps.json" "$STATE_ROOT/config.json"', installer)
         self.assertIn('if [[ ! -e "$STATE_ROOT/config.json" ]]', installer)
-        self.assertIn('superuser: "require"', cockpit_page)
+        frontend = (project / "cockpit" / "app-manager.js").read_text(encoding="utf-8")
+        self.assertIn('superuser: "require"', frontend)
+        self.assertIn('config.command_timeout_seconds ?? 30', frontend)
 
     def test_standalone_frontend_assets_are_referenced_and_installed(self):
         project = Path(__file__).resolve().parent.parent
@@ -666,7 +715,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
 
         self.assertTrue(stylesheet_path.is_file())
         self.assertIn('<link rel="stylesheet" href="app-manager.css">', cockpit_page)
-        self.assertIn('<script src="app-manager.js"></script>', cockpit_page)
+        self.assertIn('<script src="app-manager.js" defer></script>', cockpit_page)
         self.assertNotIn("/cockpit/static/desktop.css", cockpit_page)
         self.assertNotIn("<style", cockpit_page)
         self.assertTrue((cockpit_dir / "app-manager.js").is_file())

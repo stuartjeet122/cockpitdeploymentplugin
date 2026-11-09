@@ -249,6 +249,156 @@
   display: none !important;
 }
 
+.am-app-manager .am-notice,
+.am-app-manager .am-error {
+  margin-bottom: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--am-border);
+  border-radius: var(--am-radius);
+  background: var(--am-surface);
+}
+
+.am-app-manager .am-notice {
+  border-left: 4px solid #3e8635;
+}
+
+.am-app-manager .am-error {
+  border-left: 4px solid #c9190b;
+  color: #8f1308;
+}
+
+.am-app-manager .am-button-link {
+  display: inline-block;
+  margin: 0 0.375rem 0.375rem 0;
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--am-border);
+  border-radius: var(--am-radius);
+  background: var(--am-surface);
+  color: var(--am-text);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.am-app-manager .am-button-link:hover {
+  border-color: var(--am-accent);
+  text-decoration: underline;
+}
+
+.am-dialog {
+  width: min(52rem, calc(100vw - 2rem));
+  max-width: 52rem;
+  max-height: min(90vh, 60rem);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--pf-v5-global--BorderColor--100, #d2d2d2);
+  border-radius: 0.625rem;
+  background: var(--pf-v5-global--BackgroundColor--100, #fff);
+  color: var(--pf-v5-global--Color--100, #151515);
+  box-shadow: 0 1rem 3rem rgb(0 0 0 / 28%);
+}
+
+.am-dialog::backdrop {
+  background: rgb(0 0 0 / 56%);
+}
+
+.am-dialog-form {
+  display: grid;
+  max-height: inherit;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.am-dialog-header,
+.am-dialog-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 1rem 1.25rem;
+}
+
+.am-dialog-header {
+  border-bottom: 1px solid var(--pf-v5-global--BorderColor--100, #d2d2d2);
+}
+
+.am-dialog-header h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.am-dialog-body {
+  padding: 1.25rem;
+  overflow: auto;
+}
+
+.am-dialog-footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--pf-v5-global--BorderColor--100, #d2d2d2);
+}
+
+.am-dialog button,
+.am-dialog input,
+.am-dialog select,
+.am-dialog textarea {
+  font: inherit;
+}
+
+.am-dialog button {
+  min-height: 2.5rem;
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--pf-v5-global--BorderColor--100, #d2d2d2);
+  border-radius: 0.5rem;
+  background: var(--pf-v5-global--BackgroundColor--100, #fff);
+  color: inherit;
+  cursor: pointer;
+}
+
+.am-dialog button.pf-m-primary {
+  border-color: #0066cc;
+  background: #0066cc;
+  color: #fff;
+}
+
+.am-dialog .am-dialog-close {
+  min-width: 2.5rem;
+  padding: 0.25rem;
+  font-size: 1.5rem;
+}
+
+.am-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.am-form-grid label {
+  display: block;
+  font-weight: 600;
+}
+
+.am-form-grid input,
+.am-form-grid select,
+.am-form-grid textarea {
+  display: block;
+  width: 100%;
+  margin-top: 0.375rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--pf-v5-global--BorderColor--100, #d2d2d2);
+  border-radius: 0.375rem;
+  background: var(--pf-v5-global--BackgroundColor--100, #fff);
+  color: inherit;
+}
+
+.am-form-grid label:nth-last-child(-n + 2) {
+  grid-column: 1 / -1;
+}
+
+.am-log-output {
+  max-height: 60vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 @media (prefers-color-scheme: dark) {
   .am-app-manager {
     --am-background: #15191e;
@@ -371,6 +521,27 @@
   --am-status-text: #92400e;
 }
 
+.pf-v5-theme-dark .am-dialog,
+[data-theme="dark"] .am-dialog {
+  border-color: #454b52;
+  background: #20252b;
+  color: #f0f0f0;
+  color-scheme: dark;
+}
+
+.pf-v5-theme-dark .am-dialog button,
+[data-theme="dark"] .am-dialog button,
+.pf-v5-theme-dark .am-form-grid input,
+.pf-v5-theme-dark .am-form-grid select,
+.pf-v5-theme-dark .am-form-grid textarea,
+[data-theme="dark"] .am-form-grid input,
+[data-theme="dark"] .am-form-grid select,
+[data-theme="dark"] .am-form-grid textarea {
+  border-color: #454b52;
+  background: #20252b;
+  color: #f0f0f0;
+}
+
 @media (max-width: 700px) {
   .am-app-manager {
     padding: 1rem;
@@ -383,6 +554,14 @@
   .am-app-manager .row {
     grid-template-columns: minmax(0, 1fr);
     gap: 0.75rem;
+  }
+
+  .am-form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .am-form-grid label:nth-last-child(-n + 2) {
+    grid-column: auto;
   }
 }
 

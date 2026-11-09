@@ -2,6 +2,8 @@
 
 App Manager is a Cockpit navigation plugin with a Python command-line backend for registering and operating multiple web applications on an Ubuntu host.
 
+The Cockpit interface provides application registration and editing, deployment and repository updates, service controls, health checks, logs, deployment history with per-release rollback, and deployment settings. Removing an application unregisters it and stops its service; source and release files are retained.
+
 ## Installation
 
 Review `config/defaults.json`, then install from the project directory:

@@ -5,7 +5,10 @@
     "cockpit": "318"
   },
   "menu": {
-    "label": "App Manager",
-    "path": "/app-manager"
+    "app-manager": {
+      "label": "App Manager",
+      "path": "index.html",
+      "order": 60
+    }
   }
 }
