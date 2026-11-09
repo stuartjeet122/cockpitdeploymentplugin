@@ -18,7 +18,11 @@
   })[character]);
 
   async function callBackend(command, args = []) {
-    const output = await cockpit.spawn([BACKEND, command, ...args], { superuser: "require" });
+    const cockpitApi = globalThis.cockpit;
+    if (!cockpitApi || typeof cockpitApi.spawn !== "function") {
+      throw new Error("Cockpit API is unavailable. Open App Manager inside Cockpit and verify that /cockpit/cockpit.js loaded.");
+    }
+    const output = await cockpitApi.spawn([BACKEND, command, ...args], { superuser: "require" });
     let result;
     try {
       result = JSON.parse(output);
@@ -42,8 +46,23 @@
 
   function showError(error) {
     const message = error?.message || String(error);
-    byId("appManagerError").textContent = message;
-    byId("appManagerError").classList.remove("hidden");
+    const dialog = byId("appManagerDialog");
+    if (dialog.open) {
+      let dialogError = dialog.querySelector(".am-dialog-error");
+      if (!dialogError) {
+        dialogError = document.createElement("div");
+        dialogError.className = "am-error am-dialog-error";
+        dialogError.setAttribute("role", "alert");
+        dialogError.setAttribute("aria-live", "assertive");
+        dialogError.tabIndex = -1;
+        dialog.querySelector(".am-dialog-body").prepend(dialogError);
+      }
+      dialogError.textContent = message;
+      dialogError.focus();
+    } else {
+      byId("appManagerError").textContent = message;
+      byId("appManagerError").classList.remove("hidden");
+    }
     byId("appManagerNotice").classList.add("hidden");
     updateConnection("error", "Action needs attention");
   }
@@ -56,7 +75,7 @@
 
   function setBusy(busy) {
     state.busy = busy;
-    document.querySelectorAll(".am-app-manager button, .am-app-manager input, .am-app-manager select, .am-app-manager textarea")
+    document.querySelectorAll(".am-app-manager button, .am-app-manager input, .am-app-manager select, .am-app-manager textarea, .am-dialog button, .am-dialog input, .am-dialog select, .am-dialog textarea")
       .forEach((control) => {
         control.disabled = busy;
       });
@@ -143,7 +162,7 @@
           <span class="am-empty-state__icon" aria-hidden="true">+</span>
           <h3>No applications yet</h3>
           <p>Connect a Git repository to create your first managed application.</p>
-          <button type="button" class="am-button am-button--primary" data-tab-target="add-app">Add your first application</button>
+          <button type="button" class="am-button am-button--primary" data-open-add>Add your first application</button>
         </div>
       `;
       return;
@@ -307,8 +326,9 @@
     }
   }
 
-  function openDialog(title, body, submitLabel, onSubmit) {
+  function openDialog(title, body, submitLabel, onSubmit, onSuccess) {
     const dialog = byId("appManagerDialog");
+    byId("appManagerError").classList.add("hidden");
     const submit = submitLabel
       ? `<button type="submit" class="pf-m-primary">${escapeHtml(submitLabel)}</button>`
       : "";
@@ -337,6 +357,7 @@
           return;
         }
         dialog.close();
+        if (typeof onSuccess === "function") onSuccess();
       } catch (error) {
         showError(error);
         submitButton.disabled = false;
@@ -346,6 +367,8 @@
       button.addEventListener("click", () => dialog.close());
     });
     dialog.showModal();
+    const firstInput = dialog.querySelector("input, select, textarea");
+    if (firstInput) firstInput.focus();
   }
 
   function parseBuildConfig(value) {
@@ -362,21 +385,36 @@
     return parsed;
   }
 
-  function bindAddForm() {
-    byId("addAppForm").addEventListener("submit", (event) => {
-      event.preventDefault();
-      const form = event.currentTarget;
+  function suggestSlug(value) {
+    return value.trim().toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 24)
+      .replace(/-$/g, "") || "app";
+  }
+
+  function openAddApplicationDialog() {
+    const body = byId("addAppFormTemplate").innerHTML;
+    openDialog("Add an application", body, "Add application", async (form) => {
       const payload = Object.fromEntries(new FormData(form).entries());
-      try {
-        payload.build_config = parseBuildConfig(payload.build_config || "");
-      } catch (error) {
-        showError(error);
-        return;
-      }
-      void runOperation(async () => {
+      payload.build_config = parseBuildConfig(payload.build_config || "");
+      return runOperation(async () => {
         await callBackend("add", [JSON.stringify(payload)]);
-        form.reset();
-      }, "Application registered. Deploy it from the Websites tab to build and start it.");
+      }, "Application added. Select Deploy on its card to build and start it.");
+    }, () => byId("tab-websites").click());
+
+    const form = byId("appManagerDialog").querySelector("form");
+    const nameInput = form.elements.namedItem("name");
+    const slugInput = form.elements.namedItem("slug");
+    slugInput.dataset.autogenerated = "true";
+    nameInput.addEventListener("input", () => {
+      if (slugInput.dataset.autogenerated === "true") {
+        slugInput.value = suggestSlug(nameInput.value);
+      }
+    });
+    slugInput.addEventListener("input", () => {
+      slugInput.dataset.autogenerated = "false";
     });
   }
 
@@ -512,11 +550,9 @@
   }
 
   document.querySelector(".am-app-manager").addEventListener("click", (event) => {
-    const target = event.target instanceof Element ? event.target.closest("[data-tab-target]") : null;
+    const target = event.target instanceof Element ? event.target.closest("[data-open-add]") : null;
     if (!target || state.busy) return;
-    const tab = Array.from(document.querySelectorAll('.am-app-manager [role="tab"][data-tab]'))
-      .find((item) => item.dataset.tab === target.dataset.tabTarget);
-    if (tab) tab.click();
+    openAddApplicationDialog();
   });
   byId("refreshButton").addEventListener("click", () => {
     void runOperation(refreshData, "Application data refreshed.", false);
@@ -533,6 +569,10 @@
     if (event.target === event.currentTarget) event.currentTarget.close();
   });
   bindTabs();
-  bindAddForm();
-  void runOperation(refreshData, "", false);
+  if (globalThis.cockpit && typeof globalThis.cockpit.spawn === "function") {
+    void runOperation(refreshData, "", false);
+  } else {
+    setBusy(false);
+    showError(new Error("Cockpit API is unavailable. Open App Manager inside Cockpit and verify that /cockpit/cockpit.js loaded."));
+  }
 })();

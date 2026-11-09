@@ -34,7 +34,7 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-3M4 4v4h4m-4 5a8 8 0 0 0 14.9 3M20 20v-4h-4" /></svg>
             <span>Refresh</span>
           </button>
-          <button class="am-button am-button--primary" type="button" data-tab-target="add-app">
+          <button class="am-button am-button--primary" type="button" data-open-add>
             <span aria-hidden="true">+</span>
             Add application
           </button>
@@ -47,7 +47,6 @@
       <nav class="am-tabs" role="tablist" aria-label="App Manager sections">
         <button id="tab-overview" class="am-tab tab active" type="button" role="tab" aria-selected="true" aria-controls="overview" tabindex="0" data-tab="overview">Overview</button>
         <button id="tab-websites" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="websites" tabindex="-1" data-tab="websites">Applications</button>
-        <button id="tab-add-app" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="add-app" tabindex="-1" data-tab="add-app">Add application</button>
         <button id="tab-deployments" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="deployments" tabindex="-1" data-tab="deployments">Deployments</button>
         <button id="tab-settings" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="settings" tabindex="-1" data-tab="settings">Settings</button>
       </nav>
@@ -79,75 +78,9 @@
             <h2>Applications</h2>
             <p class="am-section-copy">Deploy releases, check health, and control each service.</p>
           </div>
-          <button class="am-button am-button--primary" type="button" data-tab-target="add-app">Add application</button>
+          <button class="am-button am-button--primary" type="button" data-open-add>Add application</button>
         </div>
         <div id="appsTableContainer" class="am-app-grid"></div>
-      </section>
-
-      <section id="add-app" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-add-app" tabindex="0">
-        <div class="am-section-heading">
-          <div>
-            <p class="am-eyebrow">GET STARTED</p>
-            <h2>Add an application</h2>
-            <p class="am-section-copy">Connect a Git repository. App Manager can detect the framework for you.</p>
-          </div>
-        </div>
-        <form id="addAppForm" class="am-form am-surface">
-          <div class="am-form-section">
-            <h3>Project details</h3>
-            <p>Choose a memorable name and a path-safe slug for the application.</p>
-            <div class="am-form-grid">
-              <div>
-                <label for="appName">Website name</label>
-                <input id="appName" required name="name" autocomplete="organization" placeholder="My application" />
-              </div>
-              <div>
-                <label for="appSlug">Application slug</label>
-                <input id="appSlug" required name="slug" autocomplete="off" placeholder="my-application" />
-                <small class="am-field-hint">Used in the application URL path.</small>
-              </div>
-              <div class="am-form-grid__wide">
-                <label for="appRepo">Git repository URL</label>
-                <input id="appRepo" required name="repo_url" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://github.com/owner/project.git or git@github.com:owner/project.git" />
-                <small class="am-field-hint">Use an HTTPS or SSH remote. SSH keys must already be configured on the host.</small>
-              </div>
-              <div>
-                <label for="appBranch">Production branch</label>
-                <input id="appBranch" name="branch" value="main" autocomplete="off" />
-              </div>
-              <div>
-                <label for="appFramework">Framework</label>
-                <select id="appFramework" name="framework">
-                  <option value="auto">Auto detect</option>
-                  <option value="nextjs">Next.js</option>
-                  <option value="go">Go</option>
-                  <option value="node">Node.js</option>
-                  <option value="python">Python</option>
-                  <option value="static">Static</option>
-                </select>
-              </div>
-              <div>
-                <label for="appHealthCheck">Health-check path</label>
-                <input id="appHealthCheck" name="health_check_url" placeholder="/health" />
-              </div>
-              <div>
-                <label for="appDescription">Description <span class="am-optional">Optional</span></label>
-                <input id="appDescription" name="description" placeholder="What does this application do?" />
-              </div>
-            </div>
-          </div>
-          <details class="am-advanced">
-            <summary>Advanced build configuration</summary>
-            <div>
-              <label for="appBuildConfig">Build configuration <span class="am-optional">JSON object</span></label>
-              <textarea id="appBuildConfig" name="build_config" rows="5" spellcheck="false" placeholder='{"build_command": "npm run build"}'></textarea>
-              <small class="am-field-hint">Leave blank to use the framework defaults. Add a start command only when automatic detection is not suitable.</small>
-            </div>
-          </details>
-          <div class="am-form-actions">
-            <button type="submit" class="am-button am-button--primary">Add application</button>
-          </div>
-        </form>
       </section>
 
       <section id="deployments" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-deployments" tabindex="0">
@@ -173,5 +106,57 @@
       </section>
     </main>
     <dialog id="appManagerDialog" class="am-dialog" aria-labelledby="appManagerDialogTitle"></dialog>
+    <template id="addAppFormTemplate">
+      <div class="am-form-section">
+        <p class="am-dialog-intro">Connect a repository to register your app. You can deploy it as soon as it appears in Applications.</p>
+        <div class="am-form-grid">
+          <div>
+            <label for="appName">Application name</label>
+            <input id="appName" required name="name" autocomplete="organization" placeholder="My application" />
+          </div>
+          <div>
+            <label for="appSlug">URL slug</label>
+            <input id="appSlug" required name="slug" autocomplete="off" placeholder="my-application" />
+            <small class="am-field-hint">Suggested from the name; you can edit it.</small>
+          </div>
+          <div class="am-form-grid__wide">
+            <label for="appRepo">Git repository</label>
+            <input id="appRepo" required name="repo_url" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://github.com/owner/project.git or git@github.com:owner/project.git" />
+            <small class="am-field-hint">HTTPS and SSH remotes are supported. SSH keys must already be configured on the host.</small>
+          </div>
+          <div>
+            <label for="appBranch">Production branch</label>
+            <input id="appBranch" name="branch" value="main" autocomplete="off" />
+          </div>
+          <div>
+            <label for="appFramework">Framework</label>
+            <select id="appFramework" name="framework">
+              <option value="auto">Auto detect (recommended)</option>
+              <option value="nextjs">Next.js</option>
+              <option value="go">Go</option>
+              <option value="node">Node.js</option>
+              <option value="python">Python</option>
+              <option value="static">Static</option>
+            </select>
+          </div>
+          <div>
+            <label for="appHealthCheck">Health-check path <span class="am-optional">Optional</span></label>
+            <input id="appHealthCheck" name="health_check_url" placeholder="/health" />
+          </div>
+          <div>
+            <label for="appDescription">Description <span class="am-optional">Optional</span></label>
+            <input id="appDescription" name="description" placeholder="What does this application do?" />
+          </div>
+        </div>
+      </div>
+      <details class="am-advanced">
+        <summary>Advanced build configuration</summary>
+        <div>
+          <label for="appBuildConfig">Build configuration <span class="am-optional">JSON object</span></label>
+          <textarea id="appBuildConfig" name="build_config" rows="5" spellcheck="false" placeholder='{"build_command": "npm run build"}'></textarea>
+          <small class="am-field-hint">Leave blank for framework defaults. Only add a start command when automatic detection is not suitable.</small>
+        </div>
+      </details>
+    </template>
   </body>
 </html>
