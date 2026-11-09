@@ -71,7 +71,7 @@ def _default_config() -> Dict[str, Any]:
         "source_root": DEFAULT_SOURCE_ROOT,
         "production_root": DEFAULT_PRODUCTION_ROOT,
         "registry_path": DEFAULT_REGISTRY_PATH,
-        "allowed_source_dirs": ["/opt", "/home/sjeetoo", "/srv", DEFAULT_SOURCE_ROOT],
+        "allowed_source_dirs": ["/opt", "/home/stuserver", "/srv", DEFAULT_SOURCE_ROOT],
         "default_branch": "main",
         "release_retention": 5,
         "build_timeout_seconds": 900,

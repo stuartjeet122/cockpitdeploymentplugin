@@ -10,7 +10,7 @@
   "registry_path": "/var/lib/cockpit/app-manager/apps.json",
   "allowed_source_dirs": [
     "/opt",
-    "/home/sjeetoo",
+    "/home/stuserver",
     "/srv",
     "/var/lib/cockpit/app-manager/sources"
   ],
