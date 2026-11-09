@@ -14,6 +14,30 @@ The installer installs the Cockpit assets under `/usr/share/cockpit/app-manager`
 
 The backend stores its registry at `/var/lib/cockpit/app-manager/apps.json` and configuration at `/var/lib/cockpit/app-manager/config.json`. Registry/configuration JSON is atomically replaced and protected by file locks.
 
+## Uninstall
+
+Use the uninstall helper to remove App Manager safely without disturbing the existing Nginx configuration, Cloudflare Tunnel, or the root website.
+
+```bash
+sudo bash ./scripts/uninstall.sh
+```
+
+Default behavior removes only App Manager-owned Cockpit plugin and backend files. It preserves application source repositories, production deployments under `/opt/webapps`, and the existing server infrastructure.
+
+For a full destructive removal of App Manager-managed application data, run the explicit cleanup path with confirmation:
+
+```bash
+sudo bash ./scripts/uninstall.sh --remove-managed-data --yes
+```
+
+To preview the actions without deleting anything:
+
+```bash
+sudo bash ./scripts/uninstall.sh --dry-run
+```
+
+Never run the destructive uninstall path unless you intentionally want to remove App Manager-managed application state and deployed releases.
+
 ## Backend commands
 
 The executable returns one JSON object on stdout for successful and failed operations; diagnostic errors are also written to stderr. Commands include:

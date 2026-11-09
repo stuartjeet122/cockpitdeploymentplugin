@@ -327,5 +327,88 @@ class AppManagerTests(unittest.TestCase):
                 NextJSAdapter().build({"port": 8100}, repo, release, runner=runner, timeout=1)
 
 
+class UninstallScriptTests(unittest.TestCase):
+    def _run_uninstall(self, temp_root: Path, *args: str) -> subprocess.CompletedProcess:
+        env = dict(__import__("os").environ)
+        env.update({
+            "APP_MANAGER_PLUGIN_DEST": str(temp_root / "usr" / "share" / "cockpit" / "app-manager"),
+            "APP_MANAGER_BACKEND_DEST": str(temp_root / "usr" / "libexec" / "cockpit"),
+            "APP_MANAGER_CONFIG_DEST": str(temp_root / "etc" / "cockpit" / "app-manager"),
+            "APP_MANAGER_STATE_ROOT": str(temp_root / "var" / "lib" / "cockpit" / "app-manager"),
+            "APP_MANAGER_PRODUCTION_ROOT": str(temp_root / "opt" / "webapps"),
+            "APP_MANAGER_LOG_ROOT": str(temp_root / "var" / "log" / "cockpit-app-manager"),
+            "APP_MANAGER_SYSTEMD_DIR": str(temp_root / "etc" / "systemd" / "system"),
+        })
+        script = Path(__file__).resolve().parent.parent / "scripts" / "uninstall.sh"
+        git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        command = [str(git_bash), str(script), *args] if git_bash.exists() else ["bash", str(script), *args]
+        return subprocess.run(command, capture_output=True, text=True, env=env)
+
+    def test_default_uninstall_preserves_app_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            plugin = temp_root / "usr" / "share" / "cockpit" / "app-manager"
+            backend = temp_root / "usr" / "libexec" / "cockpit"
+            state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
+            production_root = temp_root / "opt" / "webapps"
+            plugin.mkdir(parents=True)
+            backend.mkdir(parents=True)
+            (backend / "app-manager").write_text("#!/bin/bash\n", encoding="utf-8")
+            (backend / "adapters.py").write_text("print('x')\n", encoding="utf-8")
+            config = temp_root / "etc" / "cockpit" / "app-manager"
+            config.mkdir(parents=True)
+            state_root.mkdir(parents=True)
+            (state_root / "apps.json").write_text('{"apps": [{"id": "demo"}]}', encoding="utf-8")
+            (production_root / "demo").mkdir(parents=True)
+            result = self._run_uninstall(temp_root)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertFalse(plugin.exists())
+            self.assertFalse((backend / "app-manager").exists())
+            self.assertFalse((backend / "adapters.py").exists())
+            self.assertFalse(config.exists())
+            self.assertTrue((state_root / "apps.json").exists())
+            self.assertTrue((production_root / "demo").exists())
+
+    def test_explicit_data_removal_targets_only_app_manager_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
+            production_root = temp_root / "opt" / "webapps"
+            log_root = temp_root / "var" / "log" / "cockpit-app-manager"
+            systemd_dir = temp_root / "etc" / "systemd" / "system"
+            state_root.mkdir(parents=True)
+            (state_root / "sources").mkdir(parents=True)
+            (state_root / "sources" / "demo").mkdir(parents=True)
+            (state_root / "homes").mkdir(parents=True)
+            (state_root / "homes" / "demo").mkdir(parents=True)
+            (state_root / "apps.json").write_text('{"apps": [{"id": "demo"}]}', encoding="utf-8")
+            (production_root / "demo").mkdir(parents=True)
+            (production_root / "shared").mkdir(parents=True)
+            (log_root / "demo").mkdir(parents=True)
+            systemd_dir.mkdir(parents=True)
+            (systemd_dir / "cockpit-app-demo.service").write_text("[Unit]\n", encoding="utf-8")
+            result = self._run_uninstall(temp_root, "--remove-managed-data", "--yes")
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertFalse((production_root / "demo").exists())
+            self.assertTrue((production_root / "shared").exists())
+            self.assertFalse((state_root / "sources" / "demo").exists())
+            self.assertFalse((state_root / "apps.json").exists())
+            self.assertFalse((systemd_dir / "cockpit-app-demo.service").exists())
+
+    def test_dry_run_does_not_change_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
+            production_root = temp_root / "opt" / "webapps"
+            state_root.mkdir(parents=True)
+            (state_root / "apps.json").write_text('{"apps": [{"id": "demo"}]}', encoding="utf-8")
+            (production_root / "demo").mkdir(parents=True)
+            result = self._run_uninstall(temp_root, "--remove-managed-data", "--yes", "--dry-run")
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("DRY-RUN", result.stdout)
+            self.assertTrue((state_root / "apps.json").exists())
+            self.assertTrue((production_root / "demo").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
