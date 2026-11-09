@@ -1,40 +1,68 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 
-class FrameworkAdapter:
+CommandRunner = Callable[[Sequence[str], Path, int], subprocess.CompletedProcess]
+
+
+def _copy_source(repo_path: Path, release_dir: Path) -> Path:
+    app_dir = release_dir / "app"
+    shutil.copytree(
+        repo_path,
+        app_dir,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(".git", "node_modules", ".venv", "__pycache__", ".pytest_cache"),
+    )
+    return app_dir
+
+
+def _run_build(
+    runner: Optional[CommandRunner],
+    command: Sequence[str],
+    cwd: Path,
+    timeout: int,
+    description: str,
+) -> None:
+    if runner is None:
+        raise RuntimeError("Build commands require an unprivileged application command runner")
+    try:
+        result = runner(command, cwd, timeout)
+    except Exception as exc:
+        raise RuntimeError(f"{description} failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[-4000:]
+        raise RuntimeError(f"{description} failed (exit {result.returncode})" + (f": {detail}" if detail else ""))
+
+
+def _configured_start(app: Dict[str, Any], default: List[str]) -> List[str]:
+    configured = app.get("build_config", {}).get("start_command")
+    if configured is None:
+        return default
+    if not isinstance(configured, list) or not configured or not all(isinstance(item, str) and item for item in configured):
+        raise ValueError("build_config.start_command must be a non-empty argument array")
+    return configured
+
+
+class FrameworkAdapter(ABC):
     name = "base"
 
-    @staticmethod
-    def detect(repo_path: Path) -> bool:
-        return False
-
-    def build(self, app: Dict[str, Any], repo_path: Path, release_dir: Path) -> Dict[str, Any]:
-        return {"status": "success", "release_dir": str(release_dir)}
-
-    def write_service(self, app: Dict[str, Any], release_dir: Path, service_path: Path, start_command: str) -> None:
-        service_path.write_text(
-            "[Unit]\n"
-            "Description=App Manager service for {name}\n"
-            "After=network.target\n"
-            "[Service]\n"
-            "Type=simple\n"
-            "WorkingDirectory={release_dir}\n"
-            "ExecStart={cmd}\n"
-            "Restart=on-failure\n"
-            "RestartSec=5\n"
-            "User=root\n"
-            "Group=root\n"
-            "[Install]\n"
-            "WantedBy=multi-user.target\n".format(name=app.get("name", "app"), release_dir=release_dir, cmd=start_command),
-            encoding="utf-8",
-        )
+    @abstractmethod
+    def build(
+        self,
+        app: Dict[str, Any],
+        repo_path: Path,
+        release_dir: Path,
+        *,
+        runner: Optional[CommandRunner] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
 
 
 class NextJSAdapter(FrameworkAdapter):
@@ -42,41 +70,48 @@ class NextJSAdapter(FrameworkAdapter):
 
     @staticmethod
     def detect(repo_path: Path) -> bool:
-        return (
-            (repo_path / "next.config.js").exists()
-            or (repo_path / "next.config.mjs").exists()
-            or (repo_path / "next.config.ts").exists()
-            or (repo_path / "package.json").exists() and json.loads((repo_path / "package.json").read_text(encoding="utf-8").replace("\n", " ") or "{}", strict=False).get("dependencies", {}).get("next") is not None
-        )
+        if any((repo_path / name).is_file() for name in ("next.config.js", "next.config.mjs", "next.config.ts")):
+            return True
+        package_path = repo_path / "package.json"
+        if not package_path.is_file():
+            return False
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        dependencies = {
+            **package.get("dependencies", {}),
+            **package.get("devDependencies", {}),
+        }
+        return "next" in dependencies
 
-    def build(self, app: Dict[str, Any], repo_path: Path, release_dir: Path) -> Dict[str, Any]:
-        if not (repo_path / "package.json").exists():
-            raise FileNotFoundError("package.json not found for Next.js app")
-
-        app_dir = release_dir / "app"
-        shutil.copytree(repo_path, app_dir, dirs_exist_ok=True)
-        package_path = app_dir / "package.json"
-        package = json.loads(package_path.read_text(encoding="utf-8")) if package_path.exists() else {}
-        package.setdefault("scripts", {})
-        package["scripts"]["start"] = "next start -H 127.0.0.1 -p ${PORT:-" + str(app.get("port", 3000)) + "}"
-        package_path.write_text(json.dumps(package, indent=2), encoding="utf-8")
-
-        subprocess.run(["npm", "install", "--no-fund", "--no-audit"], cwd=str(app_dir), check=False, capture_output=True, text=True)
-        subprocess.run(["npm", "run", "build"], cwd=str(app_dir), check=False, capture_output=True, text=True)
-
-        next_config = app_dir / "next.config.js"
-        if next_config.exists():
-            content = next_config.read_text(encoding="utf-8")
-            if "basePath" not in content:
-                config_text = (
-                    "\nmodule.exports = {\n"
-                    "  basePath: '/{slug}',\n"
-                    "  output: 'standalone',\n"
-                    "};\n"
-                ).format(slug=app.get("slug", "app"))
-                next_config.write_text(content + config_text, encoding="utf-8")
-
-        return {"status": "success", "release_dir": str(release_dir), "start_command": f"cd {app_dir} && npx next start -H 127.0.0.1 -p {app.get('port', 3000)}"}
+    def build(
+        self,
+        app: Dict[str, Any],
+        repo_path: Path,
+        release_dir: Path,
+        *,
+        runner: Optional[CommandRunner] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        package_path = repo_path / "package.json"
+        if not package_path.is_file():
+            raise FileNotFoundError("package.json not found for Next.js application")
+        app_dir = _copy_source(repo_path, release_dir)
+        package = json.loads((app_dir / "package.json").read_text(encoding="utf-8"))
+        dependencies = {**package.get("dependencies", {}), **package.get("devDependencies", {})}
+        if "next" not in dependencies:
+            raise ValueError("Next.js was selected but is not declared in package.json")
+        installer = "ci" if (app_dir / "package-lock.json").exists() or (app_dir / "npm-shrinkwrap.json").exists() else "install"
+        _run_build(runner, ["npm", installer, "--no-fund", "--no-audit"], app_dir, timeout, "Installing Next.js dependencies")
+        _run_build(runner, ["npm", "run", "build", "--if-present"], app_dir, timeout, "Building Next.js application")
+        start = [
+            str(app_dir / "node_modules" / ".bin" / "next"),
+            "start",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            str(app["port"]),
+        ]
+        start = _configured_start(app, start)
+        return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
 class GoAdapter(FrameworkAdapter):
@@ -84,17 +119,24 @@ class GoAdapter(FrameworkAdapter):
 
     @staticmethod
     def detect(repo_path: Path) -> bool:
-        return (repo_path / "go.mod").exists()
+        return (repo_path / "go.mod").is_file()
 
-    def build(self, app: Dict[str, Any], repo_path: Path, release_dir: Path) -> Dict[str, Any]:
-        if not (repo_path / "go.mod").exists():
-            raise FileNotFoundError("go.mod not found for Go app")
-
-        app_dir = release_dir / "app"
-        shutil.copytree(repo_path, app_dir, dirs_exist_ok=True)
+    def build(
+        self,
+        app: Dict[str, Any],
+        repo_path: Path,
+        release_dir: Path,
+        *,
+        runner: Optional[CommandRunner] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        if not (repo_path / "go.mod").is_file():
+            raise FileNotFoundError("go.mod not found for Go application")
+        app_dir = _copy_source(repo_path, release_dir)
         binary_path = release_dir / "server"
-        subprocess.run(["go", "build", "-o", str(binary_path), "."], cwd=str(app_dir), check=False, capture_output=True, text=True)
-        return {"status": "success", "release_dir": str(release_dir), "start_command": f"{binary_path} --port {app.get('port', 3000)}"}
+        _run_build(runner, ["go", "build", "-o", str(binary_path), "."], app_dir, timeout, "Building Go application")
+        start = _configured_start(app, [str(binary_path)])
+        return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
 class NodeAdapter(FrameworkAdapter):
@@ -102,17 +144,31 @@ class NodeAdapter(FrameworkAdapter):
 
     @staticmethod
     def detect(repo_path: Path) -> bool:
-        return (repo_path / "package.json").exists()
+        return (repo_path / "package.json").is_file()
 
-    def build(self, app: Dict[str, Any], repo_path: Path, release_dir: Path) -> Dict[str, Any]:
-        if not (repo_path / "package.json").exists():
-            raise FileNotFoundError("package.json not found for Node app")
-
-        app_dir = release_dir / "app"
-        shutil.copytree(repo_path, app_dir, dirs_exist_ok=True)
-        subprocess.run(["npm", "install", "--no-fund", "--no-audit"], cwd=str(app_dir), check=False, capture_output=True, text=True)
-        start_script = app.get("build_config", {}).get("start_command") or "npm run start -- --host 127.0.0.1 --port " + str(app.get("port", 3000))
-        return {"status": "success", "release_dir": str(release_dir), "start_command": start_script}
+    def build(
+        self,
+        app: Dict[str, Any],
+        repo_path: Path,
+        release_dir: Path,
+        *,
+        runner: Optional[CommandRunner] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        package_path = repo_path / "package.json"
+        if not package_path.is_file():
+            raise FileNotFoundError("package.json not found for Node.js application")
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        app_dir = _copy_source(repo_path, release_dir)
+        installer = "ci" if (app_dir / "package-lock.json").exists() or (app_dir / "npm-shrinkwrap.json").exists() else "install"
+        _run_build(runner, ["npm", installer, "--no-fund", "--no-audit"], app_dir, timeout, "Installing Node.js dependencies")
+        if package.get("scripts", {}).get("build"):
+            _run_build(runner, ["npm", "run", "build"], app_dir, timeout, "Building Node.js application")
+        start = _configured_start(
+            app,
+            ["npm", "run", "start", "--", "--host", "127.0.0.1", "--port", str(app["port"])],
+        )
+        return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
 class PythonAdapter(FrameworkAdapter):
@@ -120,14 +176,48 @@ class PythonAdapter(FrameworkAdapter):
 
     @staticmethod
     def detect(repo_path: Path) -> bool:
-        return (repo_path / "requirements.txt").exists() or (repo_path / "pyproject.toml").exists()
+        return (repo_path / "requirements.txt").is_file() or (repo_path / "pyproject.toml").is_file()
 
-    def build(self, app: Dict[str, Any], repo_path: Path, release_dir: Path) -> Dict[str, Any]:
-        app_dir = release_dir / "app"
-        shutil.copytree(repo_path, app_dir, dirs_exist_ok=True)
-        if (app_dir / "requirements.txt").exists():
-            subprocess.run(["python3", "-m", "pip", "install", "-r", "requirements.txt"], cwd=str(app_dir), check=False, capture_output=True, text=True)
-        return {"status": "success", "release_dir": str(release_dir), "start_command": f"cd {app_dir} && python3 -m gunicorn --bind 127.0.0.1:{app.get('port', 8000)} app:app"}
+    def build(
+        self,
+        app: Dict[str, Any],
+        repo_path: Path,
+        release_dir: Path,
+        *,
+        runner: Optional[CommandRunner] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        app_dir = _copy_source(repo_path, release_dir)
+        _run_build(runner, ["python3", "-m", "venv", ".venv"], app_dir, timeout, "Creating Python virtual environment")
+        python = str(app_dir / ".venv" / "bin" / "python")
+        if (app_dir / "requirements.txt").is_file():
+            _run_build(
+                runner,
+                [python, "-m", "pip", "install", "--disable-pip-version-check", "-r", "requirements.txt"],
+                app_dir,
+                timeout,
+                "Installing Python dependencies",
+            )
+        elif (app_dir / "pyproject.toml").is_file():
+            _run_build(
+                runner,
+                [python, "-m", "pip", "install", "--disable-pip-version-check", "."],
+                app_dir,
+                timeout,
+                "Installing Python application",
+            )
+        _run_build(
+            runner,
+            [python, "-m", "pip", "install", "--disable-pip-version-check", "gunicorn"],
+            app_dir,
+            timeout,
+            "Installing Gunicorn",
+        )
+        start = _configured_start(
+            app,
+            [str(app_dir / ".venv" / "bin" / "gunicorn"), "--bind", f"127.0.0.1:{app['port']}", "app:app"],
+        )
+        return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
 class StaticAdapter(FrameworkAdapter):
@@ -135,27 +225,43 @@ class StaticAdapter(FrameworkAdapter):
 
     @staticmethod
     def detect(repo_path: Path) -> bool:
-        return (repo_path / "index.html").exists()
+        return (repo_path / "index.html").is_file()
 
-    def build(self, app: Dict[str, Any], repo_path: Path, release_dir: Path) -> Dict[str, Any]:
-        app_dir = release_dir / "app"
-        shutil.copytree(repo_path, app_dir, dirs_exist_ok=True)
-        return {"status": "success", "release_dir": str(release_dir), "start_command": f"python3 -m http.server {app.get('port', 8081)} --directory {app_dir}"}
+    def build(
+        self,
+        app: Dict[str, Any],
+        repo_path: Path,
+        release_dir: Path,
+        *,
+        runner: Optional[CommandRunner] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        if not (repo_path / "index.html").is_file():
+            raise FileNotFoundError("index.html not found for static application")
+        app_dir = _copy_source(repo_path, release_dir)
+        start = _configured_start(
+            app,
+            ["python3", "-m", "http.server", str(app["port"]), "--bind", "127.0.0.1", "--directory", str(app_dir)],
+        )
+        return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
 def detect_framework(repo_path: Path) -> str:
     for adapter_cls in (NextJSAdapter, GoAdapter, PythonAdapter, NodeAdapter, StaticAdapter):
         if adapter_cls.detect(repo_path):
             return adapter_cls.name
-    return "static"
+    raise ValueError("Could not detect a supported framework in the Git repository")
 
 
 def get_adapter(name: str) -> FrameworkAdapter:
     registry = {
-        "nextjs": NextJSAdapter(),
-        "go": GoAdapter(),
-        "node": NodeAdapter(),
-        "python": PythonAdapter(),
-        "static": StaticAdapter(),
+        "nextjs": NextJSAdapter,
+        "go": GoAdapter,
+        "node": NodeAdapter,
+        "python": PythonAdapter,
+        "static": StaticAdapter,
     }
-    return registry.get(name, StaticAdapter())
+    try:
+        return registry[name]()
+    except KeyError as exc:
+        raise ValueError(f"Unsupported framework: {name}") from exc

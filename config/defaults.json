@@ -6,16 +6,19 @@
   },
   "source_root": "/var/lib/cockpit/app-manager/sources",
   "production_root": "/opt/webapps",
+  "log_root": "/var/log/cockpit-app-manager",
   "registry_path": "/var/lib/cockpit/app-manager/apps.json",
   "allowed_source_dirs": [
     "/opt",
     "/home/sjeetoo",
-    "/srv"
+    "/srv",
+    "/var/lib/cockpit/app-manager/sources"
   ],
   "default_branch": "main",
   "release_retention": 5,
   "build_timeout_seconds": 900,
   "health_timeout_seconds": 30,
+  "command_timeout_seconds": 30,
   "nginx_template": "/etc/cockpit/app-manager/templates/nginx.conf.tpl",
   "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl"
 }

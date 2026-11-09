@@ -177,6 +177,7 @@
               <button data-action="open" data-id="${escapeHtml(app.id)}">Open</button>
               <button data-action="deploy" data-id="${escapeHtml(app.id)}">Deploy</button>
               <button data-action="pull" data-id="${escapeHtml(app.id)}">Pull</button>
+              <button data-action="edit" data-id="${escapeHtml(app.id)}">Edit</button>
               <button data-action="restart" data-id="${escapeHtml(app.id)}">Restart</button>
               <button data-action="stop" data-id="${escapeHtml(app.id)}">Stop</button>
               <button data-action="start" data-id="${escapeHtml(app.id)}">Start</button>
@@ -267,9 +268,39 @@
               <li>Build timeout: ${escapeHtml(config.build_timeout_seconds || 900)} seconds</li>
               <li>Health timeout: ${escapeHtml(config.health_timeout_seconds || 30)} seconds</li>
             </ul>
+            <form id="settingsForm">
+              <div class="row">
+                <div>
+                  <label>Release retention</label>
+                  <input type="number" min="0" step="1" name="release_retention" value="${escapeHtml(config.release_retention || 5)}" />
+                </div>
+                <div>
+                  <label>Health timeout seconds</label>
+                  <input type="number" min="1" step="1" name="health_timeout_seconds" value="${escapeHtml(config.health_timeout_seconds || 30)}" />
+                </div>
+              </div>
+              <button type="submit">Save settings</button>
+            </form>
           </div>
         `;
         document.getElementById('settingsPanel').innerHTML = html;
+
+        const settingsForm = document.getElementById('settingsForm');
+        if (settingsForm) {
+          settingsForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const formData = new FormData(event.target);
+            const payload = Object.fromEntries(formData.entries());
+            payload.release_retention = Number(payload.release_retention);
+            payload.health_timeout_seconds = Number(payload.health_timeout_seconds);
+            const result = await callBackend('settings', [JSON.stringify(payload)]);
+            if (result.ok === false) {
+              cockpit.message(result.error || 'Failed to update settings');
+            } else {
+              await refreshData();
+            }
+          });
+        }
       }
 
       async function refreshData() {

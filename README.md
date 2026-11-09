@@ -1,69 +1,52 @@
 # Cockpit App Manager
 
-A native Cockpit plugin for managing websites and web applications on Ubuntu Server while preserving the existing root website and Cloudflare Tunnel setup.
+App Manager is a Cockpit navigation plugin with a Python command-line backend for registering and operating multiple web applications on an Ubuntu host.
 
-## Goals
+## Installation
 
-- Integrate directly into Cockpit navigation.
-- Manage applications by URL prefix rather than hostname/subdomain.
-- Keep the existing root website at `https://stuserver.online/` untouched.
-- Maintain a separate registry that does not mutate the existing Go registry file.
-- Support a modular adapter for Next.js, Go, Node.js, Python, and static deployments.
-
-## Recommended installation
-
-1. Review the configuration defaults in `config/defaults.json`.
-2. Run the installer:
+Review `config/defaults.json`, then install from the project directory:
 
 ```bash
 sudo bash ./scripts/install.sh
 ```
 
-3. Reload Cockpit or open `https://<server>:9090/cockpit/@localhost/app-manager/index.html`
+The installer installs the Cockpit assets under `/usr/share/cockpit/app-manager`, the backend and adapter module under `/usr/libexec/cockpit`, and state under `/var/lib/cockpit/app-manager`. Cockpit invokes the backend with its privileged prompt; deployment operations require that privilege.
 
-## Architecture overview
+The backend stores its registry at `/var/lib/cockpit/app-manager/apps.json` and configuration at `/var/lib/cockpit/app-manager/config.json`. Registry/configuration JSON is atomically replaced and protected by file locks.
 
-- `cockpit/` — Cockpit UI assets (`manifest.json`, `index.html`, `app-manager.js`)
-- `backend/` — Python backend implementing registry management, Git operations, security checks, and adapters
-- `templates/` — example service and NGINX snippets
-- `config/` — default configuration and registry template
-- `tests/` — unit tests for framework detection and registry logic
+## Backend commands
 
-## Safe operations
+The executable returns one JSON object on stdout for successful and failed operations; diagnostic errors are also written to stderr. Commands include:
 
-- All external commands execute as argument arrays, never by concatenating user input into shell strings.
-- Git operations refuse to overwrite uncommitted changes or a diverged working tree.
-- The plugin only reads the legacy registry file for discovery and never mutates it.
-- Destructive commands such as `git reset --hard` are intentionally avoided.
-
-## Supported frameworks
-
-- Next.js
-- Go
-- Node.js
-- Python
-- Static HTML/CSS/JavaScript
-
-## Deployment model
-
-Applications use a release directory layout under `/opt/webapps/<app-id>/` with `releases/` and a `current` symlink. The plugin keeps a source clone under `/var/lib/cockpit/app-manager/sources/<app-id>/` so Git updates can be fetched without disturbing the active release.
-
-## Security and operational restrictions
-
-- Applications bind to `127.0.0.1` only.
-- Ports are allocated from `8100-8999` only.
-- Port `8080` is never assigned to a new app because it is already used by the existing root website.
-- No credentials or SSH private keys are stored in the app registry.
-- Only explicitly allowed source roots are permitted: `/opt`, `/home/sjeetoo`, and `/srv`.
-
-## Testing
-
-```bash
-npm test
+```text
+list | overview | add <json> | edit <app-id> <json>
+deploy <app-id> | pull <app-id>
+start <app-id> | stop <app-id> | restart <app-id>
+logs <app-id> [--lines N] | health <app-id>
+remove <app-id> | rollback <app-id> [release-id]
+deployments | settings [<json>]
+action <action> <app-id>
 ```
 
-or
+Project conventions and deployment requirements are documented in `AGENTS.md` and must be followed for all future changes.
+
+`action` supports the operations used by the Cockpit UI: `open`, `deploy`, `pull`, `start`, `stop`, `restart`, `logs`, `remove`, `health`, and `rollback`.
+
+## Deployment and safety
+
+- Ports are allocated from 8100–8999. Port 8080 is excluded. Registration holds the registry lock while checking existing allocations and listening sockets and recording the new port.
+- Git remotes must use HTTPS or SSH. Updates reject local changes and branch changes, fetch the selected branch, and only merge with `--ff-only`.
+- Each app uses a dedicated system account named `app-<app-id>`. Git operations, dependency installation, and build commands run as that account, never as root. The generated systemd service also uses that account and binds framework defaults to loopback where the framework supports it.
+- Source trees, releases, application configuration, and logs use app-specific paths. Deployment history and retained releases support rollback.
+- The backend does not edit an existing Nginx server configuration or Cloudflare Tunnel configuration. URL-prefix routing must be installed and verified separately; the presence of `templates/nginx.conf.tpl` does not mean routing is active.
+- Removing an app unregisters it and stops/removes its App Manager service, but intentionally retains source and release data.
+
+Applications must provide an appropriate start entry point. Framework adapters install/build dependencies and use a conventional start command; applications with nonstandard startup behavior can supply `build_config.start_command` as an array of executable arguments (not a shell string). The app must listen on the assigned `PORT` and on `127.0.0.1`. Health checks use the configured local path and require a 2xx response.
+
+## Development tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+The test suite covers validation, framework detection, JSON/locking behavior, concurrent port allocation, health checks, fast-forward Git updates, and subprocess failures. Systemd, account creation, and live deployment behavior must additionally be validated on a disposable Ubuntu host.

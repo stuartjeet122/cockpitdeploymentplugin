@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -9,486 +10,1674 @@ import shutil
 import socket
 import subprocess
 import sys
-from datetime import datetime
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlsplit
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - used on Windows development hosts
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - used on POSIX hosts
+    msvcrt = None
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - Windows has no POSIX account database
+    pwd = None
+
+try:
+    import grp
+except ImportError:  # pragma: no cover - Windows has no POSIX group database
+    grp = None
 
 try:
     from .adapters import detect_framework, get_adapter
-except ImportError:  # pragma: no cover - direct execution fallback
+except ImportError:  # pragma: no cover - direct execution after installation
     from adapters import detect_framework, get_adapter
 
 APP_NAME = "app-manager"
-DEFAULT_CONFIG_PATH = "/var/lib/cockpit/app-manager/config.json"
-DEFAULT_REGISTRY_PATH = "/var/lib/cockpit/app-manager/apps.json"
 DEFAULT_STATE_ROOT = "/var/lib/cockpit/app-manager"
+DEFAULT_CONFIG_PATH = f"{DEFAULT_STATE_ROOT}/config.json"
+DEFAULT_REGISTRY_PATH = f"{DEFAULT_STATE_ROOT}/apps.json"
 DEFAULT_PRODUCTION_ROOT = "/opt/webapps"
-DEFAULT_SOURCE_ROOT = "/var/lib/cockpit/app-manager/sources"
-ALLOWED_SOURCE_DIRS = ["/opt", "/home/sjeetoo", "/srv"]
+DEFAULT_SOURCE_ROOT = f"{DEFAULT_STATE_ROOT}/sources"
+DEFAULT_LOG_ROOT = "/var/log/cockpit-app-manager"
 PORT_START = 8100
 PORT_END = 8999
 RESERVED_PORTS = {8080}
+COMMAND_TIMEOUT_SECONDS = 30
+APP_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$")
+BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
+FRAMEWORKS = {"auto", "nextjs", "go", "node", "python", "static"}
 
 
 def now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def ensure_runtime_dirs() -> Dict[str, str]:
-    source_root = Path(DEFAULT_SOURCE_ROOT)
-    production_root = Path(DEFAULT_PRODUCTION_ROOT)
-    source_root.mkdir(parents=True, exist_ok=True)
-    production_root.mkdir(parents=True, exist_ok=True)
-    return {"source_root": str(source_root), "production_root": str(production_root)}
-
-
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        path.write_text(json.dumps(default, indent=2), encoding="utf-8")
-    with path.open("r", encoding="utf-8") as handle:
-        try:
-            return json.load(handle)
-        except json.JSONDecodeError:
-            return default
-
-
-def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
-
-
-def get_config() -> Dict[str, Any]:
-    config_path = Path(DEFAULT_CONFIG_PATH)
-    default = {
+def _default_config() -> Dict[str, Any]:
+    return {
         "port_range": {"start": PORT_START, "end": PORT_END, "reserved": sorted(RESERVED_PORTS)},
         "source_root": DEFAULT_SOURCE_ROOT,
         "production_root": DEFAULT_PRODUCTION_ROOT,
         "registry_path": DEFAULT_REGISTRY_PATH,
-        "allowed_source_dirs": ALLOWED_SOURCE_DIRS,
+        "allowed_source_dirs": ["/opt", "/home/sjeetoo", "/srv", DEFAULT_SOURCE_ROOT],
         "default_branch": "main",
         "release_retention": 5,
         "build_timeout_seconds": 900,
         "health_timeout_seconds": 30,
+        "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
+        "log_root": DEFAULT_LOG_ROOT,
     }
-    return load_json(config_path, default)
+
+
+def _atomic_json_write(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temporary_path = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary_path), str(path))
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+        raise
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.touch(mode=0o600, exist_ok=True)
+    handle = path.open("r+b")
+    locked = False
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+        elif msvcrt is not None:  # pragma: no cover - Windows development host
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(0.01)
+        else:  # pragma: no cover - unsupported platform
+            raise RuntimeError("No supported file-locking implementation is available")
+        yield
+    finally:
+        if locked and fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        elif locked and msvcrt is not None:  # pragma: no cover - Windows development host
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        handle.close()
+
+
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        _atomic_json_write(path, default)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+
+
+def write_json(path: Path, payload: Any) -> None:
+    _atomic_json_write(path, payload)
+
+
+def get_config() -> Dict[str, Any]:
+    config_path = Path(DEFAULT_CONFIG_PATH)
+    with _file_lock(config_path.with_name(config_path.name + ".lock")):
+        loaded = load_json(config_path, _default_config())
+    if not isinstance(loaded, dict):
+        raise ValueError("Configuration must contain a JSON object")
+    config = _default_config()
+    config.update(loaded)
+    # Registry location is fixed so configuration cannot redirect privileged writes.
+    config["registry_path"] = DEFAULT_REGISTRY_PATH
+    configured_roots = (
+        ("source_root", DEFAULT_SOURCE_ROOT),
+        ("production_root", DEFAULT_PRODUCTION_ROOT),
+        ("log_root", DEFAULT_LOG_ROOT),
+    )
+    for key, allowed_root in configured_roots:
+        candidate = _resolved_path(Path(config[key]))
+        if not _path_is_within(candidate, Path(allowed_root)):
+            raise ValueError(f"Configured {key} resolves outside its managed directory")
+        config[key] = str(candidate)
+    if not isinstance(config["allowed_source_dirs"], list) or not all(
+        isinstance(root, str) and root and "\0" not in root for root in config["allowed_source_dirs"]
+    ):
+        raise ValueError("allowed_source_dirs must be an array of paths")
+    port_range = config.get("port_range")
+    if not isinstance(port_range, dict):
+        raise ValueError("port_range must be a JSON object")
+    start, end = port_range.get("start"), port_range.get("end")
+    if (
+        isinstance(start, bool) or not isinstance(start, int)
+        or isinstance(end, bool) or not isinstance(end, int)
+        or start < PORT_START or end > PORT_END or start > end
+    ):
+        raise ValueError("Configured port range must stay within 8100-8999")
+    for key in ("build_timeout_seconds", "health_timeout_seconds", "command_timeout_seconds"):
+        value = config[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    retention = config["release_retention"]
+    if isinstance(retention, bool) or not isinstance(retention, int) or retention < 0:
+        raise ValueError("release_retention must be a non-negative integer")
+    return config
 
 
 def get_registry() -> Dict[str, Any]:
-    registry_path = Path(get_config().get("registry_path", DEFAULT_REGISTRY_PATH))
-    return load_json(registry_path, {"apps": []})
+    registry_path = Path(DEFAULT_REGISTRY_PATH)
+    with _file_lock(registry_path.with_name(registry_path.name + ".lock")):
+        registry = load_json(registry_path, {"apps": []})
+    if not isinstance(registry, dict) or not isinstance(registry.get("apps"), list):
+        raise ValueError("Application registry must contain an 'apps' array")
+    _validate_registry(registry)
+    return registry
 
 
 def save_registry(registry: Dict[str, Any]) -> None:
-    registry_path = Path(get_config().get("registry_path", DEFAULT_REGISTRY_PATH))
-    write_json(registry_path, registry)
+    if not isinstance(registry, dict) or not isinstance(registry.get("apps"), list):
+        raise ValueError("Application registry must contain an 'apps' array")
+    registry_path = Path(DEFAULT_REGISTRY_PATH)
+    with _file_lock(registry_path.with_name(registry_path.name + ".lock")):
+        _atomic_json_write(registry_path, registry)
+
+
+@contextlib.contextmanager
+def _registry_transaction() -> Iterator[Dict[str, Any]]:
+    registry_path = Path(DEFAULT_REGISTRY_PATH)
+    with _file_lock(registry_path.with_name(registry_path.name + ".lock")):
+        registry = load_json(registry_path, {"apps": []})
+        if not isinstance(registry, dict) or not isinstance(registry.get("apps"), list):
+            raise ValueError("Application registry must contain an 'apps' array")
+        _validate_registry(registry)
+        yield registry
+        _atomic_json_write(registry_path, registry)
+
+
+def ensure_runtime_dirs() -> Dict[str, str]:
+    config = get_config()
+    state_root = Path(DEFAULT_STATE_ROOT)
+    source_root = Path(config["source_root"])
+    production_root = Path(config["production_root"])
+    log_root = Path(config["log_root"])
+    for path in (state_root, source_root, production_root, log_root):
+        path.mkdir(parents=True, exist_ok=True, mode=0o700 if path == state_root else 0o755)
+    return {
+        "source_root": str(source_root),
+        "production_root": str(production_root),
+        "log_root": str(log_root),
+    }
 
 
 def sanitize_slug(value: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9-]+", "-", value.strip().lower())
+    slug = re.sub(r"[^a-zA-Z0-9-]+", "-", value.strip().lower())
     slug = re.sub(r"-+", "-", slug).strip("-")
-    return slug or "app"
+    return slug[:24].strip("-") or "app"
 
 
-def validate_git_url(value: str) -> bool:
-    return bool(value) and ("github.com" in value or "git@" in value or value.startswith("https://") or value.startswith("ssh://") or value.startswith("git://"))
+def validate_app_id(value: Any) -> str:
+    if not isinstance(value, str) or not APP_ID_RE.fullmatch(value):
+        raise ValueError("Application ID must be 1-24 lowercase letters, digits, or internal hyphens")
+    return value
 
 
-def validate_app_payload(payload: Dict[str, Any]) -> None:
-    if not payload.get("name"):
-        raise ValueError("Website name is required")
-    if not payload.get("repo_url"):
-        raise ValueError("Git repository URL is required")
-    if not validate_git_url(payload["repo_url"]):
-        raise ValueError("Repository URL must be a valid Git remote")
-    if not payload.get("slug"):
-        payload["slug"] = sanitize_slug(payload["name"])
-    slug = sanitize_slug(payload["slug"])
-    payload["slug"] = slug
-    if payload.get("framework") == "auto":
-        payload["framework"] = "auto"
-
-    if payload.get("source_directory"):
-        safe_dir = payload["source_directory"]
-        if not any(safe_dir.startswith(prefix) for prefix in ALLOWED_SOURCE_DIRS):
-            raise ValueError(f"Source directory must be within: {', '.join(ALLOWED_SOURCE_DIRS)}")
+def validate_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Website name must be a string")
+    name = value.strip()
+    if not name or len(name) > 100 or any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("Website name must be 1-100 printable characters")
+    return name
 
 
-def get_listening_ports() -> set:
-    ports = set()
+def validate_git_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        return False
+    if any(char.isspace() or ord(char) < 32 for char in value):
+        return False
+    if value.startswith("git@"):
+        match = re.fullmatch(r"git@([A-Za-z0-9.-]+):([A-Za-z0-9_./-]+)", value)
+        if not match:
+            return False
+        host, path = match.groups()
+        return (
+            bool(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", host))
+            and ".." not in host
+            and not path.startswith("-")
+            and ".." not in path.split("/")
+        )
     try:
-        result = subprocess.run(["ss", "-lnt"], capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            for line in result.stdout.splitlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 5 and parts[3].endswith(":"):
-                    continue
-                if len(parts) >= 4:
-                    local = parts[3]
-                    if ":" in local:
-                        try:
-                            ports.add(int(local.rsplit(":", 1)[1]))
-                        except ValueError:
-                            pass
-    except FileNotFoundError:
-        pass
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"https", "ssh"} or not parsed.hostname or not parsed.path:
+            return False
+        if parsed.password is not None or (parsed.scheme == "https" and parsed.username is not None):
+            return False
+        if (
+            parsed.query or parsed.fragment
+            or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", parsed.hostname)
+            or ".." in parsed.hostname
+            or ".." in parsed.path.split("/")
+        ):
+            return False
+        if parsed.username is not None and (
+            not re.fullmatch(r"[A-Za-z0-9._-]+", parsed.username) or parsed.username.startswith("-")
+        ):
+            return False
+        path_pattern = r"/?[A-Za-z0-9._/-]+" if parsed.scheme == "ssh" else r"/[A-Za-z0-9._~/%+-]+"
+        if not re.fullmatch(path_pattern, parsed.path) or parsed.path.startswith("-"):
+            return False
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            return False
+        return True
+    except ValueError:
+        return False
+
+
+def validate_branch(value: Any) -> str:
+    if not isinstance(value, str) or not BRANCH_RE.fullmatch(value):
+        raise ValueError("Branch must be a valid Git branch name")
+    components = value.split("/")
+    if (
+        value.startswith("-") or value.endswith(("/", ".", ".lock"))
+        or ".." in value or "@{" in value or "//" in value
+        or any(component.startswith(".") or component.endswith(".") or component.endswith(".lock") for component in components)
+    ):
+        raise ValueError("Branch must be a valid Git branch name")
+    return value
+
+
+def _resolved_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        _resolved_path(path).relative_to(_resolved_path(root))
+        return True
+    except ValueError:
+        return False
+
+
+def validate_allowed_path(value: Any, allowed_roots: Sequence[str]) -> Path:
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise ValueError("Path must be a non-empty string")
+    candidate = _resolved_path(Path(value))
+    if not any(_path_is_within(candidate, Path(root)) for root in allowed_roots):
+        raise ValueError("Path resolves outside the configured allowed directories")
+    return candidate
+
+
+def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Application payload must be a JSON object")
+    name = validate_name(payload.get("name"))
+    app_id = payload.get("id", payload.get("slug"))
+    if app_id is None or app_id == "":
+        app_id = sanitize_slug(name)
+    app_id = validate_app_id(app_id)
+    repo_url = payload.get("repo_url")
+    if not validate_git_url(repo_url):
+        raise ValueError("Repository URL must be a valid HTTPS or SSH Git remote")
+    branch = validate_branch(payload.get("branch") or get_config().get("default_branch", "main"))
+    framework = payload.get("framework") or "auto"
+    if not isinstance(framework, str) or framework not in FRAMEWORKS:
+        raise ValueError(f"Framework must be one of: {', '.join(sorted(FRAMEWORKS))}")
+    build_config = payload.get("build_config") or {}
+    if not isinstance(build_config, dict):
+        raise ValueError("Build configuration must be a JSON object")
+    if "start_command" in build_config:
+        command = build_config["start_command"]
+        if not isinstance(command, list) or not command or not all(
+            isinstance(part, str) and part and not any(ord(char) < 32 or ord(char) == 127 for char in part)
+            for part in command
+        ):
+            raise ValueError("build_config.start_command must be a non-empty array of command arguments")
+    health_path = payload.get("health_check_url") or "/"
+    if not isinstance(health_path, str) or not health_path.startswith("/") or health_path.startswith("//"):
+        raise ValueError("Health-check URL must be a path beginning with one slash")
+    if any(ord(char) < 32 for char in health_path):
+        raise ValueError("Health-check URL contains control characters")
+    result: Dict[str, Any] = dict(payload)
+    result.update({
+        "id": app_id,
+        "slug": app_id,
+        "name": name,
+        "repo_url": repo_url,
+        "branch": branch,
+        "framework": framework,
+        "build_config": build_config,
+        "health_check_url": health_path,
+    })
+    description = payload.get("description", "")
+    if not isinstance(description, str) or len(description) > 2000 or any(ord(char) < 32 and char not in "\t" for char in description):
+        raise ValueError("Description must be a string of at most 2000 printable characters")
+    result["description"] = description
+    if "port" in payload and payload["port"] is not None:
+        port = payload["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
+            raise ValueError(f"Port must be an integer from {PORT_START} through {PORT_END}, excluding reserved ports")
+        result["port"] = port
+    if payload.get("source_directory"):
+        result["source_directory"] = str(validate_allowed_path(
+            payload["source_directory"],
+            get_config().get("allowed_source_dirs", _default_config()["allowed_source_dirs"]),
+        ))
+    return result
+
+
+def _parse_ss_ports(output: str) -> Set[int]:
+    ports: Set[int] = set()
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        address = fields[3]
+        match = re.search(r":(\d+)$", address)
+        if match:
+            ports.add(int(match.group(1)))
     return ports
 
 
-def pick_port() -> int:
-    registry = get_registry()
-    used = {int(app.get("port", 0)) for app in registry.get("apps", []) if app.get("port")}
-    used |= get_listening_ports() | RESERVED_PORTS
-    start = int(get_config().get("port_range", {}).get("start", PORT_START))
-    end = int(get_config().get("port_range", {}).get("end", PORT_END))
+def _proc_listening_ports() -> Optional[Set[int]]:
+    ports: Set[int] = set()
+    readable = False
+    for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        try:
+            lines = table.read_text(encoding="ascii").splitlines()[1:]
+        except OSError:
+            continue
+        readable = True
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 3 and fields[3] == "0A":
+                try:
+                    ports.add(int(fields[1].rsplit(":", 1)[1], 16))
+                except (ValueError, IndexError):
+                    continue
+    return ports if readable else None
+
+
+def get_listening_ports() -> Set[int]:
+    try:
+        result = subprocess.run(
+            ["ss", "-H", "-ltn"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        if result.returncode == 0:
+            return _parse_ss_ports(result.stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    proc_ports = _proc_listening_ports()
+    if proc_ports is not None:
+        return proc_ports
+    if os.name == "nt":
+        return set()
+    raise RuntimeError("Unable to inspect listening TCP sockets (ss and /proc unavailable)")
+
+
+def _socket_port_available(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            listener.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+
+
+def _select_port(registry: Dict[str, Any], config: Dict[str, Any]) -> int:
+    used = {app.get("port") for app in registry["apps"]}
+    _clear_expired_port_reservations(registry)
+    reservations = {int(port) for port in registry.get("port_reservations", {})}
+    used.update(reservations)
+    listening = get_listening_ports()
+    port_range = config.get("port_range", {})
+    start = int(port_range.get("start", PORT_START))
+    end = int(port_range.get("end", PORT_END))
+    if start < PORT_START or end > PORT_END or start > end:
+        raise ValueError("Configured port range must stay within 8100-8999")
+    reserved = set(RESERVED_PORTS)
+    reserved.update(port_range.get("reserved", []))
     for port in range(start, end + 1):
-        if port not in used:
+        if port not in reserved and port not in used and port not in listening and _socket_port_available(port):
             return port
     raise RuntimeError("No available ports remaining in the configured range")
 
 
-def clone_or_update_repo(repo_url: str, repo_path: Path, branch: str) -> Dict[str, Any]:
-    if repo_path.exists():
+def pick_port() -> int:
+    config = get_config()
+    with _registry_transaction() as registry:
+        port = _select_port(registry, config)
+        reservations = registry.setdefault("port_reservations", {})
+        reservations[str(port)] = time.time() + 600
+        return port
+
+
+def _clear_expired_port_reservations(registry: Dict[str, Any]) -> None:
+    reservations = registry.setdefault("port_reservations", {})
+    if not isinstance(reservations, dict):
+        raise ValueError("Registry port_reservations must be a JSON object")
+    now = time.time()
+    for port, expiry in list(reservations.items()):
         try:
-            subprocess.run(["git", "-C", str(repo_path), "rev-parse", "--is-inside-work-tree"], check=True, capture_output=True, text=True)
-            fetch = subprocess.run(["git", "-C", str(repo_path), "fetch", "--all", "--tags"], check=False, capture_output=True, text=True)
-            if fetch.returncode != 0:
-                raise RuntimeError(fetch.stderr.strip() or "Failed to fetch repository updates")
-            status = subprocess.run(["git", "-C", str(repo_path), "status", "--porcelain"], capture_output=True, text=True, check=False)
-            if status.stdout.strip():
-                raise RuntimeError("Repository contains uncommitted changes; refusing to pull over local modifications")
-            branch_result = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=False)
-            if branch_result.returncode == 0 and branch_result.stdout.strip() != branch:
-                subprocess.run(["git", "-C", str(repo_path), "checkout", branch], check=False, capture_output=True, text=True)
-            pull = subprocess.run(["git", "-C", str(repo_path), "pull", "--ff-only", "origin", branch], capture_output=True, text=True, check=False)
-            if pull.returncode != 0:
-                raise RuntimeError(pull.stderr.strip() or "Failed to pull updates")
-            return {"status": "updated"}
-        except RuntimeError:
-            raise
-    repo_path.parent.mkdir(parents=True, exist_ok=True)
-    clone = subprocess.run(["git", "clone", "--branch", branch, repo_url, str(repo_path)], capture_output=True, text=True, check=False)
-    if clone.returncode != 0:
-        raise RuntimeError(clone.stderr.strip() or "Failed to clone repository")
-    return {"status": "cloned"}
+            valid_port = int(port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Registry contains an invalid port reservation") from exc
+        if valid_port < PORT_START or valid_port > PORT_END or valid_port in RESERVED_PORTS:
+            raise ValueError("Registry contains an invalid port reservation")
+        if isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
+            raise ValueError("Registry contains an invalid port reservation expiry")
+        if expiry <= now:
+            del reservations[port]
 
 
-def git_output(repo_path: Path, *args: str) -> str:
-    proc = subprocess.run(["git", "-C", str(repo_path), *args], capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        return ""
-    return proc.stdout.strip()
-
-
-def run_command(args: List[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(args, cwd=str(cwd) if cwd else None, capture_output=True, text=True, check=False)
-
-
-def app_health_url(app: Dict[str, Any]) -> str:
-    health = app.get("health_check_url") or "/health"
-    normalized = health if health.startswith("http") else f"http://127.0.0.1:{app.get('port', 8080)}{health if health.startswith('/') else '/' + health}"
-    return normalized
-
-
-def check_app_health(app: Dict[str, Any], timeout_seconds: int = 30) -> bool:
+def run_command(
+    args: Sequence[str],
+    cwd: Optional[Path] = None,
+    timeout: int = COMMAND_TIMEOUT_SECONDS,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
+    if not args or not all(isinstance(arg, str) and "\0" not in arg for arg in args):
+        raise ValueError("Subprocess arguments must be a non-empty list of strings")
     try:
-        import urllib.request
+        return subprocess.run(
+            list(args),
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(1, int(timeout)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Command timed out after {timeout} seconds: {args[0]}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Could not run {args[0]}: {exc}") from exc
 
-        request = urllib.request.Request(app_health_url(app), method="GET")
-        with urllib.request.urlopen(request, timeout=max(1, timeout_seconds)) as response:
-            return 200 <= getattr(response, "status", 200) < 500
-    except Exception:
+
+def _command_error(result: subprocess.CompletedProcess, description: str) -> None:
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[-4000:]
+        raise RuntimeError(f"{description} failed (exit {result.returncode})" + (f": {detail}" if detail else ""))
+
+
+def _require_root() -> None:
+    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise PermissionError("This operation requires the privileged Cockpit backend")
+
+
+def _account_name(app_id: str) -> str:
+    return f"app-{validate_app_id(app_id)}"
+
+
+def _home_path(app_id: str) -> Path:
+    return Path(DEFAULT_STATE_ROOT) / "homes" / validate_app_id(app_id)
+
+
+def _account_exists(username: str) -> bool:
+    if pwd is None:
+        return False
+    try:
+        pwd.getpwnam(username)
+        return True
+    except KeyError:
         return False
 
 
-def prune_releases(app: Dict[str, Any], keep_count: int) -> None:
-    production_root = Path(app["production_path"])
-    releases = sorted((production_root / "releases").glob("release-*"), key=lambda path: path.name)
-    while len(releases) > max(0, int(keep_count)):
-        rel = releases.pop(0)
-        if rel.exists():
-            shutil.rmtree(rel, ignore_errors=True)
+def ensure_app_user(app_id: str) -> str:
+    _require_root()
+    username = _account_name(app_id)
+    home = _home_path(app_id)
+    home.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not _account_exists(username):
+        result = run_command(
+            ["useradd", "--system", "--user-group", "--home-dir", str(home), "--create-home", "--shell", "/usr/sbin/nologin", username],
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0 and not _account_exists(username):
+            _command_error(result, "Creating the application service account")
+    if pwd is not None:
+        account = pwd.getpwnam(username)
+        if Path(account.pw_dir).resolve() != home.resolve():
+            raise RuntimeError(f"Existing account {username} has an unexpected home directory")
+        if account.pw_uid == 0 or account.pw_shell != "/usr/sbin/nologin":
+            raise RuntimeError(f"Existing account {username} is not a dedicated unprivileged service account")
+        if grp is not None and grp.getgrgid(account.pw_gid).gr_name != username:
+            raise RuntimeError(f"Existing account {username} does not have its dedicated group")
+        os.chown(str(home), account.pw_uid, account.pw_gid)
+    return username
+
+
+def _account_ids(username: str) -> Tuple[int, int]:
+    if pwd is None:
+        raise RuntimeError("Application accounts are only supported on POSIX systems")
+    try:
+        account = pwd.getpwnam(username)
+    except KeyError as exc:
+        raise RuntimeError(f"Application service account {username} does not exist") from exc
+    return account.pw_uid, account.pw_gid
+
+
+def _chown_tree(path: Path, username: str) -> None:
+    uid, gid = _account_ids(username)
+    if path.is_symlink():
+        os.chown(str(path), uid, gid, follow_symlinks=False)
+        return
+    for root, dirs, files in os.walk(path, followlinks=False):
+        root_path = Path(root)
+        os.chown(str(root_path), uid, gid, follow_symlinks=False)
+        for name in dirs + files:
+            child = root_path / name
+            os.chown(str(child), uid, gid, follow_symlinks=False)
+
+
+def _run_as_user(
+    username: str,
+    args: Sequence[str],
+    cwd: Optional[Path] = None,
+    timeout: int = COMMAND_TIMEOUT_SECONDS,
+    environment: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
+    _require_root()
+    if os.name == "nt":
+        raise RuntimeError("Running application commands as a separate Linux user requires Ubuntu")
+    if not _account_exists(username):
+        raise RuntimeError(f"Application service account {username} does not exist")
+    home = str(_home_path(username.removeprefix("app-")))
+    env_args = [
+        "env",
+        f"HOME={home}",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ]
+    for key, value in (environment or {}).items():
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) or "\0" in value:
+            raise ValueError("Invalid application environment variable")
+        env_args.append(f"{key}={value}")
+    return run_command(
+        ["runuser", "--user", username, "--", *env_args, *args],
+        cwd=cwd,
+        timeout=timeout,
+    )
+
+
+def _run_checked_as_user(
+    username: str,
+    args: Sequence[str],
+    cwd: Path,
+    timeout: int,
+    description: str,
+    environment: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
+    result = _run_as_user(username, args, cwd, timeout, environment)
+    _command_error(result, description)
+    return result
+
+
+def _git(
+    repo_path: Path,
+    username: Optional[str],
+    args: Sequence[str],
+    timeout: int,
+) -> subprocess.CompletedProcess:
+    command = ["git", "-C", str(repo_path), *args]
+    if username is None:
+        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            raise PermissionError("Git must run as the application's unprivileged service account")
+        return run_command(command, timeout=timeout)
+    return _run_as_user(username, command, timeout=timeout)
+
+
+def clone_or_update_repo(
+    repo_url: str,
+    repo_path: Path,
+    branch: str,
+    username: Optional[str] = None,
+    timeout: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not validate_git_url(repo_url):
+        raise ValueError("Repository URL must be a valid HTTPS or SSH Git remote")
+    validate_branch(branch)
+    command_timeout = int(timeout or get_config().get("command_timeout_seconds", COMMAND_TIMEOUT_SECONDS))
+    repo_path = _resolved_path(repo_path)
+    config = get_config()
+    allowed = [config["source_root"]]
+    if not any(_path_is_within(repo_path, Path(root)) and repo_path != _resolved_path(Path(root)) for root in allowed):
+        raise ValueError("Repository path must be a child of the configured source root")
+
+    if repo_path.exists() and not (repo_path.is_dir() and not any(repo_path.iterdir())):
+        if not repo_path.is_dir():
+            raise ValueError("Repository path exists and is not a directory")
+        top_level = _git(repo_path, username, ["rev-parse", "--show-toplevel"], command_timeout)
+        _command_error(top_level, "Checking the source repository")
+        if _resolved_path(Path(top_level.stdout.strip())) != repo_path:
+            raise ValueError("Source path is not the root of its Git repository")
+        status = _git(repo_path, username, ["status", "--porcelain", "--untracked-files=all"], command_timeout)
+        _command_error(status, "Checking source changes")
+        if status.stdout.strip():
+            raise RuntimeError("Repository has local changes; refusing to update it")
+        remote = _git(repo_path, username, ["remote", "get-url", "origin"], command_timeout)
+        _command_error(remote, "Checking the source remote")
+        if remote.stdout.strip() != repo_url:
+            raise RuntimeError("Repository origin differs from the configured Git URL; refusing to change it")
+        current_branch = _git(repo_path, username, ["symbolic-ref", "--short", "HEAD"], command_timeout)
+        _command_error(current_branch, "Checking the current Git branch")
+        if current_branch.stdout.strip() != branch:
+            raise RuntimeError(
+                f"Repository is on branch {current_branch.stdout.strip()!r}, not {branch!r}; refusing to switch branches"
+            )
+        fetch = _git(
+            repo_path,
+            username,
+            ["fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+            command_timeout,
+        )
+        _command_error(fetch, "Fetching Git updates")
+        merge = _git(repo_path, username, ["merge", "--ff-only", f"refs/remotes/origin/{branch}"], command_timeout)
+        _command_error(merge, "Fast-forwarding the source repository")
+        return {"status": "updated", "branch": branch, "commit": git_output(repo_path, "rev-parse", "HEAD", username=username, timeout=command_timeout)}
+
+    repo_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if repo_path.exists():
+        repo_path.rmdir()
+    repo_path.mkdir(mode=0o750)
+    if username:
+        _chown_tree(repo_path, username)
+    clone_args = ["git", "clone", "--branch", branch, "--single-branch", repo_url, str(repo_path)]
+    try:
+        if username is None:
+            if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+                raise PermissionError("Git must run as the application's unprivileged service account")
+            result = run_command(clone_args, timeout=command_timeout)
+        else:
+            result = _run_as_user(username, clone_args, timeout=command_timeout)
+    except Exception:
+        shutil.rmtree(repo_path, ignore_errors=True)
+        raise
+    if result.returncode != 0:
+        shutil.rmtree(repo_path)
+        _command_error(result, "Cloning the Git repository")
+    return {"status": "cloned", "branch": branch, "commit": git_output(repo_path, "rev-parse", "HEAD", username=username, timeout=command_timeout)}
+
+
+def git_output(
+    repo_path: Path,
+    *args: str,
+    username: Optional[str] = None,
+    timeout: int = COMMAND_TIMEOUT_SECONDS,
+) -> str:
+    try:
+        result = _git(repo_path, username, args, timeout)
+    except (RuntimeError, PermissionError, ValueError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def app_health_url(app: Dict[str, Any]) -> str:
+    health = app.get("health_check_url") or "/"
+    if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
+        raise ValueError("Health-check URL must be a local path")
+    port = app.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
+        raise ValueError("Application has an invalid port")
+    return f"http://127.0.0.1:{port}{health}"
+
+
+def check_app_health(app: Dict[str, Any], timeout_seconds: int = 30) -> bool:
+    request = urllib.request.Request(app_health_url(app), method="GET")
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=max(1, min(int(timeout_seconds), 10))) as response:
+            return 200 <= response.status < 300
+    except urllib.error.HTTPError as exc:
+        return 200 <= exc.code < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, new_url):
+        return None
+
+
+def _wait_for_health(app: Dict[str, Any], timeout_seconds: int) -> bool:
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    while True:
+        if check_app_health(app, min(5, max(1, int(deadline - time.monotonic())))):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
 
 def app_metadata(app: Dict[str, Any]) -> Dict[str, Any]:
-    repo_path = Path(app.get("source_path") or app.get("source_dir") or str(Path(DEFAULT_SOURCE_ROOT) / app["slug"]))
     metadata = dict(app)
-    if repo_path.exists():
-        metadata["latest_commit"] = git_output(repo_path, "rev-parse", "HEAD") or metadata.get("latest_commit")
-        metadata["branch"] = git_output(repo_path, "rev-parse", "--abbrev-ref", "HEAD") or app.get("branch", "main")
-        metadata["status"] = "running" if app.get("status") == "running" else app.get("status", "stopped")
-        metadata["public_url"] = app.get("public_url") or f"https://stuserver.online/{app['slug']}/"
+    source = Path(app.get("source_path", ""))
+    if source.is_dir():
+        metadata["latest_commit"] = git_output(source, "rev-parse", "HEAD", username=app.get("service_user")) or metadata.get("latest_commit")
+    metadata["public_url"] = app.get("public_url") or f"https://stuserver.online/{app['id']}/"
     return metadata
+
+
+def _app_paths(app_id: str, config: Dict[str, Any]) -> Dict[str, Path]:
+    app_id = validate_app_id(app_id)
+    source_root = _resolved_path(Path(config["source_root"]))
+    production_root = _resolved_path(Path(config["production_root"]))
+    source = source_root / app_id
+    production = production_root / app_id
+    log_root = _resolved_path(Path(config["log_root"]))
+    home_root = _resolved_path(Path(DEFAULT_STATE_ROOT) / "homes")
+    paths = {
+        "source": source,
+        "production": production,
+        "releases": production / "releases",
+        "current": production / "current",
+        "config": production / "config",
+        "logs": log_root / app_id,
+        "home": home_root / app_id,
+    }
+    if (
+        not _path_is_within(source, source_root)
+        or not _path_is_within(production, production_root)
+        or not _path_is_within(paths["releases"], production)
+        or not _path_is_within(paths["current"], production)
+        or not _path_is_within(paths["config"], production)
+        or not _path_is_within(paths["logs"], log_root)
+        or not _path_is_within(paths["home"], home_root)
+    ):
+        raise ValueError("Application paths resolve outside their managed roots")
+    return paths
+
+
+def _validate_registry(registry: Dict[str, Any]) -> None:
+    config = get_config()
+    seen_ids: Set[str] = set()
+    seen_ports: Set[int] = set()
+    for app in registry["apps"]:
+        if not isinstance(app, dict):
+            raise ValueError("Each application registry entry must be an object")
+        app_id = validate_app_id(app.get("id"))
+        if app_id in seen_ids:
+            raise ValueError(f"Duplicate application ID in registry: {app_id}")
+        seen_ids.add(app_id)
+        validate_name(app.get("name"))
+        if not validate_git_url(app.get("repo_url")):
+            raise ValueError(f"Application {app_id!r} has an invalid Git URL")
+        validate_branch(app.get("branch"))
+        if app.get("framework") not in FRAMEWORKS:
+            raise ValueError(f"Application {app_id!r} has an unsupported framework")
+        port = app.get("port")
+        if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
+            raise ValueError(f"Application {app_id!r} has an invalid port")
+        if port in seen_ports:
+            raise ValueError(f"Duplicate application port in registry: {port}")
+        seen_ports.add(port)
+        expected_paths = _app_paths(app_id, config)
+        expected_user = _account_name(app_id)
+        fields = {
+            "source_path": expected_paths["source"],
+            "production_path": expected_paths["production"],
+            "config_path": expected_paths["config"],
+            "log_path": expected_paths["logs"],
+        }
+        for field, expected in fields.items():
+            if field in app and _resolved_path(Path(app[field])) != _resolved_path(expected):
+                raise ValueError(f"Application {app_id!r} has an invalid {field}")
+            app[field] = str(expected)
+        if app.get("service_user", expected_user) != expected_user:
+            raise ValueError(f"Application {app_id!r} has an invalid service account")
+        app["service_user"] = expected_user
+        if app.get("slug", app_id) != app_id:
+            raise ValueError(f"Application {app_id!r} has an invalid slug")
+        if not isinstance(app.get("build_config", {}), dict):
+            raise ValueError(f"Application {app_id!r} has an invalid build configuration")
+        try:
+            app_health_url(app)
+        except ValueError as exc:
+            raise ValueError(f"Application {app_id!r} has an invalid health-check configuration") from exc
+    _clear_expired_port_reservations(registry)
+    if seen_ports & {int(port) for port in registry["port_reservations"]}:
+        raise ValueError("Registry port reservations conflict with registered applications")
+
+
+def _find_app(registry: Dict[str, Any], app_id: str) -> Dict[str, Any]:
+    validate_app_id(app_id)
+    app = next((item for item in registry["apps"] if item.get("id") == app_id), None)
+    if app is None:
+        raise ValueError(f"Application {app_id!r} not found")
+    return app
 
 
 def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
     ensure_runtime_dirs()
-    validate_app_payload(payload)
-    registry = get_registry()
-    slug = sanitize_slug(payload["slug"])
-    if any(app.get("slug") == slug for app in registry.get("apps", [])):
-        raise ValueError(f"Application '{slug}' is already registered")
-
-    port = payload.get("port") or pick_port()
-    if payload.get("framework") == "auto" or not payload.get("framework"):
-        source_dir = Path(payload.get("source_directory") or str(Path(DEFAULT_SOURCE_ROOT) / slug))
-        if source_dir.exists() and source_dir.is_dir():
-            framework = detect_framework(source_dir)
+    normalized = validate_app_payload(payload)
+    config = get_config()
+    with _registry_transaction() as registry:
+        if any(app.get("id") == normalized["id"] for app in registry["apps"]):
+            raise ValueError(f"Application {normalized['id']!r} is already registered")
+        port = normalized.get("port")
+        if port is None:
+            port = _select_port(registry, config)
         else:
-            framework = "static"
-        payload["framework"] = framework
-
-    app_record = {
-        "id": slug,
-        "name": payload["name"],
-        "slug": slug,
-        "repo_url": payload["repo_url"],
-        "branch": payload.get("branch") or get_config().get("default_branch", "main"),
-        "framework": payload.get("framework", "auto"),
-        "description": payload.get("description", ""),
-        "health_check_url": payload.get("health_check_url", "/health"),
-        "build_config": payload.get("build_config") or {},
-        "port": port,
-        "public_url": f"https://stuserver.online/{slug}/",
-        "source_path": str(Path(DEFAULT_SOURCE_ROOT) / slug),
-        "production_path": str(Path(DEFAULT_PRODUCTION_ROOT) / slug),
-        "status": "stopped",
-        "last_deploy": None,
-        "latest_commit": None,
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-    }
-
-    registry.setdefault("apps", []).append(app_record)
-    save_registry(registry)
+            _clear_expired_port_reservations(registry)
+            reservations = registry.get("port_reservations", {})
+            if (
+                any(app.get("port") == port for app in registry["apps"])
+                or port in get_listening_ports()
+                or not _socket_port_available(port)
+            ):
+                raise ValueError(f"Port {port} is already in use")
+            reservations.pop(str(port), None)
+        paths = _app_paths(normalized["id"], config)
+        app_record = {
+            "id": normalized["id"],
+            "name": normalized["name"],
+            "slug": normalized["id"],
+            "repo_url": normalized["repo_url"],
+            "branch": normalized["branch"],
+            "framework": normalized["framework"],
+            "description": normalized.get("description", ""),
+            "health_check_url": normalized["health_check_url"],
+            "build_config": normalized["build_config"],
+            "port": port,
+            "public_url": f"https://stuserver.online/{normalized['id']}/",
+            "source_path": str(paths["source"]),
+            "production_path": str(paths["production"]),
+            "config_path": str(paths["config"]),
+            "log_path": str(paths["logs"]),
+            "service_user": _account_name(normalized["id"]),
+            "status": "stopped",
+            "last_deploy": None,
+            "latest_commit": None,
+            "deployments": [],
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        registry["apps"].append(app_record)
     return {"ok": True, "app": app_record}
 
 
 def list_apps() -> Dict[str, Any]:
-    registry = get_registry()
-    apps = [app_metadata(app) for app in registry.get("apps", [])]
-    return {"apps": apps}
+    return {"apps": [app_metadata(app) for app in get_registry()["apps"]]}
 
 
 def stats_for_apps(apps: List[Dict[str, Any]]) -> Dict[str, Any]:
-    total = len(apps)
-    running = sum(1 for app in apps if app.get("status") == "running")
-    stopped = sum(1 for app in apps if app.get("status") == "stopped")
-    failed = sum(1 for app in apps if app.get("status") == "failed")
-    ports = sorted({app.get("port") for app in apps if app.get("port")})
+    ports = {app.get("port") for app in apps}
     return {
-        "total_apps": total,
-        "running_apps": running,
-        "stopped_apps": stopped,
-        "failed_deployments": failed,
-        "available_ports": [port for port in range(PORT_START, PORT_END + 1) if port not in set(ports) and port not in RESERVED_PORTS],
-        "recent_activity": [{"name": app.get("name"), "action": "Deployment", "when": app.get("last_deploy") or "never"} for app in apps[:5]],
+        "total_apps": len(apps),
+        "running_apps": sum(app.get("status") == "running" for app in apps),
+        "stopped_apps": sum(app.get("status") == "stopped" for app in apps),
+        "failed_deployments": sum(app.get("status") == "failed" for app in apps),
+        "available_ports": [
+            port for port in range(PORT_START, PORT_END + 1)
+            if port not in ports and port not in RESERVED_PORTS
+        ],
+        "recent_activity": [
+            {"name": app.get("name"), "action": "Deployment", "when": app.get("last_deploy") or "never"}
+            for app in sorted(apps, key=lambda item: item.get("updated_at", ""), reverse=True)[:5]
+        ],
     }
 
 
 def overview() -> Dict[str, Any]:
-    apps = list_apps()["apps"]
-    return stats_for_apps(apps)
+    return stats_for_apps(list_apps()["apps"])
 
 
 def get_deployments() -> Dict[str, Any]:
-    registry = get_registry()
     deployments = []
-    for app in registry.get("apps", []):
-        if app.get("deployments"):
-            deployments.extend(app["deployments"])
-    return {"deployments": deployments}
+    for app in get_registry()["apps"]:
+        deployments.extend(dict(item, app_id=app["id"]) for item in app.get("deployments", []))
+    return {"deployments": sorted(deployments, key=lambda item: item.get("date", ""), reverse=True)}
 
 
 def get_settings() -> Dict[str, Any]:
+    return {"config": get_config()}
+
+
+def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Settings payload must be a JSON object")
     config = get_config()
-    return {"config": config}
+    allowed_keys = {
+        "port_range",
+        "default_branch",
+        "source_root",
+        "production_root",
+        "log_root",
+        "allowed_source_dirs",
+        "release_retention",
+        "build_timeout_seconds",
+        "health_timeout_seconds",
+        "command_timeout_seconds",
+    }
+    update = dict(payload)
+    for key in update:
+        if key not in allowed_keys:
+            raise ValueError(f"Unsupported configuration key: {key!r}")
+    if "source_root" in update:
+        update["source_root"] = str(validate_allowed_path(update["source_root"], [DEFAULT_SOURCE_ROOT]))
+    if "production_root" in update:
+        update["production_root"] = str(validate_allowed_path(update["production_root"], [DEFAULT_PRODUCTION_ROOT]))
+    if "log_root" in update:
+        update["log_root"] = str(validate_allowed_path(update["log_root"], [DEFAULT_LOG_ROOT]))
+    if "allowed_source_dirs" in update:
+        if not isinstance(update["allowed_source_dirs"], list) or not all(
+            isinstance(root, str) and root and "\0" not in root for root in update["allowed_source_dirs"]
+        ):
+            raise ValueError("allowed_source_dirs must be an array of paths")
+        update["allowed_source_dirs"] = [
+            str(validate_allowed_path(root, [DEFAULT_SOURCE_ROOT, "/opt", "/srv", "/home"])) for root in update["allowed_source_dirs"]
+        ]
+    if "port_range" in update:
+        port_range = update["port_range"]
+        if not isinstance(port_range, dict):
+            raise ValueError("port_range must be a JSON object")
+        start = port_range.get("start")
+        end = port_range.get("end")
+        if (
+            isinstance(start, bool) or not isinstance(start, int)
+            or isinstance(end, bool) or not isinstance(end, int)
+            or start < PORT_START or end > PORT_END or start > end
+        ):
+            raise ValueError("Configured port range must stay within 8100-8999")
+        update["port_range"] = {"start": start, "end": end, "reserved": sorted(set(RESERVED_PORTS) | set(port_range.get("reserved", [])))}
+    merged = config.copy()
+    merged.update(update)
+    path = Path(DEFAULT_CONFIG_PATH)
+    with _file_lock(path.with_name(path.name + ".lock")):
+        _atomic_json_write(path, merged)
+    return {"ok": True, "config": get_config()}
 
 
-def clone_repo_if_needed(app: Dict[str, Any]) -> Path:
-    source_path = Path(app["source_path"])
-    if not source_path.exists():
-        subprocess.run(["git", "clone", "--branch", app["branch"], app["repo_url"], str(source_path)], check=False, capture_output=True, text=True)
-    return source_path
+def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    validate_app_id(app_id)
+    if not isinstance(payload, dict):
+        raise ValueError("Application payload must be a JSON object")
+    if "id" in payload or "slug" in payload:
+        raise ValueError("Application ID and slug cannot be changed")
+    with _app_lock(app_id):
+        registry = get_registry()
+        app = _find_app(registry, app_id)
+        current = {key: value for key, value in app.items() if key not in {"id", "slug", "status", "last_deploy", "latest_commit", "deployments", "created_at", "updated_at", "source_path", "production_path", "config_path", "log_path", "service_user", "public_url"}}
+        current["id"] = app_id
+        current["slug"] = app_id
+        candidate = {**current, **payload}
+        normalized = validate_app_payload(candidate)
+        port = normalized.get("port", app.get("port"))
+        if port != app.get("port"):
+            if any(other.get("id") != app_id and other.get("port") == port for other in registry["apps"]):
+                raise ValueError(f"Port {port} is already in use")
+            if port in get_listening_ports() or not _socket_port_available(port):
+                raise ValueError(f"Port {port} is already in use")
+        with _registry_transaction() as registry2:
+            app = _find_app(registry2, app_id)
+            for key in ("name", "repo_url", "branch", "framework", "description", "health_check_url", "build_config", "port", "public_url"):
+                if key in normalized:
+                    app[key] = normalized[key]
+            app["slug"] = app_id
+            app["updated_at"] = now_iso()
+            return {"ok": True, "app": app}
+
+
+def _service_path(app: Dict[str, Any]) -> Path:
+    validate_app_id(app["id"])
+    return Path("/etc/systemd/system") / f"cockpit-app-{app['id']}.service"
+
+
+def _legacy_service_path(app: Dict[str, Any]) -> Path:
+    validate_app_id(app["id"])
+    return Path("/etc/systemd/system") / f"{app['id']}.service"
+
+
+def _retire_legacy_root_service(app: Dict[str, Any]) -> None:
+    legacy_path = _legacy_service_path(app)
+    if not legacy_path.exists() and not legacy_path.is_symlink():
+        return
+    if legacy_path.is_symlink():
+        raise RuntimeError(f"Refusing to manage symlinked legacy service {legacy_path.name}")
+    try:
+        content = legacy_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect legacy service {legacy_path.name}: {exc}") from exc
+    required_lines = {
+        f"Description={app['name']}",
+        "User=root",
+        "Group=root",
+        f"Environment=PORT={app['port']}",
+    }
+    if "[Service]" not in content or not required_lines.issubset(set(content.splitlines())):
+        raise RuntimeError(f"Legacy unit {legacy_path.name} is not a recognized App Manager root service")
+    _systemctl("disable", "--now", legacy_path.name)
+    legacy_path.unlink()
+    _systemctl("daemon-reload")
+
+
+def _systemd_quote(argument: str) -> str:
+    return '"' + argument.replace("%", "%%").replace("$", "$$").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _write_service(app: Dict[str, Any], release_dir: Path, start_command: Sequence[str], config: Dict[str, Any]) -> Path:
+    if not start_command:
+        raise ValueError("Application start command cannot be empty")
+    paths = _app_paths(app["id"], config)
+    working_directory = paths["current"] / "app"
+    exec_start = " ".join(_systemd_quote(part) for part in start_command)
+    service = (
+        "[Unit]\n"
+        f"Description=Cockpit App Manager - {app['id']}\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"User={app['service_user']}\n"
+        f"Group={app['service_user']}\n"
+        f"WorkingDirectory={_systemd_quote(str(working_directory))}\n"
+        f"ExecStart={exec_start}\n"
+        f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
+        f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
+        f"Environment={_systemd_quote('APP_CONFIG_DIR=' + str(paths['config']))}\n"
+        f"Environment={_systemd_quote('HOME=' + str(paths['home']))}\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n"
+        f"StandardOutput=append:{paths['logs'] / 'stdout.log'}\n"
+        f"StandardError=append:{paths['logs'] / 'stderr.log'}\n"
+        "NoNewPrivileges=true\n"
+        "PrivateTmp=true\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=true\n"
+        f"ReadWritePaths={_systemd_quote(str(paths['config']))} {_systemd_quote(str(paths['logs']))}\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    service_path = _service_path(app)
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{service_path.name}.", dir=str(service_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(service)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o644)
+        os.replace(temporary_name, service_path)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name)
+        raise
+    return service_path
+
+
+def _restore_service_file(service_path: Path, previous_content: Optional[bytes]) -> None:
+    if previous_content is None:
+        with contextlib.suppress(FileNotFoundError):
+            service_path.unlink()
+        return
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{service_path.name}.", dir=str(service_path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(previous_content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o644)
+        os.replace(temporary_name, service_path)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name)
+        raise
+
+
+def _systemctl(*args: str, timeout: int = COMMAND_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
+    result = run_command(["systemctl", *args], timeout=timeout)
+    _command_error(result, f"systemctl {' '.join(args)}")
+    return result
+
+
+def _atomic_symlink(target: Path, link_path: Path) -> None:
+    temp_link = link_path.with_name(f".{link_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_link.symlink_to(target, target_is_directory=True)
+        os.replace(str(temp_link), str(link_path))
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            temp_link.unlink()
+        raise
+
+
+def _release_command_path(command: Sequence[str], release_dir: Path, current_path: Path) -> List[str]:
+    result = []
+    release = str(release_dir)
+    current = str(current_path)
+    for part in command:
+        if part == release:
+            result.append(current)
+        elif part.startswith(release + os.sep):
+            result.append(current + part[len(release):])
+        else:
+            result.append(part)
+    return result
+
+
+def _record_deployment(app: Dict[str, Any], record: Dict[str, Any]) -> None:
+    app.setdefault("deployments", []).append(record)
+    app["updated_at"] = now_iso()
+
+
+def _prune_releases(app: Dict[str, Any], keep_count: int) -> None:
+    production = Path(app["production_path"])
+    releases_dir = production / "releases"
+    if not releases_dir.exists():
+        return
+    releases = sorted((path for path in releases_dir.iterdir() if path.is_dir()), key=lambda path: path.name)
+    current = (production / "current").resolve(strict=False)
+    retained = set(releases[-max(0, keep_count):]) if keep_count else set()
+    retained.add(current)
+    for release in releases:
+        if release not in retained:
+            shutil.rmtree(release)
+            for deployment in app.get("deployments", []):
+                if deployment.get("release") == str(release):
+                    deployment["release_available"] = False
+
+
+def _app_lock(app_id: str) -> contextlib.AbstractContextManager:
+    return _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / f"{validate_app_id(app_id)}.lock")
+
+
+def _setup_app_directories(app: Dict[str, Any], username: str, config: Dict[str, Any]) -> Dict[str, Path]:
+    paths = _app_paths(app["id"], config)
+    for key in ("source", "production", "releases", "config", "logs", "home"):
+        paths[key].mkdir(parents=True, exist_ok=True, mode=0o750)
+        _chown_tree(paths[key], username)
+    return paths
+
+
+def pull_app(app_id: str) -> Dict[str, Any]:
+    config = get_config()
+    with _app_lock(app_id):
+        app = _find_app(get_registry(), app_id)
+        username = ensure_app_user(app_id)
+        paths = _setup_app_directories(app, username, config)
+        result = clone_or_update_repo(app["repo_url"], paths["source"], app["branch"], username, int(config["command_timeout_seconds"]))
+        app["latest_commit"] = result.get("commit") or git_output(paths["source"], "rev-parse", "HEAD", username=username)
+        with _registry_transaction() as registry:
+            stored = _find_app(registry, app_id)
+            stored["latest_commit"] = app["latest_commit"]
+            stored["updated_at"] = now_iso()
+        return {"ok": True, "result": result, "app": app}
 
 
 def deploy_app(app_id: str) -> Dict[str, Any]:
-    registry = get_registry()
-    app = next((item for item in registry["apps"] if item["id"] == app_id), None)
-    if app is None:
-        raise ValueError(f"App '{app_id}' not found")
-
-    source_path = clone_repo_if_needed(app)
-    clone_or_update_repo(app["repo_url"], source_path, app["branch"])
-
-    production_root = Path(app["production_path"])
-    production_root.mkdir(parents=True, exist_ok=True)
-    release_dir = production_root / "releases"
-    release_dir.mkdir(parents=True, exist_ok=True)
-    existing = sorted(release_dir.glob("release-*"), key=lambda path: path.name)
-    next_index = len(existing) + 1
-    target = release_dir / f"release-{next_index:03d}"
-    target.mkdir(parents=True, exist_ok=True)
-
-    current_link = production_root / "current"
-    previous_release = current_link.resolve(strict=False) if current_link.exists() or current_link.is_symlink() else None
-    adapter = get_adapter(app.get("framework", "static"))
-    build_result = adapter.build(app, source_path, target)
-    if build_result.get("status") != "success":
-        raise RuntimeError("Build failed")
-
-    service_name = f"{app['slug']}.service"
-    service_path = Path("/etc/systemd/system") / service_name
-    systemd_start = build_result.get("start_command") or f"python3 -m http.server {app['port']} --directory {target}"
-    service_path.write_text(
-        f"[Unit]\nDescription={app['name']}\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={target}\nExecStart={systemd_start}\nRestart=on-failure\nRestartSec=5\nUser=root\nGroup=root\nEnvironment=PORT={app['port']}\n\n[Install]\nWantedBy=multi-user.target\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(["systemctl", "daemon-reload"], check=False, capture_output=True, text=True)
-    if current_link.exists() or current_link.is_symlink():
-        current_link.unlink()
-    current_link.symlink_to(target)
-
-    try:
-        subprocess.run(["systemctl", "restart", service_name], check=False, capture_output=True, text=True)
-        if not check_app_health(app):
-            raise RuntimeError("Health check failed after deployment")
-    except Exception as exc:
-        if previous_release is not None and previous_release.exists():
-            if current_link.exists() or current_link.is_symlink():
-                current_link.unlink()
-            current_link.symlink_to(previous_release)
-            subprocess.run(["systemctl", "restart", service_name], check=False, capture_output=True, text=True)
-        app["status"] = "failed"
-        app["updated_at"] = now_iso()
-        app.setdefault("deployments", []).append(
-            {"name": app["name"], "date": now_iso(), "commit": git_output(source_path, "rev-parse", "HEAD"), "build_status": "failed", "status": "failed", "error": str(exc)}
-        )
-        save_registry(registry)
-        raise RuntimeError(str(exc))
-
-    app["status"] = "running"
-    app["last_deploy"] = now_iso()
-    app["updated_at"] = now_iso()
-    app["latest_commit"] = git_output(source_path, "rev-parse", "HEAD")
-    app.setdefault("deployments", []).append(
-        {
-            "name": app["name"],
-            "date": app["last_deploy"],
-            "commit": app["latest_commit"],
-            "build_status": "success",
-            "status": "deployed",
+    _require_root()
+    config = get_config()
+    with _app_lock(app_id):
+        release_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        started_at = now_iso()
+        with _registry_transaction() as registry:
+            app = _find_app(registry, app_id)
+            app_snapshot = dict(app)
+        record = {
+            "id": release_id,
+            "name": app_snapshot["name"],
+            "date": started_at,
+            "commit": None,
+            "release": None,
+            "release_available": False,
+            "framework": app_snapshot.get("framework", "auto"),
+            "build_status": "pending",
+            "status": "deploying",
             "error": None,
         }
-    )
-    keep_count = int(get_config().get("release_retention", 5))
-    prune_releases(app, keep_count)
-    save_registry(registry)
-    return {"ok": True, "app": app, "build": build_result}
+        with _registry_transaction() as registry:
+            app = _find_app(registry, app_id)
+            app["status"] = "deploying"
+            _record_deployment(app, record)
+
+        paths: Optional[Dict[str, Path]] = None
+        release_dir: Optional[Path] = None
+        current_release: Optional[Path] = None
+        service_path: Optional[Path] = None
+        previous_service_content: Optional[bytes] = None
+        unit_written = False
+        activation_attempted = False
+        try:
+            username = ensure_app_user(app_id)
+            paths = _setup_app_directories(app_snapshot, username, config)
+            current_release = paths["current"].resolve(strict=False) if paths["current"].exists() or paths["current"].is_symlink() else None
+            source_path = paths["source"]
+            clone_or_update_repo(
+                app_snapshot["repo_url"],
+                source_path,
+                app_snapshot["branch"],
+                username,
+                int(config["command_timeout_seconds"]),
+            )
+            framework = app_snapshot.get("framework", "auto")
+            if framework == "auto":
+                framework = detect_framework(source_path)
+            adapter = get_adapter(framework)
+            release_dir = paths["releases"] / release_id
+            if release_dir.exists() or release_dir.is_symlink():
+                raise RuntimeError("Generated release path already exists")
+            release_dir.mkdir(mode=0o750)
+            _chown_tree(release_dir, username)
+            record.update({
+                "release": str(release_dir),
+                "release_available": True,
+                "framework": framework,
+                "build_status": "running",
+            })
+            commit = git_output(source_path, "rev-parse", "HEAD", username=username)
+            record["commit"] = commit or None
+            service_path = _service_path(app_snapshot)
+            previous_service_content = service_path.read_bytes() if service_path.exists() else None
+            build_result = adapter.build(
+                app_snapshot,
+                source_path,
+                release_dir,
+                runner=lambda args, cwd, timeout: _run_checked_as_user(
+                    username, args, cwd, timeout, f"{framework} build"
+                ),
+                timeout=int(config["build_timeout_seconds"]),
+            )
+            _chown_tree(release_dir, username)
+            command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
+            _write_service(app_snapshot, release_dir, command, config)
+            unit_written = True
+            _systemctl("daemon-reload")
+            _retire_legacy_root_service(app_snapshot)
+            _atomic_symlink(release_dir, paths["current"])
+            activation_attempted = True
+            _systemctl("enable", service_path.name)
+            _systemctl("restart", service_path.name)
+            if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
+                raise RuntimeError("Application did not pass its health check before the timeout")
+        except Exception as exc:
+            rollback_error = None
+            try:
+                if unit_written and service_path is not None:
+                    _restore_service_file(service_path, previous_service_content)
+                    _systemctl("daemon-reload")
+                if activation_attempted and paths is not None and current_release is not None and current_release.is_dir():
+                    _atomic_symlink(current_release, paths["current"])
+                    if previous_service_content is not None and service_path is not None:
+                        if app_snapshot.get("status") == "running":
+                            _systemctl("restart", service_path.name)
+                            if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
+                                raise RuntimeError("The previous release did not recover its health check")
+                        else:
+                            _systemctl("stop", service_path.name)
+                    else:
+                        if service_path is not None:
+                            _systemctl("stop", service_path.name)
+                elif activation_attempted and previous_service_content is None and service_path is not None:
+                    _systemctl("stop", service_path.name)
+            except Exception as rollback_exc:
+                rollback_error = str(rollback_exc)
+            if activation_attempted and current_release is None and service_path is not None:
+                with contextlib.suppress(Exception):
+                    _systemctl("disable", "--now", service_path.name)
+            record.update({
+                "build_status": "failed",
+                "status": "failed",
+                "release_available": bool(release_dir and release_dir.is_dir()),
+                "error": str(exc),
+            })
+            if rollback_error:
+                record["rollback_error"] = rollback_error
+            if release_dir is not None:
+                with contextlib.suppress(OSError):
+                    if release_dir.is_dir() and not release_dir.is_symlink():
+                        shutil.rmtree(release_dir)
+                        record["release_available"] = False
+            with _registry_transaction() as registry:
+                app = _find_app(registry, app_id)
+                stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
+                stored_record.update(record)
+                app["updated_at"] = now_iso()
+                app["status"] = (
+                    "failed" if rollback_error
+                    else app_snapshot.get("status", "stopped") if current_release
+                    else "failed"
+                )
+            raise
+
+        record.update({"build_status": "success", "status": "deployed"})
+        with _registry_transaction() as registry:
+            app = _find_app(registry, app_id)
+            app["framework"] = framework
+            app["status"] = "running"
+            app["last_deploy"] = record["date"]
+            app["latest_commit"] = commit or app.get("latest_commit")
+            stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
+            stored_record.update(record)
+            app["updated_at"] = now_iso()
+            _prune_releases(app, int(config["release_retention"]))
+        app_snapshot.update({"status": "running", "framework": framework, "latest_commit": commit or app_snapshot.get("latest_commit")})
+        return {"ok": True, "app": app_snapshot, "build": build_result, "deployment": record}
+
+
+def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any]:
+    _require_root()
+    config = get_config()
+    with _app_lock(app_id):
+        registry = get_registry()
+        app = _find_app(registry, app_id)
+        deployments = app.get("deployments", [])
+        paths = _app_paths(app_id, config)
+        current_release = paths["current"].resolve(strict=False) if paths["current"].exists() or paths["current"].is_symlink() else None
+        target_record = None
+        for item in reversed(deployments):
+            if item.get("status") == "deployed" and item.get("release_available", True):
+                if release_id is not None and item.get("id") == release_id:
+                    target_record = item
+                    break
+                candidate = item.get("release")
+                if release_id is None and candidate and _resolved_path(Path(candidate)) != current_release:
+                    target_record = item
+                    break
+        if target_record is None:
+            raise ValueError("No requested rollback deployment is available")
+        release = _resolved_path(Path(target_record["release"]))
+        if not _path_is_within(release, paths["releases"]) or not release.is_dir():
+            raise ValueError("Rollback release is outside the managed releases directory or missing")
+        username = app["service_user"]
+        service_path = _service_path(app)
+        if not service_path.exists():
+            raise RuntimeError("Application service is not installed")
+        previous_running = app.get("status") == "running"
+        try:
+            _atomic_symlink(release, paths["current"])
+            _systemctl("restart", service_path.name)
+            if not _wait_for_health(app, int(config["health_timeout_seconds"])):
+                raise RuntimeError("Rolled-back application did not pass its health check")
+        except Exception as exc:
+            recovery_error = None
+            try:
+                if current_release is not None and current_release.is_dir():
+                    _atomic_symlink(current_release, paths["current"])
+                    if previous_running:
+                        _systemctl("restart", service_path.name)
+                        if not _wait_for_health(app, int(config["health_timeout_seconds"])):
+                            raise RuntimeError("The previous release did not recover its health check")
+                    else:
+                        _systemctl("stop", service_path.name)
+                else:
+                    if paths["current"].is_symlink():
+                        paths["current"].unlink()
+                    _systemctl("stop", service_path.name)
+            except Exception as recovery_exc:
+                recovery_error = str(recovery_exc)
+            message = f"Rollback failed: {exc}"
+            if recovery_error:
+                message += f"; restoring the previous release also failed: {recovery_error}"
+            raise RuntimeError(message) from exc
+        with _registry_transaction() as current_registry:
+            stored = _find_app(current_registry, app_id)
+            stored["status"] = "running"
+            stored["updated_at"] = now_iso()
+            _record_deployment(stored, {
+                "id": f"rollback-{uuid.uuid4().hex[:12]}",
+                "name": stored["name"],
+                "date": now_iso(),
+                "commit": target_record.get("commit"),
+                "release": str(release),
+                "release_available": True,
+                "build_status": "skipped",
+                "status": "rolled_back",
+                "error": None,
+            })
+        return {"ok": True, "app_id": app_id, "release": str(release), "service_user": username}
+
+
+def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
+    _require_root()
+    config = get_config()
+    with _app_lock(app_id):
+        with _registry_transaction() as registry:
+            app = _find_app(registry, app_id)
+            app_snapshot = dict(app)
+        service_path = _service_path(app_snapshot)
+        if not service_path.exists():
+            raise RuntimeError(f"Application service {service_path.name} is not installed; deploy it first")
+        _systemctl(action_name, service_path.name)
+        if action_name in {"start", "restart"} and not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
+            raise RuntimeError(f"Application did not pass its health check after {action_name}")
+        status = "stopped" if action_name == "stop" else "running"
+        with _registry_transaction() as registry:
+            app = _find_app(registry, app_id)
+            app["status"] = status
+            app["updated_at"] = now_iso()
+        return {"ok": True, "app_id": app_id, "status": status}
+
+
+def start_app(app_id: str) -> Dict[str, Any]:
+    return _service_action(app_id, "start")
+
+
+def stop_app(app_id: str) -> Dict[str, Any]:
+    return _service_action(app_id, "stop")
+
+
+def restart_app(app_id: str) -> Dict[str, Any]:
+    return _service_action(app_id, "restart")
+
+
+def logs_app(app_id: str, lines: int = 100) -> Dict[str, Any]:
+    validate_app_id(app_id)
+    if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= 1000:
+        raise ValueError("Log line count must be between 1 and 1000")
+    app = _find_app(get_registry(), app_id)
+    config = get_config()
+    paths = _app_paths(app_id, config)
+    stdout_log = paths["logs"] / "stdout.log"
+    stderr_log = paths["logs"] / "stderr.log"
+    output = _tail_log(stdout_log, lines)
+    errors = _tail_log(stderr_log, lines)
+    combined = []
+    if output:
+        combined.append("[stdout]\n" + output)
+    if errors:
+        combined.append("[stderr]\n" + errors)
+    return {
+        "ok": True,
+        "app_id": app_id,
+        "logs": "\n".join(combined),
+        "message": None if combined else "No application logs are available",
+    }
+
+
+def _tail_log(path: Path, lines: int, max_bytes: int = 1024 * 1024) -> str:
+    if not path.exists():
+        return ""
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Refusing to read non-regular application log: {path.name}")
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        end = handle.tell()
+        start = max(0, end - max_bytes)
+        handle.seek(start)
+        data = handle.read(max_bytes)
+    text = data.decode("utf-8", errors="replace")
+    if start:
+        text = text.split("\n", 1)[-1]
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def health_check_app(app_id: str) -> Dict[str, Any]:
+    app = _find_app(get_registry(), app_id)
+    url = app_health_url(app)
+    healthy = check_app_health(app, int(get_config()["health_timeout_seconds"]))
+    return {"ok": True, "app_id": app_id, "healthy": healthy, "url": url}
 
 
 def remove_app(app_id: str) -> Dict[str, Any]:
-    registry = get_registry()
-    apps = registry.get("apps", [])
-    filtered = [app for app in apps if app["id"] != app_id]
-    if len(filtered) == len(apps):
-        raise ValueError(f"App '{app_id}' not found")
-    registry["apps"] = filtered
-    save_registry(registry)
-    return {"ok": True, "removed": app_id}
+    validate_app_id(app_id)
+    _require_root()
+    with _app_lock(app_id):
+        app = _find_app(get_registry(), app_id)
+        service_path = _service_path(app)
+        _retire_legacy_root_service(app)
+        if service_path.exists():
+            _systemctl("disable", "--now", service_path.name)
+            service_path.unlink()
+            _systemctl("daemon-reload")
+        with _registry_transaction() as registry:
+            _find_app(registry, app_id)
+            registry["apps"] = [item for item in registry["apps"] if item.get("id") != app_id]
+        return {"ok": True, "removed": app_id, "data_retained": True}
+
+
+def open_app(app_id: str) -> Dict[str, Any]:
+    app = _find_app(get_registry(), app_id)
+    return {"ok": True, "app_id": app_id, "url": app.get("public_url", f"https://stuserver.online/{app_id}/")}
 
 
 def action(app_id: str, action_name: str) -> Dict[str, Any]:
-    registry = get_registry()
-    app = next((item for item in registry["apps"] if item["id"] == app_id), None)
-    if app is None:
-        raise ValueError(f"App '{app_id}' not found")
-
-    service_name = f"{app['slug']}.service"
-    if action_name == "deploy":
-        return deploy_app(app_id)
-    if action_name == "pull":
-        return {"ok": True, "result": clone_or_update_repo(app["repo_url"], Path(app["source_path"]), app["branch"])}
-    if action_name == "start":
-        subprocess.run(["systemctl", "start", service_name], check=False, capture_output=True, text=True)
-        app["status"] = "running"
-        save_registry(registry)
-        return {"ok": True}
-    if action_name == "stop":
-        subprocess.run(["systemctl", "stop", service_name], check=False, capture_output=True, text=True)
-        app["status"] = "stopped"
-        save_registry(registry)
-        return {"ok": True}
-    if action_name == "restart":
-        subprocess.run(["systemctl", "restart", service_name], check=False, capture_output=True, text=True)
-        app["status"] = "running"
-        save_registry(registry)
-        return {"ok": True}
-    if action_name == "remove":
-        return remove_app(app_id)
-    if action_name == "logs":
-        proc = subprocess.run(["journalctl", "-u", service_name, "-n", "50", "--no-pager"], capture_output=True, text=True, check=False)
-        return {"ok": proc.returncode == 0, "logs": proc.stdout}
-    return {"ok": False, "error": f"Action '{action_name}' is not supported"}
+    operations = {
+        "deploy": lambda: deploy_app(app_id),
+        "pull": lambda: pull_app(app_id),
+        "start": lambda: start_app(app_id),
+        "stop": lambda: stop_app(app_id),
+        "restart": lambda: restart_app(app_id),
+        "logs": lambda: logs_app(app_id),
+        "remove": lambda: remove_app(app_id),
+        "open": lambda: open_app(app_id),
+        "health": lambda: health_check_app(app_id),
+        "health-check": lambda: health_check_app(app_id),
+        "rollback": lambda: rollback_app(app_id),
+        "edit": lambda: edit_app(app_id, {}),
+    }
+    if action_name not in operations:
+        raise ValueError(f"Action {action_name!r} is not supported")
+    return operations[action_name]()
 
 
 def parse_payload(raw: str) -> Dict[str, Any]:
-    if not raw:
-        return {}
     try:
-        return json.loads(raw)
+        payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON payload: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Application payload must be a JSON object")
+    return payload
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Cockpit App Manager backend")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ValueError(message)
 
-    subparsers.add_parser("list")
-    subparsers.add_parser("overview")
-    subparsers.add_parser("deployments")
-    subparsers.add_parser("settings")
 
-    add_parser = subparsers.add_parser("add")
-    add_parser.add_argument("payload")
+def _build_parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(description="Cockpit App Manager backend")
+    commands = parser.add_subparsers(dest="command", required=True)
+    settings = commands.add_parser("settings")
+    settings.add_argument("payload", nargs="?")
+    for name in ("list", "overview", "deployments"):
+        commands.add_parser(name)
+    add = commands.add_parser("add")
+    add.add_argument("payload")
+    edit = commands.add_parser("edit")
+    edit.add_argument("app_id")
+    edit.add_argument("payload")
+    for name in ("deploy", "pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "open"):
+        command = commands.add_parser(name)
+        command.add_argument("app_id")
+    logs = commands.add_parser("logs")
+    logs.add_argument("app_id")
+    logs.add_argument("--lines", type=int, default=100)
+    rollback = commands.add_parser("rollback")
+    rollback.add_argument("app_id")
+    rollback.add_argument("release_id", nargs="?")
+    act = commands.add_parser("action")
+    act.add_argument("action_name")
+    act.add_argument("app_id")
+    return parser
 
-    action_parser = subparsers.add_parser("action")
-    action_parser.add_argument("action_name")
-    action_parser.add_argument("app_id")
 
-    remove_parser = subparsers.add_parser("remove")
-    remove_parser.add_argument("app_id")
+def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.command == "list":
+        return list_apps()
+    if args.command == "overview":
+        return overview()
+    if args.command == "deployments":
+        return get_deployments()
+    if args.command == "settings":
+        if getattr(args, "payload", None) is None:
+            return get_settings()
+        return update_settings(parse_payload(args.payload))
+    if args.command == "add":
+        return add_app(parse_payload(args.payload))
+    if args.command == "edit":
+        return edit_app(args.app_id, parse_payload(args.payload))
+    if args.command == "action":
+        return action(args.app_id, args.action_name)
+    if args.command == "logs":
+        return logs_app(args.app_id, args.lines)
+    if args.command == "rollback":
+        return rollback_app(args.app_id, args.release_id)
+    if args.command in {"health", "health-check", "check-health"}:
+        return health_check_app(args.app_id)
+    if args.command == "open":
+        return open_app(args.app_id)
+    operations = {
+        "deploy": deploy_app,
+        "pull": pull_app,
+        "start": start_app,
+        "stop": stop_app,
+        "restart": restart_app,
+        "remove": remove_app,
+    }
+    if args.command in operations:
+        return operations[args.command](args.app_id)
+    raise ValueError(f"Unsupported command: {args.command}")
 
-    args = parser.parse_args()
 
+def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
-        ensure_runtime_dirs()
-        if args.command == "list":
-            sys.stdout.write(json.dumps(list_apps()))
-        elif args.command == "overview":
-            sys.stdout.write(json.dumps(overview()))
-        elif args.command == "deployments":
-            sys.stdout.write(json.dumps(get_deployments()))
-        elif args.command == "settings":
-            sys.stdout.write(json.dumps(get_settings()))
-        elif args.command == "add":
-            payload = parse_payload(args.payload)
-            result = add_app(payload)
-            sys.stdout.write(json.dumps(result))
-        elif args.command == "action":
-            result = action(args.app_id, args.action_name)
-            sys.stdout.write(json.dumps(result))
-        elif args.command == "remove":
-            result = remove_app(args.app_id)
-            sys.stdout.write(json.dumps(result))
-        else:
-            raise ValueError(f"Unknown command '{args.command}'")
+        args = _build_parser().parse_args(argv)
+        result = _dispatch(args)
+        if not isinstance(result, dict):
+            raise RuntimeError("Backend command returned an invalid response")
+        response = dict(result)
+        response.setdefault("ok", True)
+        sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
         return 0
-    except Exception as exc:  # pragma: no cover - CLI error reporting
-        sys.stdout.write(json.dumps({"ok": False, "error": str(exc)}))
+    except SystemExit as exc:  # argparse help
+        return int(exc.code or 0)
+    except Exception as exc:
+        sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
+        sys.stdout.write(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, separators=(",", ":")) + "\n")
         return 1
 
 
