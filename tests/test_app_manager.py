@@ -29,6 +29,7 @@ class AppManagerTests(unittest.TestCase):
             "DEFAULT_SOURCE_ROOT": root / "state" / "sources",
             "DEFAULT_PRODUCTION_ROOT": root / "webapps",
             "DEFAULT_LOG_ROOT": root / "logs",
+            "DEFAULT_PLUGIN_VERSION_PATH": root / "state" / "plugin-version.json",
         }
         for attribute, path in paths.items():
             active_patch = patch.object(manager, attribute, str(path))
@@ -235,9 +236,144 @@ class AppManagerTests(unittest.TestCase):
         with patch.object(manager.subprocess, "run", side_effect=subprocess.TimeoutExpired("sleep", 1)):
             with self.assertRaisesRegex(RuntimeError, "timed out"):
                 manager.run_command(["sleep", "2"], timeout=1)
+        with patch.object(
+            manager.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(
+                "npm",
+                1,
+                output=b"install progress",
+                stderr=b"registry request failed",
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                manager.run_command(["npm", "ci"], timeout=1)
+        self.assertIn("stdout:\ninstall progress", str(raised.exception))
+        self.assertIn("stderr:\nregistry request failed", str(raised.exception))
         with patch.object(manager.subprocess, "run", side_effect=FileNotFoundError("missing")):
             with self.assertRaisesRegex(RuntimeError, "Could not run"):
                 manager.run_command(["missing"])
+
+    def test_run_command_streams_live_output_and_preserves_both_streams(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "deployment.log"
+            result = manager.run_command(
+                [
+                    manager.sys.executable,
+                    "-c",
+                    "import sys; print('build output'); print('build warning', file=sys.stderr)",
+                ],
+                timeout=10,
+                live_log_path=log_path,
+            )
+            live_log = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("build output", result.stdout)
+        self.assertIn("build warning", result.stderr)
+        self.assertIn("[stdout] build output", live_log)
+        self.assertIn("[stderr] build warning", live_log)
+
+    def test_live_command_timeout_keeps_captured_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(RuntimeError) as raised:
+                manager.run_command(
+                    [
+                        manager.sys.executable,
+                        "-c",
+                        "import time; print('started', flush=True); time.sleep(2)",
+                    ],
+                    timeout=1,
+                    live_log_path=Path(temporary) / "deployment.log",
+                )
+
+        self.assertIn("timed out", str(raised.exception))
+        self.assertIn("started", str(raised.exception))
+
+    def test_live_log_is_capped_without_truncating_command_output(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            manager, "MAX_DEPLOYMENT_LOG_BYTES", 1024
+        ):
+            log_path = Path(temporary) / "deployment.log"
+            result = manager.run_command(
+                [
+                    manager.sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.write('x' * 4096); sys.stdout.flush()",
+                ],
+                timeout=10,
+                live_log_path=log_path,
+            )
+            log_content = log_path.read_bytes()
+
+        self.assertEqual(len(result.stdout), 4096)
+        self.assertLessEqual(len(log_content), 1024)
+        self.assertIn(b"output truncated", log_content)
+
+    def test_deployment_logs_returns_tail_and_running_state(self):
+        app = self.add_app()["app"]
+        deployment_id = "20261109220923-abcdef12"
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            manager._record_deployment(stored, {
+                "id": deployment_id,
+                "name": app["name"],
+                "date": "2026-11-09T22:09:23Z",
+                "release": None,
+                "release_available": False,
+                "status": "deploying",
+            })
+        log_path = manager._deployment_log_path(app["id"], deployment_id, create=True)
+        manager._append_deployment_log(log_path, "Build started")
+
+        result = manager.deployment_logs_app(app["id"])
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["status"], "deploying")
+        self.assertIn("Build started", result["logs"])
+        self.assertIn("Build started", manager.logs_app(app["id"])["logs"])
+
+    def test_plugin_update_check_compares_installed_and_remote_revisions(self):
+        version_path = Path(manager.DEFAULT_PLUGIN_VERSION_PATH)
+        version_path.parent.mkdir(parents=True)
+        version_path.write_text(json.dumps({"commit": "a" * 40}), encoding="utf-8")
+        with patch.object(manager, "_plugin_remote_commit", return_value="b" * 40):
+            result = manager.plugin_update_check()
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["current_commit"], "a" * 40)
+        self.assertEqual(result["latest_commit"], "b" * 40)
+
+    def test_plugin_update_downloads_fixed_upstream_and_runs_its_installer(self):
+        commit = "b" * 40
+
+        def fake_git(args, timeout=120):
+            if "clone" in args:
+                checkout = Path(args[-1])
+                (checkout / "scripts").mkdir(parents=True)
+                (checkout / "scripts" / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=commit + "\n", stderr="")
+
+        with patch.object(manager, "plugin_update_check", return_value={"available": True}), patch.object(
+            manager, "_account_ids", return_value=(65534, 65534)
+        ), patch.object(manager, "_plugin_git", side_effect=fake_git) as plugin_git, patch.object(
+            manager, "_seal_plugin_update_checkout"
+        ), patch.object(manager.os, "chown", create=True), patch.object(
+            manager.os, "chmod"
+        ), patch.object(
+            manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="installed", stderr="")
+        ) as install:
+            result = manager.plugin_update()
+
+        self.assertTrue(result["updated"])
+        self.assertEqual(result["commit"], commit)
+        clone_command = plugin_git.call_args_list[0].args[0]
+        self.assertIn(manager.PLUGIN_REPOSITORY_URL, clone_command)
+        self.assertIn("--branch", clone_command)
+        self.assertEqual(install.call_args.args[0][0], "bash")
+        installer_path = install.call_args.args[0][1].replace("\\", "/")
+        self.assertTrue(installer_path.endswith("scripts/install.sh"))
 
     def test_git_clone_failure_is_reported_and_partial_directory_removed(self):
         source = Path(manager.DEFAULT_SOURCE_ROOT) / "example-site"
@@ -338,14 +474,189 @@ class AppManagerTests(unittest.TestCase):
             release = Path(tmp) / "release"
             repo.mkdir()
             release.mkdir()
-            (repo / "package.json").write_text('{"dependencies":{"next":"^15"}}', encoding="utf-8")
+            (repo / "package.json").write_text(
+                '{"dependencies":{"next":"^15"},"scripts":{"build":"next build"}}',
+                encoding="utf-8",
+            )
             failed = subprocess.CompletedProcess(args=["npm"], returncode=2, stdout="", stderr="compile failed")
 
             runner = Mock(return_value=failed)
 
             with self.assertRaisesRegex(RuntimeError, "compile failed"):
                 NextJSAdapter().build({"port": 8100}, repo, release, runner=runner, timeout=1)
-            runner.assert_called_once()
+            self.assertEqual(runner.call_count, 1)
+
+
+class NextJSDependencyInstallationTests(unittest.TestCase):
+    def build_project(self, lockfiles, runner):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        repo = root / "repo"
+        release = root / "release"
+        repo.mkdir()
+        release.mkdir()
+        (repo / "package.json").write_text(
+            json.dumps({
+                "dependencies": {"next": "^15.0.0", "react": "^19.0.0"},
+                "devDependencies": {"typescript": "^5.0.0"},
+                "scripts": {"build": "next build"},
+            }),
+            encoding="utf-8",
+        )
+        for name, contents in lockfiles.items():
+            path = repo / name
+            if isinstance(contents, bytes):
+                path.write_bytes(contents)
+            else:
+                path.write_text(contents, encoding="utf-8")
+        result = NextJSAdapter().build(
+            {"port": 8123},
+            repo,
+            release,
+            runner=runner,
+            timeout=17,
+        )
+        return repo, release, result
+
+    def successful_runner(self):
+        return Mock(side_effect=[
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            for _ in range(3)
+        ])
+
+    def test_npm_lockfile_uses_ci_build_and_production_prune(self):
+        package_lock = json.dumps({"lockfileVersion": 3, "packages": {}})
+        runner = self.successful_runner()
+        repo, release, result = self.build_project({"package-lock.json": package_lock}, runner)
+
+        calls = [call.args[0] for call in runner.call_args_list]
+        self.assertEqual(calls, [
+            ["npm", "ci", "--include=dev", "--no-fund", "--no-audit"],
+            ["npm", "run", "build"],
+            ["npm", "prune", "--omit=dev", "--no-fund", "--no-audit"],
+        ])
+        self.assertEqual(
+            result["start_command"],
+            ["npm", "exec", "--", "next", "start", "--hostname", "127.0.0.1", "--port", "8123"],
+        )
+        self.assertEqual((repo / "package-lock.json").read_text(encoding="utf-8"), package_lock)
+        self.assertTrue((release / "app" / "package-lock.json").is_file())
+
+    def test_npm_shrinkwrap_is_used_as_npm_lockfile(self):
+        shrinkwrap = json.dumps({"lockfileVersion": 3, "packages": {}})
+        runner = self.successful_runner()
+        self.build_project({"npm-shrinkwrap.json": shrinkwrap}, runner)
+
+        self.assertEqual(
+            runner.call_args_list[0].args[0],
+            ["npm", "ci", "--include=dev", "--no-fund", "--no-audit"],
+        )
+
+    def test_npm_without_lockfile_uses_install_only_in_release_copy(self):
+        runner = self.successful_runner()
+        repo, release, _ = self.build_project({}, runner)
+
+        self.assertEqual(
+            runner.call_args_list[0].args[0],
+            ["npm", "install", "--include=dev", "--no-fund", "--no-audit"],
+        )
+        self.assertFalse((repo / "package-lock.json").exists())
+        self.assertTrue((release / "app" / "package.json").is_file())
+
+    def test_inconsistent_npm_lockfile_reports_complete_output_without_fallback(self):
+        package_lock = json.dumps({"lockfileVersion": 3, "packages": {}})
+        stdout = "npm ci started\n" + ("install output\n" * 600)
+        stderr = "npm error code EUSAGE\npackage.json and package-lock.json must be in sync\n"
+        runner = Mock(return_value=subprocess.CompletedProcess(
+            args=["npm", "ci"],
+            returncode=1,
+            stdout=stdout,
+            stderr=stderr,
+        ))
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repo = Path(temporary.name) / "repo"
+        release = Path(temporary.name) / "release"
+        repo.mkdir()
+        release.mkdir()
+        package_json = {
+            "dependencies": {"next": "^15.0.0"},
+            "scripts": {"build": "next build"},
+        }
+        (repo / "package.json").write_text(json.dumps(package_json), encoding="utf-8")
+        (repo / "package-lock.json").write_text(package_lock, encoding="utf-8")
+
+        with self.assertRaises(RuntimeError) as raised:
+            NextJSAdapter().build({"port": 8123}, repo, release, runner=runner, timeout=17)
+
+        message = str(raised.exception)
+        self.assertIn("inconsistent with package.json", message)
+        self.assertIn(stdout, message)
+        self.assertIn(stderr.strip(), message)
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual((repo / "package-lock.json").read_text(encoding="utf-8"), package_lock)
+
+    def test_pnpm_yarn_and_bun_use_lockfile_specific_commands(self):
+        cases = (
+            (
+                {"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
+                ["pnpm", "install", "--frozen-lockfile", "--prod=false"],
+                ["pnpm", "run", "build"],
+                ["pnpm", "install", "--frozen-lockfile", "--prod=true"],
+                ["pnpm", "exec", "next", "start", "--hostname", "127.0.0.1", "--port", "8123"],
+            ),
+            (
+                {"yarn.lock": "# yarn lockfile"},
+                ["yarn", "install", "--frozen-lockfile", "--production=false"],
+                ["yarn", "run", "build"],
+                ["yarn", "install", "--frozen-lockfile", "--production=true"],
+                ["yarn", "run", "next", "start", "--hostname", "127.0.0.1", "--port", "8123"],
+            ),
+            (
+                {"bun.lock": "{\"lockfileVersion\":1}"},
+                ["bun", "install", "--frozen-lockfile"],
+                ["bun", "run", "build"],
+                ["bun", "install", "--frozen-lockfile", "--production"],
+                ["bun", "run", "next", "start", "--hostname", "127.0.0.1", "--port", "8123"],
+            ),
+            (
+                {"bun.lockb": b"\x00bun-lock"},
+                ["bun", "install", "--frozen-lockfile"],
+                ["bun", "run", "build"],
+                ["bun", "install", "--frozen-lockfile", "--production"],
+                ["bun", "run", "next", "start", "--hostname", "127.0.0.1", "--port", "8123"],
+            ),
+        )
+        for lockfiles, install, build, production, start in cases:
+            with self.subTest(lockfile=next(iter(lockfiles))):
+                runner = self.successful_runner()
+                repo, _, result = self.build_project(lockfiles, runner)
+                self.assertEqual(
+                    [call.args[0] for call in runner.call_args_list],
+                    [install, build, production],
+                )
+                self.assertEqual(result["start_command"], start)
+                self.assertTrue(all(call.args[1] == repo.parent / "release" / "app" for call in runner.call_args_list))
+                self.assertTrue(all(call.args[2] == 17 for call in runner.call_args_list))
+
+    def test_failed_dependency_install_preserves_stdout_and_stderr(self):
+        stdout = "resolver output\n" + ("package detail\n" * 600)
+        stderr = "ERR_PNPM_FETCH_500: registry unavailable"
+        runner = Mock(return_value=subprocess.CompletedProcess(
+            args=["pnpm", "install"],
+            returncode=1,
+            stdout=stdout,
+            stderr=stderr,
+        ))
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.build_project({"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"}, runner)
+
+        self.assertIn("Installing Next.js dependencies with pnpm failed", str(raised.exception))
+        self.assertIn(stdout, str(raised.exception))
+        self.assertIn(stderr, str(raised.exception))
+        self.assertEqual(runner.call_count, 1)
 
 
 class InfrastructureConfigurationTests(unittest.TestCase):
@@ -399,8 +710,20 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             'callBackend("rollback", [appId, releaseId])',
             'callBackend("remove", [appId])',
             '() => callBackend(action, [appId])',
+            'callBackend("deployment-logs", [appId])',
+            'callBackend("plugin-update-check")',
+            'callBackend("plugin-update")',
         ):
             self.assertIn(endpoint, frontend)
+        self.assertIn('id="checkUpdateButton"', html)
+        self.assertIn('function deployWithLiveLog(appId)', frontend)
+        self.assertIn('class="am-log-output"', frontend)
+        self.assertIn('if (result.available)', frontend)
+        backend = (project / "backend" / "app_manager.py").read_text(encoding="utf-8")
+        self.assertIn('PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"', backend)
+        self.assertIn('PLUGIN_UPDATE_USER = "nobody"', backend)
+        self.assertIn('["runuser", "--user", PLUGIN_UPDATE_USER, "--", *env_args]', backend)
+        self.assertIn('["bash", str(installer)]', backend)
         self.assertIn('target="_blank" rel="noopener noreferrer"', frontend)
         self.assertIn('Another operation is still in progress.', frontend)
         self.assertIn('updateConnection("error", "Could not load data")', frontend)
@@ -473,6 +796,19 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         read_write_paths = next(line for line in service.splitlines() if line.startswith("ReadWritePaths="))
         self.assertNotIn(manager._systemd_quote(str(paths["current"] / "app")), read_write_paths)
         self.assertNotIn(manager._systemd_quote(str(paths["releases"])), read_write_paths)
+
+    def test_nextjs_service_runs_with_production_node_environment(self):
+        config = manager._default_config()
+        app = {
+            "id": "next-demo",
+            "service_user": "app-next-demo",
+            "port": 8123,
+            "framework": "nextjs",
+        }
+
+        service = manager._render_service(app, ["/opt/webapps/next-demo/current/app/next"], config)
+
+        self.assertIn('Environment="NODE_ENV=production"', service)
 
     def test_release_sealing_removes_app_write_access(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -741,6 +1077,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('"$STATE_ROOT/apps.json" "$STATE_ROOT/config.json"', installer)
         self.assertIn('chmod 0600 "$STATE_ROOT/apps.json" "$STATE_ROOT/config.json"', installer)
         self.assertIn('if [[ ! -e "$STATE_ROOT/config.json" ]]', installer)
+        self.assertIn('git -C "$APP_DIR" rev-parse --verify HEAD', installer)
+        self.assertIn('"$STATE_ROOT/plugin-version.json"', installer)
         frontend = (project / "cockpit" / "app-manager.js").read_text(encoding="utf-8")
         self.assertIn('superuser: "require"', frontend)
         self.assertIn('config.command_timeout_seconds ?? 30', frontend)

@@ -93,6 +93,8 @@
     const refreshButton = byId("refreshButton");
     refreshButton.querySelector("span").textContent = busy ? "Working…" : "Refresh";
     refreshButton.setAttribute("aria-label", busy ? "App Manager is working" : "Refresh application data");
+    const updateButton = byId("checkUpdateButton");
+    updateButton.querySelector("span").textContent = busy ? "Please wait…" : "Check for updates";
     document.querySelector(".am-app-manager").setAttribute("aria-busy", String(busy));
     if (busy) updateConnection("busy", "Working…");
     else if (byId("appManagerConnection").dataset.state === "busy") updateConnection("connected", "Ready");
@@ -464,6 +466,92 @@
     }, "Logs loaded.", false);
   }
 
+  function renderDeploymentLog(result) {
+    const output = byId("deploymentLiveLog");
+    const status = byId("deploymentLiveStatus");
+    if (!output || !status) return;
+    output.textContent = result.logs || "Waiting for deployment output…";
+    output.scrollTop = output.scrollHeight;
+    status.textContent = result.active
+      ? "Deployment in progress"
+      : result.status === "deployed"
+        ? "Deployment complete"
+        : result.status === "failed"
+          ? "Deployment failed"
+          : "Preparing deployment";
+  }
+
+  async function deployWithLiveLog(appId) {
+    openDialog(
+      "Live deployment log",
+      `<p id="deploymentLiveStatus" class="am-dialog-intro" role="status" aria-live="polite">Starting deployment…</p>
+       <pre id="deploymentLiveLog" class="am-log-output" aria-live="polite">Waiting for deployment output…</pre>`,
+    );
+    let finished = false;
+    const deploymentPromise = callBackend("deploy", [appId]);
+    const pollPromise = (async () => {
+      while (!finished) {
+        try {
+          renderDeploymentLog(await callBackend("deployment-logs", [appId]));
+        } catch (error) {
+          const output = byId("deploymentLiveLog");
+          if (output) {
+            output.textContent += `\nLive log polling failed: ${error.message}`;
+            output.scrollTop = output.scrollHeight;
+          }
+        }
+        if (!finished) await new Promise((resolve) => window.setTimeout(resolve, 750));
+      }
+    })();
+    try {
+      await deploymentPromise;
+    } finally {
+      finished = true;
+      await pollPromise;
+      try {
+        renderDeploymentLog(await callBackend("deployment-logs", [appId]));
+      } catch (error) {
+        const output = byId("deploymentLiveLog");
+        if (output) output.textContent += `\nFinal log refresh failed: ${error.message}`;
+      }
+    }
+  }
+
+  function showPluginUpdate(result) {
+    const latest = String(result.latest_commit || "");
+    const body = `
+      <p class="am-dialog-intro">A newer App Manager revision is available. The update will be downloaded from the project's fixed HTTPS GitHub repository and reinstalled.</p>
+      <dl class="am-settings-paths">
+        <div><dt>Installed</dt><dd>${escapeHtml(result.current_commit || "Unknown")}</dd></div>
+        <div><dt>Available</dt><dd>${escapeHtml(latest || "Unknown")}</dd></div>
+      </dl>
+      <p class="am-field-hint">The plugin files will be replaced. Application source, releases, and host configuration are not changed.</p>
+    `;
+    openDialog("App Manager update available", body, "Pull and reinstall", async () => {
+      setBusy(true);
+      try {
+        const update = await callBackend("plugin-update");
+        showNotice(update.updated
+          ? `App Manager updated to ${String(update.commit || "").slice(0, 12)}. Reload Cockpit to use the new plugin files.`
+          : "App Manager is already up to date.");
+        return true;
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  function checkPluginUpdates() {
+    void runOperation(async () => {
+      const result = await callBackend("plugin-update-check");
+      if (result.available) {
+        showPluginUpdate(result);
+      } else {
+        showNotice("App Manager is up to date.");
+      }
+    }, "", false);
+  }
+
   async function handleAppAction(action, appId) {
     const app = state.apps.find((item) => item.id === appId);
     if (!app) {
@@ -501,6 +589,13 @@
       start: `Start "${app.name}"?`,
     };
     if (confirmations[action] && !window.confirm(confirmations[action])) return;
+    if (action === "deploy") {
+      await runOperation(
+        () => deployWithLiveLog(appId),
+        "Deployment completed.",
+      );
+      return;
+    }
     const labels = {
       deploy: "Deployment completed.",
       pull: "Repository update completed.",
@@ -568,6 +663,7 @@
   byId("refreshButton").addEventListener("click", () => {
     void runOperation(refreshData, "Application data refreshed.", false);
   });
+  byId("checkUpdateButton").addEventListener("click", checkPluginUpdates);
   byId("appsTableContainer").addEventListener("click", (event) => {
     const button = event.target instanceof Element ? event.target.closest("button[data-action]") : null;
     if (button) void handleAppAction(button.dataset.action, button.dataset.id).catch(showError);

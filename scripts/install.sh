@@ -121,6 +121,28 @@ install_files() {
     fail "The installed backend or one of its imports failed."
   [[ -r "$BACKEND_DEST/adapters.py" && -x "$BACKEND_DEST/app-manager" ]] ||
     fail "Installed backend files have incorrect permissions."
+
+  local plugin_commit=""
+  if command -v git >/dev/null 2>&1; then
+    plugin_commit="$(git -C "$APP_DIR" rev-parse --verify HEAD 2>/dev/null || true)"
+  fi
+  if [[ ! "$plugin_commit" =~ ^[0-9a-f]{40,64}$ ]]; then
+    plugin_commit=""
+  fi
+  if [[ -L "$STATE_ROOT/plugin-version.json" ]]; then
+    fail "Plugin version metadata must not be a symlink."
+  fi
+  if [[ -e "$STATE_ROOT/plugin-version.json" && ! -f "$STATE_ROOT/plugin-version.json" ]]; then
+    fail "Plugin version metadata must be a regular file."
+  fi
+  local version_tmp="$STATE_ROOT/.plugin-version.json.$$"
+  install -o root -g root -m 0600 /dev/null "$version_tmp"
+  if [[ -n "$plugin_commit" ]]; then
+    printf '{"commit":"%s"}\n' "$plugin_commit" >"$version_tmp"
+  else
+    printf '{"commit":null}\n' >"$version_tmp"
+  fi
+  mv -f -- "$version_tmp" "$STATE_ROOT/plugin-version.json"
 }
 
 preflight

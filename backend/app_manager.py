@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import json
 import os
@@ -11,13 +12,14 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 try:
@@ -52,10 +54,15 @@ DEFAULT_REGISTRY_PATH = f"{DEFAULT_STATE_ROOT}/apps.json"
 DEFAULT_PRODUCTION_ROOT = "/opt/webapps"
 DEFAULT_SOURCE_ROOT = f"{DEFAULT_STATE_ROOT}/sources"
 DEFAULT_LOG_ROOT = "/var/log/cockpit-app-manager"
+DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
+PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
+PLUGIN_REPOSITORY_BRANCH = "main"
+PLUGIN_UPDATE_USER = "nobody"
 PORT_START = 8100
 PORT_END = 8999
 RESERVED_PORTS = {8080}
 COMMAND_TIMEOUT_SECONDS = 30
+MAX_DEPLOYMENT_LOG_BYTES = 5 * 1024 * 1024
 APP_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 FRAMEWORKS = {"auto", "nextjs", "go", "node", "python", "static"}
@@ -514,10 +521,13 @@ def run_command(
     cwd: Optional[Path] = None,
     timeout: int = COMMAND_TIMEOUT_SECONDS,
     env: Optional[Dict[str, str]] = None,
+    live_log_path: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     if not args or not all(isinstance(arg, str) and "\0" not in arg for arg in args):
         raise ValueError("Subprocess arguments must be a non-empty list of strings")
     try:
+        if live_log_path is not None:
+            return _run_command_with_live_log(args, cwd, timeout, env, live_log_path)
         return subprocess.run(
             list(args),
             cwd=str(cwd) if cwd is not None else None,
@@ -528,9 +538,130 @@ def run_command(
             timeout=max(1, int(timeout)),
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Command timed out after {timeout} seconds: {args[0]}") from exc
+        details = []
+        for label, output in (("stdout", exc.stdout), ("stderr", exc.stderr)):
+            if output:
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                details.append(f"{label}:\n{output.rstrip()}")
+        detail = "\n".join(details)
+        raise RuntimeError(
+            f"Command timed out after {timeout} seconds: {args[0]}"
+            + (f"\n{detail}" if detail else "")
+        ) from exc
     except OSError as exc:
         raise RuntimeError(f"Could not run {args[0]}: {exc}") from exc
+
+
+def _run_command_with_live_log(
+    args: Sequence[str],
+    cwd: Optional[Path],
+    timeout: int,
+    env: Optional[Dict[str, str]],
+    live_log_path: Path,
+) -> subprocess.CompletedProcess:
+    live_log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if live_log_path.is_symlink() or (live_log_path.exists() and not live_log_path.is_file()):
+        raise RuntimeError("Refusing to write a deployment log through a non-regular file")
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    reader_errors = []
+    write_lock = threading.Lock()
+    log_truncated = False
+
+    def append_live_text(channel: str, text: str) -> None:
+        nonlocal log_truncated
+        if not text or log_truncated:
+            return
+        marker = b"\n[deployment output truncated at 5 MiB]\n"
+        with write_lock:
+            current_size = live_log_path.stat().st_size if live_log_path.exists() else 0
+            write_limit = MAX_DEPLOYMENT_LOG_BYTES - len(marker)
+            remaining = max(0, write_limit - current_size)
+            encoded = f"[{channel}] {text}".encode("utf-8")
+            with live_log_path.open("ab") as handle:
+                if remaining:
+                    handle.write(encoded[:remaining])
+                if len(encoded) > remaining:
+                    handle.write(marker)
+                    log_truncated = True
+                handle.flush()
+    process = subprocess.Popen(
+        list(args),
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+    )
+
+    def consume(channel: str, stream: Any) -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        log_write_failed = False
+        try:
+            while True:
+                chunk = os.read(stream.fileno(), 4096)
+                if not chunk:
+                    break
+                output[channel].extend(chunk)
+                text = decoder.decode(chunk)
+                if not log_write_failed:
+                    try:
+                        append_live_text(channel, text)
+                    except Exception as exc:
+                        reader_errors.append(exc)
+                        log_write_failed = True
+            remaining = decoder.decode(b"", final=True)
+            if not log_write_failed:
+                try:
+                    append_live_text(channel, remaining)
+                except Exception as exc:
+                    reader_errors.append(exc)
+        except Exception as exc:
+            reader_errors.append(exc)
+            while True:
+                try:
+                    if not os.read(stream.fileno(), 4096):
+                        break
+                except OSError:
+                    break
+
+    threads = [
+        threading.Thread(target=consume, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=consume, args=("stderr", process.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=max(1, int(timeout)))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        returncode = process.wait()
+    finally:
+        for thread in threads:
+            thread.join()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+    stdout = output["stdout"].decode("utf-8", errors="replace")
+    stderr = output["stderr"].decode("utf-8", errors="replace")
+    if timed_out:
+        details = []
+        if stdout:
+            details.append(f"stdout:\n{stdout.rstrip()}")
+        if stderr:
+            details.append(f"stderr:\n{stderr.rstrip()}")
+        detail = "\n".join(details)
+        raise RuntimeError(
+            f"Command timed out after {timeout} seconds: {args[0]}"
+            + (f"\n{detail}" if detail else "")
+        )
+    if reader_errors:
+        raise RuntimeError(f"Could not write live deployment output: {reader_errors[0]}")
+    return subprocess.CompletedProcess(list(args), returncode, stdout, stderr)
 
 
 def _command_error(result: subprocess.CompletedProcess, description: str) -> None:
@@ -641,6 +772,7 @@ def _run_as_user(
     cwd: Optional[Path] = None,
     timeout: int = COMMAND_TIMEOUT_SECONDS,
     environment: Optional[Dict[str, str]] = None,
+    live_log_path: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     _require_root()
     if os.name == "nt":
@@ -661,6 +793,7 @@ def _run_as_user(
         ["runuser", "--user", username, "--", *env_args, *args],
         cwd=cwd,
         timeout=timeout,
+        live_log_path=live_log_path,
     )
 
 
@@ -997,6 +1130,154 @@ def get_settings() -> Dict[str, Any]:
     return {"config": get_config()}
 
 
+def _plugin_update_environment() -> Dict[str, str]:
+    return {
+        "HOME": "/nonexistent",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _plugin_git(args: Sequence[str], timeout: int = 120) -> subprocess.CompletedProcess:
+    _require_root()
+    if not _account_exists(PLUGIN_UPDATE_USER):
+        raise RuntimeError(f"The unprivileged update account {PLUGIN_UPDATE_USER} is unavailable")
+    env_args = [
+        "env",
+        "-i",
+        *[f"{key}={value}" for key, value in _plugin_update_environment().items()],
+        *args,
+    ]
+    return run_command(
+        ["runuser", "--user", PLUGIN_UPDATE_USER, "--", *env_args],
+        timeout=timeout,
+        env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"]},
+    )
+
+
+def _plugin_remote_commit() -> str:
+    result = _plugin_git(
+        [
+            "git",
+            "ls-remote",
+            "--exit-code",
+            PLUGIN_REPOSITORY_URL,
+            f"refs/heads/{PLUGIN_REPOSITORY_BRANCH}",
+        ]
+    )
+    _command_error(result, "Checking for App Manager updates")
+    match = re.fullmatch(
+        rf"([0-9a-f]{{40,64}})\trefs/heads/{re.escape(PLUGIN_REPOSITORY_BRANCH)}\s*",
+        result.stdout or "",
+    )
+    if not match:
+        raise RuntimeError("The App Manager update source returned an invalid Git revision")
+    return match.group(1)
+
+
+def _installed_plugin_commit() -> Optional[str]:
+    version_path = Path(DEFAULT_PLUGIN_VERSION_PATH)
+    if version_path.is_symlink():
+        raise RuntimeError("Installed plugin version metadata must not be a symlink")
+    if not version_path.exists():
+        return None
+    try:
+        payload = json.loads(version_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Installed plugin version metadata is invalid: {exc}") from exc
+    commit = payload.get("commit") if isinstance(payload, dict) else None
+    if commit is not None and (
+        not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit)
+    ):
+        raise RuntimeError("Installed plugin version metadata contains an invalid Git revision")
+    return commit
+
+
+def plugin_update_check() -> Dict[str, Any]:
+    current_commit = _installed_plugin_commit()
+    latest_commit = _plugin_remote_commit()
+    return {
+        "ok": True,
+        "available": current_commit != latest_commit,
+        "current_commit": current_commit,
+        "latest_commit": latest_commit,
+    }
+
+
+def _seal_plugin_update_checkout(checkout: Path, update_root: Path) -> None:
+    for root, dirs, files in os.walk(checkout, topdown=True, followlinks=False):
+        root_path = Path(root)
+        if root_path.is_symlink():
+            raise RuntimeError("Update checkout contains a symlinked directory")
+        os.chown(str(root_path), 0, 0)
+        os.chmod(str(root_path), 0o500)
+        for name in dirs + files:
+            path = root_path / name
+            if path.is_symlink():
+                raise RuntimeError("Update checkout contains a symlink")
+            os.chown(str(path), 0, 0)
+            os.chmod(str(path), 0o400 if path.is_file() else 0o500)
+    os.chown(str(update_root), 0, 0)
+    os.chmod(str(update_root), 0o700)
+
+
+def plugin_update() -> Dict[str, Any]:
+    _require_root()
+    check = plugin_update_check()
+    if not check["available"]:
+        return {"ok": True, "updated": False, "commit": check["current_commit"]}
+
+    update_parent = Path(DEFAULT_STATE_ROOT) / "plugin-updates"
+    if Path(DEFAULT_STATE_ROOT).is_symlink() or update_parent.is_symlink():
+        raise RuntimeError("Plugin update staging directory must not be a symlink")
+    update_parent.mkdir(parents=True, exist_ok=True, mode=0o711)
+    os.chmod(str(update_parent), 0o711)
+    update_root = Path(tempfile.mkdtemp(prefix="app-manager-update-", dir=str(update_parent)))
+    checkout = update_root / "checkout"
+    try:
+        uid, gid = _account_ids(PLUGIN_UPDATE_USER)
+        os.chown(str(update_root), uid, gid)
+        result = _plugin_git(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                PLUGIN_REPOSITORY_BRANCH,
+                "--single-branch",
+                "--no-tags",
+                PLUGIN_REPOSITORY_URL,
+                str(checkout),
+            ],
+            timeout=300,
+        )
+        _command_error(result, "Downloading the App Manager update")
+        if not checkout.is_dir() or checkout.is_symlink():
+            raise RuntimeError("The App Manager update checkout is invalid")
+        commit_result = _plugin_git(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+        _command_error(commit_result, "Verifying the App Manager update")
+        match = re.fullmatch(r"[0-9a-f]{40,64}", (commit_result.stdout or "").strip())
+        if not match:
+            raise RuntimeError("The downloaded App Manager update has an invalid Git revision")
+        _seal_plugin_update_checkout(checkout, update_root)
+        installer = checkout / "scripts" / "install.sh"
+        if installer.is_symlink() or not installer.is_file():
+            raise RuntimeError("The App Manager update does not contain a regular installer")
+        install_result = run_command(
+            ["bash", str(installer)],
+            cwd=checkout,
+            timeout=300,
+            env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"]},
+        )
+        _command_error(install_result, "Reinstalling the App Manager plugin")
+        return {"ok": True, "updated": True, "commit": match.group(0)}
+    finally:
+        shutil.rmtree(update_root)
+
+
 def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Settings payload must be a JSON object")
@@ -1135,6 +1416,11 @@ def _render_service(
     )
     read_write_paths = " ".join(_systemd_quote(str(path)) for path in writable_paths)
     exec_start = " ".join(_systemd_quote(part) for part in start_command)
+    node_environment = (
+        f"Environment={_systemd_quote('NODE_ENV=production')}\n"
+        if app.get("framework") == "nextjs"
+        else ""
+    )
     return (
         "[Unit]\n"
         "# Managed by Cockpit App Manager\n"
@@ -1148,6 +1434,7 @@ def _render_service(
         f"ExecStart={exec_start}\n"
         f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
         f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
+        f"{node_environment}"
         f"Environment={_systemd_quote('APP_BASE_PATH=/' + app['id'])}\n"
         f"Environment={_systemd_quote('APP_CONFIG_DIR=' + str(paths['config']))}\n"
         f"Environment={_systemd_quote('HOME=' + str(paths['home']))}\n"
@@ -1346,6 +1633,51 @@ def _app_lock(app_id: str) -> contextlib.AbstractContextManager:
     return _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / f"{validate_app_id(app_id)}.lock")
 
 
+def _deployment_log_path(app_id: str, deployment_id: str, *, create: bool = False) -> Path:
+    app_id = validate_app_id(app_id)
+    if not re.fullmatch(r"\d{14}-[a-f0-9]{8}", deployment_id):
+        raise ValueError("Invalid deployment log identifier")
+    state_root = Path(DEFAULT_STATE_ROOT)
+    log_root = state_root / "deployment-logs"
+    if state_root.is_symlink() or log_root.is_symlink():
+        raise RuntimeError("Deployment log directory must not be a symlink")
+    log_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(str(log_root), 0o700)
+    path = log_root / f"{app_id}-{deployment_id}.log"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError("Deployment log must be a regular file")
+    if create:
+        descriptor = os.open(
+            str(path),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+    return path
+
+
+def _append_deployment_log(path: Path, message: str) -> None:
+    descriptor = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(f"{now_iso()} {message.rstrip()}\n")
+            handle.flush()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _setup_app_directories(app: Dict[str, Any], username: str, config: Dict[str, Any]) -> Dict[str, Path]:
     paths = _app_paths(app["id"], config)
     paths["home"].parent.mkdir(parents=True, exist_ok=True, mode=0o711)
@@ -1437,13 +1769,17 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
         current_release: Optional[Path] = None
         service_path: Optional[Path] = None
         previous_service_content: Optional[bytes] = None
+        deployment_log: Optional[Path] = None
         unit_written = False
         activation_attempted = False
         try:
+            deployment_log = _deployment_log_path(app_id, release_id, create=True)
+            _append_deployment_log(deployment_log, "Deployment started")
             username = ensure_app_user(app_id)
             paths = _setup_app_directories(app_snapshot, username, config)
             current_release = paths["current"].resolve(strict=False) if paths["current"].exists() or paths["current"].is_symlink() else None
             source_path = paths["source"]
+            _append_deployment_log(deployment_log, "Updating the application source repository")
             clone_or_update_repo(
                 app_snapshot["repo_url"],
                 source_path,
@@ -1454,6 +1790,8 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             framework = app_snapshot.get("framework", "auto")
             if framework == "auto":
                 framework = detect_framework(source_path)
+            app_snapshot["framework"] = framework
+            _append_deployment_log(deployment_log, f"Detected framework: {framework}")
             adapter = get_adapter(framework)
             release_dir = paths["releases"] / release_id
             _prepare_release_directory(release_dir, username)
@@ -1471,11 +1809,16 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                 app_snapshot,
                 source_path,
                 release_dir,
-                runner=lambda args, cwd, timeout: _run_checked_as_user(
-                    username, args, cwd, timeout, f"{framework} build"
+                runner=lambda args, cwd, timeout: _run_as_user(
+                    username,
+                    args,
+                    cwd,
+                    timeout,
+                    live_log_path=deployment_log,
                 ),
                 timeout=int(config["build_timeout_seconds"]),
             )
+            _append_deployment_log(deployment_log, "Build completed; activating the release")
             _, release_group = _account_ids(username)
             _seal_release(release_dir, release_group, public=framework == "static")
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
@@ -1487,9 +1830,14 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             activation_attempted = True
             _systemctl("enable", service_path.name)
             _systemctl("restart", service_path.name)
+            _append_deployment_log(deployment_log, "Waiting for the application health check")
             if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
                 raise RuntimeError("Application did not pass its health check before the timeout")
+            _append_deployment_log(deployment_log, "Deployment completed successfully")
         except Exception as exc:
+            if deployment_log is not None:
+                with contextlib.suppress(OSError):
+                    _append_deployment_log(deployment_log, f"Deployment failed: {exc}")
             rollback_error = None
             try:
                 if unit_written and service_path is not None:
@@ -1676,11 +2024,50 @@ def logs_app(app_id: str, lines: int = 100) -> Dict[str, Any]:
         combined.append("[stdout]\n" + output)
     if errors:
         combined.append("[stderr]\n" + errors)
+    latest = next(
+        (
+            item for item in reversed(app.get("deployments", []))
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and re.fullmatch(r"\d{14}-[a-f0-9]{8}", item["id"])
+        ),
+        None,
+    )
+    if latest is not None:
+        deployment_path = _deployment_log_path(app_id, latest["id"])
+        deployment_output = _tail_log(deployment_path, lines)
+        if deployment_output:
+            combined.append("[latest deployment]\n" + deployment_output)
     return {
         "ok": True,
         "app_id": app_id,
         "logs": "\n".join(combined),
         "message": None if combined else "No application logs are available",
+    }
+
+
+def deployment_logs_app(app_id: str) -> Dict[str, Any]:
+    app_id = validate_app_id(app_id)
+    app = _find_app(get_registry(), app_id)
+    latest = next(
+        (
+            item for item in reversed(app.get("deployments", []))
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and re.fullmatch(r"\d{14}-[a-f0-9]{8}", item["id"])
+        ),
+        None,
+    )
+    if latest is None:
+        return {"ok": True, "app_id": app_id, "active": False, "status": None, "logs": ""}
+    log_path = _deployment_log_path(app_id, latest["id"])
+    return {
+        "ok": True,
+        "app_id": app_id,
+        "deployment_id": latest["id"],
+        "active": latest.get("status") == "deploying",
+        "status": latest.get("status"),
+        "logs": _tail_log(log_path, 1000, max_bytes=1024 * 1024),
     }
 
 
@@ -1772,6 +2159,10 @@ def _build_parser() -> argparse.ArgumentParser:
     settings.add_argument("payload", nargs="?")
     for name in ("list", "overview", "deployments"):
         commands.add_parser(name)
+    commands.add_parser("plugin-update-check")
+    commands.add_parser("plugin-update")
+    deployment_logs = commands.add_parser("deployment-logs")
+    deployment_logs.add_argument("app_id")
     add = commands.add_parser("add")
     add.add_argument("payload")
     edit = commands.add_parser("edit")
@@ -1799,6 +2190,12 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         return overview()
     if args.command == "deployments":
         return get_deployments()
+    if args.command == "deployment-logs":
+        return deployment_logs_app(args.app_id)
+    if args.command == "plugin-update-check":
+        return plugin_update_check()
+    if args.command == "plugin-update":
+        return plugin_update()
     if args.command == "settings":
         if getattr(args, "payload", None) is None:
             return get_settings()

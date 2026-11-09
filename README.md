@@ -2,7 +2,9 @@
 
 App Manager is a Cockpit navigation plugin with a Python command-line backend for registering and operating multiple web applications on an Ubuntu host.
 
-The Cockpit interface provides application registration and editing, deployment and repository updates, service controls, health checks, logs, deployment history with per-release rollback, and deployment settings. Removing an application unregisters it and stops its service; source and release files are retained.
+The Cockpit interface provides application registration and editing, deployment and repository updates, service controls, health checks, logs, deployment history with per-release rollback, and deployment settings. Deployments stream their build output into a live log dialog and retain the latest release log in the application's Logs view. Removing an application unregisters it and stops its service; source and release files are retained.
+
+The header's **Check for updates** action checks the fixed upstream GitHub `main` branch. If a newer revision is available, an explicit **Pull and reinstall** confirmation downloads the source as the unprivileged `nobody` account and invokes the project's installer as root. The updater does not modify managed application data or host website configuration.
 
 ## Installation
 
@@ -71,6 +73,8 @@ Project conventions and deployment requirements are documented in `AGENTS.md` an
 - Removing an app unregisters it and stops/removes its App Manager service, but intentionally retains source and release data.
 
 Applications must provide an appropriate start entry point. Framework adapters install/build dependencies and use a conventional start command; applications with nonstandard startup behavior can supply `build_config.start_command` as an array of executable arguments (not a shell string). The app must listen on the assigned `PORT` and on `127.0.0.1`. Health checks use the configured local path and require a 2xx response.
+
+Next.js deployments select npm, pnpm, Yarn, or Bun from the repository lockfile. npm uses `npm ci` when a valid npm lockfile exists and `npm install` otherwise; a mismatched lockfile fails with the complete command output and is never silently replaced. Dependencies are installed and built in an isolated release copy, then development dependencies are pruned before runtime.
 
 ## Development tests
 
