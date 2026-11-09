@@ -49,6 +49,8 @@ preflight() {
 
   [[ -f "$APP_DIR/cockpit/manifest.json" ]] || fail "Cockpit plugin manifest is missing."
   [[ -f "$APP_DIR/cockpit/index.html" ]] || fail "Cockpit plugin entry point is missing."
+  [[ -f "$APP_DIR/cockpit/app-manager.css" ]] || fail "Cockpit plugin stylesheet is missing."
+  [[ -f "$APP_DIR/cockpit/app-manager.js" ]] || fail "Cockpit plugin JavaScript is missing."
   [[ -f "$APP_DIR/backend/app_manager.py" && -f "$APP_DIR/backend/adapters.py" ]] ||
     fail "Required backend modules are missing."
   [[ -f "$APP_DIR/config/defaults.json" ]] || fail "Default configuration is missing."
@@ -82,9 +84,8 @@ install_files() {
 
   install -o root -g root -m 0644 "$APP_DIR/cockpit/index.html" "$PLUGIN_DEST/index.html"
   install -o root -g root -m 0644 "$APP_DIR/cockpit/manifest.json" "$PLUGIN_DEST/manifest.json"
-  if [[ -f "$APP_DIR/cockpit/app-manager.js" ]]; then
-    install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.js" "$PLUGIN_DEST/app-manager.js"
-  fi
+  install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.css" "$PLUGIN_DEST/app-manager.css"
+  install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.js" "$PLUGIN_DEST/app-manager.js"
 
   install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"
   install -o root -g root -m 0644 "$APP_DIR/backend/adapters.py" "$BACKEND_DEST/adapters.py"

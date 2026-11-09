@@ -1,0 +1,399 @@
+/* Cockpit App Manager standalone stylesheet */
+.am-app-manager {
+  --am-background: var(--pf-v5-global--BackgroundColor--100, Canvas);
+  --am-surface: var(--pf-v5-global--BackgroundColor--100, Canvas);
+  --am-text: var(--pf-v5-global--Color--100, CanvasText);
+  --am-muted: var(--pf-v5-global--Color--200, #52606d);
+  --am-border: var(--pf-v5-global--BorderColor--100, #d2d2d2);
+  --am-accent: var(--pf-v5-global--primary-color--100, #0066cc);
+  --am-accent-hover: #004d99;
+  --am-focus: #2b9af3;
+  --am-status-bg: #e5e7eb;
+  --am-status-text: #111827;
+  --am-radius: 0.5rem;
+  --am-space: 1rem;
+  box-sizing: border-box;
+  min-height: 100vh;
+  width: 100%;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: clamp(1rem, 3vw, 2rem);
+  background: var(--am-background);
+  color: var(--am-text);
+  color-scheme: light;
+  font-family: var(--pf-v5-global--FontFamily--text, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+  line-height: 1.5;
+}
+
+.am-app-manager *,
+.am-app-manager *::before,
+.am-app-manager *::after {
+  box-sizing: border-box;
+}
+
+.am-app-manager .toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--am-space);
+  margin-bottom: 1.25rem;
+}
+
+.am-app-manager h2,
+.am-app-manager h3 {
+  margin-top: 0;
+  line-height: 1.25;
+}
+
+.am-app-manager h2 {
+  margin-bottom: 0;
+  font-size: clamp(1.35rem, 2vw, 1.75rem);
+}
+
+.am-app-manager h3 {
+  font-size: 1.1rem;
+}
+
+.am-app-manager .tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+  overflow-x: auto;
+  padding: 0.125rem 0 0.5rem;
+  scrollbar-width: thin;
+}
+
+.am-app-manager button {
+  min-height: 2.5rem;
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--am-border);
+  border-radius: var(--am-radius);
+  background: var(--am-surface);
+  color: var(--am-text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.am-app-manager button:hover {
+  border-color: var(--am-accent);
+  background: var(--am-surface);
+  background: color-mix(in srgb, var(--am-accent) 8%, var(--am-surface));
+}
+
+.am-app-manager button:focus-visible,
+.am-app-manager input:focus-visible,
+.am-app-manager select:focus-visible,
+.am-app-manager textarea:focus-visible {
+  outline: 2px solid var(--am-focus);
+  outline-offset: 2px;
+}
+
+.am-app-manager button.pf-m-primary,
+.am-app-manager form button[type="submit"],
+.am-app-manager .tab.active {
+  border-color: var(--am-accent);
+  background: var(--am-accent);
+  color: #fff;
+}
+
+.am-app-manager button.pf-m-primary:hover,
+.am-app-manager form button[type="submit"]:hover,
+.am-app-manager .tab.active:hover {
+  border-color: var(--am-accent-hover);
+  background: var(--am-accent-hover);
+}
+
+.am-app-manager .tab {
+  flex: 0 0 auto;
+  background: transparent;
+}
+
+.am-app-manager .cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: var(--am-space);
+  margin-bottom: var(--am-space);
+}
+
+.am-app-manager .card {
+  min-width: 0;
+  margin-bottom: var(--am-space);
+  padding: 1rem 1.125rem;
+  border: 1px solid var(--am-border);
+  border-radius: var(--am-radius);
+  background: var(--am-surface);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+}
+
+.am-app-manager .cards .card {
+  margin-bottom: 0;
+}
+
+.am-app-manager .card small {
+  color: var(--am-muted);
+}
+
+.am-app-manager .card h3 {
+  margin: 0.35rem 0 0;
+  font-size: 1.65rem;
+}
+
+.am-app-manager .table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  white-space: nowrap;
+}
+
+.am-app-manager .table th,
+.am-app-manager .table td {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--am-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.am-app-manager .table th {
+  background: var(--am-surface);
+  background: color-mix(in srgb, var(--am-surface) 92%, var(--am-text));
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+.am-app-manager .action-row button {
+  margin: 0 0.375rem 0.375rem 0;
+}
+
+.am-app-manager form {
+  display: grid;
+  width: 100%;
+  max-width: 760px;
+  gap: 1rem;
+}
+
+.am-app-manager .row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--am-space);
+}
+
+.am-app-manager label {
+  display: block;
+  margin-bottom: 0.375rem;
+  font-weight: 600;
+}
+
+.am-app-manager input,
+.am-app-manager select,
+.am-app-manager textarea {
+  display: block;
+  width: 100%;
+  min-height: 2.5rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--am-border);
+  border-radius: 0.375rem;
+  background: var(--am-surface);
+  color: var(--am-text);
+  font: inherit;
+}
+
+.am-app-manager textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.am-app-manager input::placeholder,
+.am-app-manager textarea::placeholder {
+  color: var(--am-muted);
+  opacity: 1;
+}
+
+.am-app-manager .status-pill {
+  display: inline-block;
+  padding: 0.2rem 0.65rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--am-status-bg, #e5e7eb);
+  color: var(--am-status-text, #111827);
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1.4;
+  text-transform: capitalize;
+}
+
+.am-app-manager .status-pill[data-status="running"] {
+  --am-status-bg: #d1fae5;
+  --am-status-text: #065f46;
+}
+
+.am-app-manager .status-pill[data-status="stopped"] {
+  --am-status-bg: #eef2ff;
+  --am-status-text: #312e81;
+}
+
+.am-app-manager .status-pill[data-status="failed"] {
+  --am-status-bg: #fee2e2;
+  --am-status-text: #991b1b;
+}
+
+.am-app-manager .status-pill[data-status="deploying"] {
+  --am-status-bg: #fef3c7;
+  --am-status-text: #92400e;
+}
+
+.am-app-manager .hidden {
+  display: none !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  .am-app-manager {
+    --am-background: #15191e;
+    --am-surface: #20252b;
+    --am-text: #f0f0f0;
+    --am-muted: #b8c0c8;
+    --am-border: #454b52;
+    --am-accent: #73bcf7;
+    --am-accent-hover: #9acdf8;
+    --am-focus: #73bcf7;
+    --am-status-bg: #343a40;
+    --am-status-text: #f0f0f0;
+    color-scheme: dark;
+  }
+
+  .am-app-manager .status-pill[data-status="running"] {
+    --am-status-bg: #123a2b;
+    --am-status-text: #a3e6c6;
+  }
+
+  .am-app-manager .status-pill[data-status="stopped"] {
+    --am-status-bg: #292b46;
+    --am-status-text: #c9caff;
+  }
+
+  .am-app-manager .status-pill[data-status="failed"] {
+    --am-status-bg: #4a2428;
+    --am-status-text: #ffb4b4;
+  }
+
+  .am-app-manager .status-pill[data-status="deploying"] {
+    --am-status-bg: #473814;
+    --am-status-text: #ffdc8a;
+  }
+}
+
+.pf-v5-theme-dark .am-app-manager,
+[data-theme="dark"] .am-app-manager,
+.am-app-manager.pf-v5-theme-dark {
+  --am-background: #15191e;
+  --am-surface: #20252b;
+  --am-text: #f0f0f0;
+  --am-muted: #b8c0c8;
+  --am-border: #454b52;
+  --am-accent: #73bcf7;
+  --am-accent-hover: #9acdf8;
+  --am-focus: #73bcf7;
+  color-scheme: dark;
+}
+
+.pf-v5-theme-dark .am-app-manager .status-pill[data-status="running"],
+[data-theme="dark"] .am-app-manager .status-pill[data-status="running"],
+.am-app-manager.pf-v5-theme-dark .status-pill[data-status="running"] {
+  --am-status-bg: #123a2b;
+  --am-status-text: #a3e6c6;
+}
+
+.pf-v5-theme-dark .am-app-manager .status-pill[data-status="stopped"],
+[data-theme="dark"] .am-app-manager .status-pill[data-status="stopped"],
+.am-app-manager.pf-v5-theme-dark .status-pill[data-status="stopped"] {
+  --am-status-bg: #292b46;
+  --am-status-text: #c9caff;
+}
+
+.pf-v5-theme-dark .am-app-manager .status-pill[data-status="failed"],
+[data-theme="dark"] .am-app-manager .status-pill[data-status="failed"],
+.am-app-manager.pf-v5-theme-dark .status-pill[data-status="failed"] {
+  --am-status-bg: #4a2428;
+  --am-status-text: #ffb4b4;
+}
+
+.pf-v5-theme-dark .am-app-manager .status-pill[data-status="deploying"],
+[data-theme="dark"] .am-app-manager .status-pill[data-status="deploying"],
+.am-app-manager.pf-v5-theme-dark .status-pill[data-status="deploying"] {
+  --am-status-bg: #473814;
+  --am-status-text: #ffdc8a;
+}
+
+.pf-v5-theme-light .am-app-manager,
+[data-theme="light"] .am-app-manager,
+.am-app-manager.pf-v5-theme-light {
+  --am-background: var(--pf-v5-global--BackgroundColor--100, #fff);
+  --am-surface: var(--pf-v5-global--BackgroundColor--100, #fff);
+  --am-text: var(--pf-v5-global--Color--100, #151515);
+  --am-muted: var(--pf-v5-global--Color--200, #52606d);
+  --am-border: var(--pf-v5-global--BorderColor--100, #d2d2d2);
+  --am-accent: var(--pf-v5-global--primary-color--100, #0066cc);
+  --am-accent-hover: #004d99;
+  --am-focus: #2b9af3;
+  --am-status-bg: #e5e7eb;
+  --am-status-text: #111827;
+  color-scheme: light;
+}
+
+.pf-v5-theme-light .am-app-manager .status-pill[data-status="running"],
+[data-theme="light"] .am-app-manager .status-pill[data-status="running"],
+.am-app-manager.pf-v5-theme-light .status-pill[data-status="running"] {
+  --am-status-bg: #d1fae5;
+  --am-status-text: #065f46;
+}
+
+.pf-v5-theme-light .am-app-manager .status-pill[data-status="stopped"],
+[data-theme="light"] .am-app-manager .status-pill[data-status="stopped"],
+.am-app-manager.pf-v5-theme-light .status-pill[data-status="stopped"] {
+  --am-status-bg: #eef2ff;
+  --am-status-text: #312e81;
+}
+
+.pf-v5-theme-light .am-app-manager .status-pill[data-status="failed"],
+[data-theme="light"] .am-app-manager .status-pill[data-status="failed"],
+.am-app-manager.pf-v5-theme-light .status-pill[data-status="failed"] {
+  --am-status-bg: #fee2e2;
+  --am-status-text: #991b1b;
+}
+
+.pf-v5-theme-light .am-app-manager .status-pill[data-status="deploying"],
+[data-theme="light"] .am-app-manager .status-pill[data-status="deploying"],
+.am-app-manager.pf-v5-theme-light .status-pill[data-status="deploying"] {
+  --am-status-bg: #fef3c7;
+  --am-status-text: #92400e;
+}
+
+@media (max-width: 700px) {
+  .am-app-manager {
+    padding: 1rem;
+  }
+
+  .am-app-manager .toolbar {
+    align-items: flex-start;
+  }
+
+  .am-app-manager .row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.75rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .am-app-manager .toolbar {
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .am-app-manager button {
+    transition: none;
+  }
+}

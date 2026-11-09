@@ -623,6 +623,34 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('if [[ ! -e "$STATE_ROOT/config.json" ]]', installer)
         self.assertIn('superuser: "require"', cockpit_page)
 
+    def test_standalone_frontend_assets_are_referenced_and_installed(self):
+        project = Path(__file__).resolve().parent.parent
+        cockpit_dir = project / "cockpit"
+        cockpit_page = (cockpit_dir / "index.html").read_text(encoding="utf-8")
+        stylesheet_path = cockpit_dir / "app-manager.css"
+        installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
+        stylesheet = stylesheet_path.read_text(encoding="utf-8")
+
+        self.assertTrue(stylesheet_path.is_file())
+        self.assertIn('<link rel="stylesheet" href="app-manager.css">', cockpit_page)
+        self.assertIn('<script src="app-manager.js"></script>', cockpit_page)
+        self.assertNotIn("/cockpit/static/desktop.css", cockpit_page)
+        self.assertNotIn("<style", cockpit_page)
+        self.assertTrue((cockpit_dir / "app-manager.js").is_file())
+        self.assertNotIn("@import", stylesheet)
+        self.assertNotRegex(stylesheet, r"url\(\s*['\"]?https?://")
+        self.assertIn(".am-app-manager", stylesheet)
+        self.assertIn("@media (prefers-color-scheme: dark)", stylesheet)
+        self.assertIn('[[ -f "$APP_DIR/cockpit/app-manager.css" ]]', installer)
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.css" "$PLUGIN_DEST/app-manager.css"',
+            installer,
+        )
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.js" "$PLUGIN_DEST/app-manager.js"',
+            installer,
+        )
+
 
 class UninstallScriptTests(unittest.TestCase):
     def _write_registry(self, temp_root: Path, app_id: str, production_path=None) -> Path:
@@ -711,6 +739,10 @@ class UninstallScriptTests(unittest.TestCase):
             production_root = temp_root / "opt" / "webapps"
             plugin.mkdir(parents=True)
             backend.mkdir(parents=True)
+            (plugin / "app-manager.css").write_text(
+                "/* Cockpit App Manager standalone stylesheet */\n",
+                encoding="utf-8",
+            )
             (backend / "app-manager").write_text(
                 '#!/usr/bin/env python3\nAPP_NAME = "app-manager"\n',
                 encoding="utf-8",
@@ -767,11 +799,14 @@ class UninstallScriptTests(unittest.TestCase):
             plugin.mkdir(parents=True)
             replaced_file = plugin / "index.html"
             replaced_file.write_text("<title>Another plugin</title>", encoding="utf-8")
+            stylesheet = plugin / "app-manager.css"
+            stylesheet.write_text("body { color: red; }\n", encoding="utf-8")
 
             result = self._run_uninstall(temp_root)
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue(replaced_file.exists())
+            self.assertTrue(stylesheet.exists())
             self.assertIn("Leaving unverified installation file", result.stderr)
 
     def test_default_uninstall_dry_run_reports_only_verified_files_and_empty_directories(self):
@@ -785,6 +820,10 @@ class UninstallScriptTests(unittest.TestCase):
             backend.mkdir(parents=True)
             templates.mkdir(parents=True)
             (plugin / "index.html").write_text("<title>App Manager</title>", encoding="utf-8")
+            (plugin / "app-manager.css").write_text(
+                "/* Cockpit App Manager standalone stylesheet */\n",
+                encoding="utf-8",
+            )
             unknown_plugin_file = plugin / "local.js"
             unknown_plugin_file.write_text("custom", encoding="utf-8")
             (backend / "app-manager").write_text(
@@ -806,6 +845,7 @@ class UninstallScriptTests(unittest.TestCase):
             normalized_output = result.stdout.replace("\\", "/")
             for operation in (
                 f"DRY-RUN: remove {plugin / 'index.html'}",
+                f"DRY-RUN: remove {plugin / 'app-manager.css'}",
                 f"DRY-RUN: remove {backend / 'app-manager'}",
                 f"DRY-RUN: remove {templates / 'nginx.conf.tpl'}",
                 f"DRY-RUN: rmdir -- {templates}",

@@ -3,30 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <title>App Manager</title>
-    <link rel="stylesheet" href="/cockpit/static/desktop.css" />
+    <link rel="stylesheet" href="app-manager.css">
     <script src="/cockpit/login.js"></script>
     <script src="/cockpit/cockpit.js"></script>
-    <style>
-      body { background: var(--pf-v5-global--BackgroundColor--100); color: var(--pf-v5-global--Color--100); }
-      .container { padding: 1.5rem; max-width: 1400px; margin: 0 auto; }
-      .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
-      .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem; }
-      .card { background: var(--pf-v5-global--BackgroundColor--100); border: 1px solid var(--pf-v5-global--BorderColor--100); border-radius: 12px; padding: 1rem; }
-      .table { width: 100%; border-collapse: collapse; }
-      .table th, .table td { border-bottom: 1px solid var(--pf-v5-global--BorderColor--100); padding: 0.75rem; text-align: left; }
-      .action-row button { margin-right: 0.5rem; }
-      .hidden { display: none; }
-      form { display: grid; gap: 0.75rem; max-width: 760px; }
-      .row { display: grid; grid-template-columns: repeat(2, minmax(200px, 1fr)); gap: 1rem; }
-      input, select, textarea { width: 100%; padding: 0.6rem; border: 1px solid #c7c7c7; border-radius: 6px; }
-      .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
-      .tab { background: transparent; border: 1px solid #c7c7c7; border-radius: 8px; padding: 0.5rem 1rem; cursor: pointer; }
-      .tab.active { background: var(--pf-v5-c-button--m-primary--BackgroundColor); color: white; }
-      .status-pill { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 12px; font-weight: 600; }
-    </style>
+    <script src="app-manager.js"></script>
   </head>
   <body>
-    <div class="container">
+    <div class="container am-app-manager">
       <div class="toolbar">
         <h2>App Manager</h2>
         <button id="refreshButton" class="pf-m-primary">Refresh</button>
@@ -123,14 +106,7 @@
       }
 
       function renderStatus(status) {
-        const palette = {
-          running: { bg: '#d1fae5', color: '#065f46' },
-          stopped: { bg: '#eef2ff', color: '#312e81' },
-          failed: { bg: '#fee2e2', color: '#991b1b' },
-          deploying: { bg: '#fef3c7', color: '#92400e' }
-        };
-        const style = palette[status] || { bg: '#e5e7eb', color: '#111827' };
-        return `<span class="status-pill" style="background:${style.bg}; color:${style.color};">${escapeHtml(status || 'unknown')}</span>`;
+        return `<span class="status-pill" data-status="${escapeHtml(status || 'unknown')}">${escapeHtml(status || 'unknown')}</span>`;
       }
 
       function renderOverview(data) {
