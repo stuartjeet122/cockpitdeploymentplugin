@@ -609,6 +609,32 @@ def _chown_tree(path: Path, username: str) -> None:
             os.chown(str(child), uid, gid, follow_symlinks=False)
 
 
+def _seal_release(release_dir: Path, group_id: int, *, public: bool = False) -> None:
+    if release_dir.is_symlink() or not release_dir.is_dir():
+        raise RuntimeError(f"Cannot seal invalid application release {release_dir}")
+    for root, dirs, files in os.walk(release_dir, topdown=True, followlinks=False):
+        root_path = Path(root)
+        os.chown(str(root_path), 0, group_id)
+        os.chmod(str(root_path), 0o555 if public else 0o550)
+        for entries, is_directory in ((dirs, True), (files, False)):
+            for name in entries:
+                child = root_path / name
+                if child.is_symlink():
+                    if public and not _path_is_within(child.resolve(strict=False), release_dir.resolve(strict=False)):
+                        raise RuntimeError(f"Static release symlink escapes the application release: {child}")
+                    os.chown(str(child), 0, group_id, follow_symlinks=False)
+                    continue
+                if is_directory:
+                    permissions = 0o555 if public else 0o550
+                else:
+                    mode = child.stat(follow_symlinks=False).st_mode
+                    executable = bool(mode & 0o111)
+                    execute_bits = 0o111 if public else 0o110
+                    permissions = (0o444 if public else 0o440) | (execute_bits if executable else 0)
+                os.chown(str(child), 0, group_id)
+                os.chmod(str(child), permissions)
+
+
 def _run_as_user(
     username: str,
     args: Sequence[str],
@@ -1134,6 +1160,7 @@ def _render_service(
         "PrivateDevices=true\n"
         "ProtectSystem=strict\n"
         "ProtectHome=true\n"
+        f"ReadOnlyPaths={_systemd_quote(str(paths['releases']))}\n"
         "ProtectKernelTunables=true\n"
         "ProtectKernelModules=true\n"
         "ProtectControlGroups=true\n"
@@ -1197,7 +1224,13 @@ def _render_nginx_config(
             "    proxy_set_header X-Real-IP $remote_addr;\n"
             f"    proxy_set_header X-Forwarded-Prefix /{app_id};\n"
             "    proxy_set_header Upgrade $http_upgrade;\n"
-            "    proxy_set_header Connection \"upgrade\";\n"
+            "    proxy_read_timeout 3600s;\n"
+            "    proxy_send_timeout 3600s;\n"
+            "    set $app_manager_connection_upgrade upgrade;\n"
+            "    if ($http_upgrade = \"\") {\n"
+            "        set $app_manager_connection_upgrade \"\";\n"
+            "    }\n"
+            "    proxy_set_header Connection $app_manager_connection_upgrade;\n"
             + proxy_redirect
             + "}\n"
         )
@@ -1317,10 +1350,45 @@ def _setup_app_directories(app: Dict[str, Any], username: str, config: Dict[str,
     paths = _app_paths(app["id"], config)
     paths["home"].parent.mkdir(parents=True, exist_ok=True, mode=0o711)
     os.chmod(paths["home"].parent, 0o711)
-    for key in ("source", "production", "releases", "config", "logs", "home"):
+    if paths["production"].is_symlink() or paths["releases"].is_symlink():
+        raise RuntimeError("Application production directories must not be symlinks")
+    for key in ("source", "config", "logs", "home"):
+        if paths[key].is_symlink():
+            raise RuntimeError(f"Application {key} directory must not be a symlink")
+    for key in ("production", "releases"):
+        paths[key].mkdir(parents=True, exist_ok=True, mode=0o755)
+        os.chown(str(paths[key]), 0, 0)
+        os.chmod(str(paths[key]), 0o755)
+    for key in ("source", "config", "logs", "home"):
         paths[key].mkdir(parents=True, exist_ok=True, mode=0o750)
         _chown_tree(paths[key], username)
+
+    _, group_id = _account_ids(username)
+    public_releases = {
+        _resolved_path(Path(item["release"]))
+        for item in app.get("deployments", [])
+        if isinstance(item, dict)
+        and item.get("framework") == "static"
+        and isinstance(item.get("release"), str)
+    }
+    if app.get("framework") == "static":
+        current = paths["current"].resolve(strict=False)
+        if current.exists():
+            public_releases.add(current)
+    for release in paths["releases"].iterdir():
+        if release.is_symlink() or not release.is_dir():
+            raise RuntimeError(f"Unexpected entry in application releases directory: {release}")
+        _seal_release(release, group_id, public=_resolved_path(release) in public_releases)
     return paths
+
+
+def _prepare_release_directory(release_dir: Path, username: str) -> None:
+    if release_dir.exists() or release_dir.is_symlink():
+        raise RuntimeError("Generated release path already exists")
+    uid, group_id = _account_ids(username)
+    release_dir.mkdir(mode=0o750)
+    os.chown(str(release_dir), uid, group_id)
+    os.chmod(str(release_dir), 0o750)
 
 
 def pull_app(app_id: str) -> Dict[str, Any]:
@@ -1388,10 +1456,7 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                 framework = detect_framework(source_path)
             adapter = get_adapter(framework)
             release_dir = paths["releases"] / release_id
-            if release_dir.exists() or release_dir.is_symlink():
-                raise RuntimeError("Generated release path already exists")
-            release_dir.mkdir(mode=0o750)
-            _chown_tree(release_dir, username)
+            _prepare_release_directory(release_dir, username)
             record.update({
                 "release": str(release_dir),
                 "release_available": True,
@@ -1411,7 +1476,8 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                 ),
                 timeout=int(config["build_timeout_seconds"]),
             )
-            _chown_tree(release_dir, username)
+            _, release_group = _account_ids(username)
+            _seal_release(release_dir, release_group, public=framework == "static")
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
             _write_service(app_snapshot, release_dir, command, config)
             unit_written = True

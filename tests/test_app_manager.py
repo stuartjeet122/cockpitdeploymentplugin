@@ -4,13 +4,14 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call as mock_call, patch
 
 import backend.app_manager as manager
 from backend.adapters import NextJSAdapter, detect_framework
@@ -336,6 +337,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         config["source_root"] = "/var/lib/cockpit/app-manager/sources"
         app = {"id": "demo", "service_user": "app-demo", "port": 8100}
         service = manager._render_service(app, ["/opt/webapps/demo/current/app/server"], config)
+        paths = manager._app_paths("demo", config)
         self.assertIn("User=app-demo", service)
         self.assertIn("NoNewPrivileges=true", service)
         self.assertIn("ProtectSystem=strict", service)
@@ -344,17 +346,133 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("CapabilityBoundingSet=\n", service)
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", service)
         self.assertIn("Environment=\"APP_BASE_PATH=/demo\"", service)
+        self.assertIn(f"ReadOnlyPaths={manager._systemd_quote(str(paths['releases']))}", service)
+        template = (Path(__file__).resolve().parent.parent / "templates" / "app.service.tpl").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ReadOnlyPaths={{ app_root }}/releases", template)
+        self.assertIn("CapabilityBoundingSet=", template)
         self.assertNotIn("CAP_NET_BIND_SERVICE", service)
         self.assertNotIn("AmbientCapabilities=", service)
-        paths = manager._app_paths("demo", config)
         expected_write_paths = "ReadWritePaths=" + " ".join(
             manager._systemd_quote(str(path))
             for path in (paths["home"], paths["config"], paths["logs"])
         )
         self.assertIn(expected_write_paths, service)
-        self.assertNotIn(manager._systemd_quote(str(paths["releases"])), service)
         read_write_paths = next(line for line in service.splitlines() if line.startswith("ReadWritePaths="))
         self.assertNotIn(manager._systemd_quote(str(paths["current"] / "app")), read_write_paths)
+        self.assertNotIn(manager._systemd_quote(str(paths["releases"])), read_write_paths)
+
+    def test_release_sealing_removes_app_write_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            release = Path(tmp) / "release"
+            app_dir = release / "app"
+            app_dir.mkdir(parents=True)
+            executable = app_dir / "server"
+            executable.write_text("binary", encoding="utf-8")
+            executable.chmod(0o750)
+            private_file = app_dir / "settings.json"
+            private_file.write_text("{}", encoding="utf-8")
+            private_file.chmod(0o600)
+
+            original_stat = Path.stat
+
+            def posix_stat(path, *args, **kwargs):
+                result = original_stat(path, *args, **kwargs)
+                modes = {executable: 0o750, private_file: 0o600}
+                if path in modes:
+                    values = list(result)
+                    values[0] = (values[0] & ~0o777) | modes[path]
+                    return os.stat_result(values)
+                return result
+
+            with patch.object(manager.os, "chown", create=True) as chown, patch.object(
+                manager.os, "chmod"
+            ) as chmod, patch.object(Path, "stat", new=posix_stat):
+                manager._seal_release(release, 4321)
+
+            self.assertIn(mock_call(str(release), 0o550), chmod.call_args_list)
+            self.assertIn(mock_call(str(app_dir), 0o550), chmod.call_args_list)
+            self.assertIn(mock_call(str(executable), 0o550), chmod.call_args_list)
+            self.assertIn(mock_call(str(private_file), 0o440), chmod.call_args_list)
+            self.assertTrue(all(call.args[1] == 0 and call.args[2] == 4321 for call in chown.call_args_list))
+
+    def test_static_release_sealing_is_readable_by_nginx_but_not_writable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            release = Path(tmp) / "release"
+            app_dir = release / "app"
+            app_dir.mkdir(parents=True)
+            page = app_dir / "index.html"
+            page.write_text("page", encoding="utf-8")
+            page.chmod(0o644)
+
+            original_stat = Path.stat
+
+            def posix_stat(path, *args, **kwargs):
+                result = original_stat(path, *args, **kwargs)
+                if path == page:
+                    values = list(result)
+                    values[0] = (values[0] & ~0o777) | 0o644
+                    return os.stat_result(values)
+                return result
+
+            with patch.object(manager.os, "chown", create=True), patch.object(
+                manager.os, "chmod"
+            ) as chmod, patch.object(Path, "stat", new=posix_stat):
+                manager._seal_release(release, 4321, public=True)
+
+            self.assertIn(mock_call(str(release), 0o555), chmod.call_args_list)
+            self.assertIn(mock_call(str(app_dir), 0o555), chmod.call_args_list)
+            self.assertIn(mock_call(str(page), 0o444), chmod.call_args_list)
+
+    @unittest.skipIf(os.name == "nt", "release symlink validation requires POSIX symlink semantics")
+    def test_static_release_sealing_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release = root / "release"
+            app_dir = release / "app"
+            app_dir.mkdir(parents=True)
+            (root / "outside").write_text("outside", encoding="utf-8")
+            (app_dir / "outside-link").symlink_to(root / "outside")
+
+            with patch.object(manager.os, "chown"):
+                with self.assertRaisesRegex(RuntimeError, "symlink escapes"):
+                    manager._seal_release(release, 4321, public=True)
+
+    def test_generated_systemd_unit_passes_systemd_analyzer_when_available(self):
+        analyzer = shutil.which("systemd-analyze")
+        if analyzer is None:
+            self.skipTest("systemd-analyze is not installed in this development environment")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = manager._default_config()
+            config["production_root"] = str(root / "opt" / "webapps")
+            config["source_root"] = str(root / "state" / "sources")
+            config["log_root"] = str(root / "logs")
+            app = {"id": "demo", "service_user": "app-demo", "port": 8100}
+            with patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")):
+                paths = manager._app_paths("demo", config)
+                for path in (
+                    paths["production"],
+                    paths["releases"],
+                    paths["current"] / "app",
+                    paths["home"],
+                    paths["config"],
+                    paths["logs"],
+                ):
+                    path.mkdir(parents=True, exist_ok=True)
+                unit_path = root / "cockpit-app-demo.service"
+                unit_path.write_text(
+                    manager._render_service(app, ["/bin/true"], config),
+                    encoding="utf-8",
+                )
+            result = subprocess.run(
+                [analyzer, "verify", str(unit_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
 
     def test_nginx_prefix_generation_is_framework_aware_and_handles_websockets(self):
         template = Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
@@ -372,11 +490,16 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         next_proxy_pass = next(line for line in nextjs.splitlines() if "proxy_pass " in line)
         self.assertTrue(next_proxy_pass.endswith("8123;"))
         self.assertIn("proxy_http_version 1.1;", nextjs)
+        self.assertIn("proxy_read_timeout 3600s;", nextjs)
+        self.assertIn("proxy_send_timeout 3600s;", nextjs)
         self.assertIn("proxy_set_header Host $host;", nextjs)
         self.assertIn("proxy_pass http://127.0.0.1:8123;", nextjs)
         self.assertNotIn("proxy_pass http://127.0.0.1:8123/;", nextjs)
         self.assertIn("proxy_set_header Upgrade $http_upgrade;", nextjs)
-        self.assertIn('proxy_set_header Connection "upgrade";', nextjs)
+        self.assertIn("proxy_set_header Connection $app_manager_connection_upgrade;", nextjs)
+        self.assertIn("set $app_manager_connection_upgrade upgrade;", nextjs)
+        self.assertIn('if ($http_upgrade = "") {', nextjs)
+        self.assertIn('set $app_manager_connection_upgrade "";', nextjs)
         self.assertNotIn("$http_connection", nextjs)
         self.assertIn("proxy_set_header X-Forwarded-Prefix /website1;", nextjs)
         next_proxy_uri = next_proxy_pass.split("8123", 1)[1].rstrip(";")
@@ -395,11 +518,13 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             self.assertIn("proxy_pass http://127.0.0.1:8123/;", stripped_prefix)
             self.assertIn("proxy_set_header X-Forwarded-Prefix /website1;", stripped_prefix)
             self.assertIn("proxy_redirect / /website1/;", stripped_prefix)
+            self.assertIn("proxy_set_header Connection $app_manager_connection_upgrade;", stripped_prefix)
             self.assertNotIn("$http_connection", stripped_prefix)
             for request_path, expected_upstream_path in (
                 ("/website1/", "/"),
                 ("/website1/about", "/about"),
                 ("/website1/api/items?page=1", "/api/items?page=1"),
+                ("/website1/_next/static/chunks/app.js", "/_next/static/chunks/app.js"),
             ):
                 self.assertEqual(
                     proxy_uri + request_path[len("/website1/"):],
@@ -416,6 +541,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             ("/website1/", static_root / "index.html"),
             ("/website1/about", static_root / "index.html"),
             ("/website1/css/site.css", static_root / "css" / "site.css"),
+            ("/website1/js/app.js", static_root / "js" / "app.js"),
             ("/website1/images/logo.png", static_root / "images" / "logo.png"),
         ):
             request_relative_path = request_path[len("/website1/"):]
@@ -432,6 +558,31 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             manager._render_nginx_config("../outside", 8123, template, "nextjs")
         with self.assertRaises(ValueError):
             manager._render_nginx_config("demo", 8080, template, "nextjs")
+
+    def test_generated_nginx_config_passes_nginx_parser_when_available(self):
+        nginx = shutil.which("nginx")
+        if nginx is None:
+            self.skipTest("nginx is not installed in this development environment")
+        template = Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
+        snippet = manager._render_nginx_config("website1", 8123, template, "nextjs")
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "nginx.conf"
+            config.write_text(
+                "pid " + str(Path(tmp) / "nginx.pid") + ";\n"
+                "error_log stderr;\n"
+                "events { worker_connections 16; }\n"
+                "http { server { listen 127.0.0.1:8080;\n"
+                + snippet
+                + "\n} }\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [nginx, "-t", "-c", str(config)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
 
     def test_installer_uses_exact_file_ownership_and_checks_host_and_installed_imports(self):
         project = Path(__file__).resolve().parent.parent
@@ -465,7 +616,12 @@ class UninstallScriptTests(unittest.TestCase):
         registry_path.write_text(json.dumps({"apps": [app]}), encoding="utf-8")
         return registry_path
 
-    def _run_uninstall(self, temp_root: Path, *args: str) -> subprocess.CompletedProcess:
+    def _run_uninstall(
+        self,
+        temp_root: Path,
+        *args: str,
+        supplementary_group: bool = False,
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         fake_bin = temp_root / "fake-bin"
         fake_bin.mkdir(parents=True, exist_ok=True)
@@ -477,6 +633,13 @@ class UninstallScriptTests(unittest.TestCase):
         getent = fake_bin / "getent"
         getent.write_text(
             "#!/bin/sh\n"
+            "if [ \"$1\" = \"group\" ] && [ -z \"$2\" ]; then\n"
+            "  printf 'app-demo:x:1234:\\n'\n"
+            "  if [ -n \"$APP_MANAGER_TEST_SUPPLEMENTARY_GROUP\" ]; then\n"
+            "    printf 'unrelated:x:9999:%s\\n' \"$APP_MANAGER_TEST_SUPPLEMENTARY_GROUP\"\n"
+            "  fi\n"
+            "  exit 0\n"
+            "fi\n"
             "case \"$1:$2\" in\n"
             "  passwd:app-demo) printf 'app-demo:x:1234:1234::%s/homes/demo:/usr/sbin/nologin\\n' \"$APP_MANAGER_STATE_ROOT\" ;;\n"
             "  group:app-demo) printf 'app-demo:x:1234:\\n' ;;\n"
@@ -507,6 +670,9 @@ class UninstallScriptTests(unittest.TestCase):
             "APP_MANAGER_NGINX_CONFIG_ROOT": str(temp_root / "etc" / "nginx"),
             "APP_MANAGER_TEST_SYSTEMCTL_LOG": str(systemctl_log),
             "APP_MANAGER_TEST_USERDEL_LOG": str(userdel_log),
+            "APP_MANAGER_TEST_SUPPLEMENTARY_GROUP": (
+                "app-demo" if supplementary_group else ""
+            ),
         })
         script = Path(__file__).resolve().parent.parent / "scripts" / "uninstall.sh"
         git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
@@ -522,8 +688,14 @@ class UninstallScriptTests(unittest.TestCase):
             production_root = temp_root / "opt" / "webapps"
             plugin.mkdir(parents=True)
             backend.mkdir(parents=True)
-            (backend / "app-manager").write_text("#!/bin/bash\n", encoding="utf-8")
-            (backend / "adapters.py").write_text("print('x')\n", encoding="utf-8")
+            (backend / "app-manager").write_text(
+                '#!/usr/bin/env python3\nAPP_NAME = "app-manager"\n',
+                encoding="utf-8",
+            )
+            (backend / "adapters.py").write_text(
+                "class NextJSAdapter:\n    pass\n",
+                encoding="utf-8",
+            )
             config = temp_root / "etc" / "cockpit" / "app-manager"
             config.mkdir(parents=True)
             state_root.mkdir(parents=True)
@@ -537,6 +709,90 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertFalse(config.exists())
             self.assertTrue((state_root / "apps.json").exists())
             self.assertTrue((production_root / "demo").exists())
+
+    def test_default_uninstall_preserves_unrecognized_files_in_plugin_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            plugin = temp_root / "usr" / "share" / "cockpit" / "app-manager"
+            backend = temp_root / "usr" / "libexec" / "cockpit"
+            plugin.mkdir(parents=True)
+            backend.mkdir(parents=True)
+            (plugin / "index.html").write_text("<title>App Manager</title>", encoding="utf-8")
+            unrelated_plugin_file = plugin / "local-customization.js"
+            unrelated_plugin_file.write_text("custom", encoding="utf-8")
+            (backend / "app-manager").write_text(
+                '#!/usr/bin/env python3\nAPP_NAME = "app-manager"\n',
+                encoding="utf-8",
+            )
+            unrelated_backend_file = backend / "other-tool"
+            unrelated_backend_file.write_text("keep", encoding="utf-8")
+
+            result = self._run_uninstall(temp_root)
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertTrue(unrelated_plugin_file.exists())
+            self.assertTrue(unrelated_backend_file.exists())
+            self.assertTrue(plugin.exists())
+            self.assertTrue(backend.exists())
+            self.assertFalse((plugin / "index.html").exists())
+            self.assertFalse((backend / "app-manager").exists())
+
+    def test_default_uninstall_preserves_unverified_managed_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            plugin = temp_root / "usr" / "share" / "cockpit" / "app-manager"
+            plugin.mkdir(parents=True)
+            replaced_file = plugin / "index.html"
+            replaced_file.write_text("<title>Another plugin</title>", encoding="utf-8")
+
+            result = self._run_uninstall(temp_root)
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertTrue(replaced_file.exists())
+            self.assertIn("Leaving unverified installation file", result.stderr)
+
+    def test_default_uninstall_dry_run_reports_only_verified_files_and_empty_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            plugin = temp_root / "usr" / "share" / "cockpit" / "app-manager"
+            backend = temp_root / "usr" / "libexec" / "cockpit"
+            config = temp_root / "etc" / "cockpit" / "app-manager"
+            templates = config / "templates"
+            plugin.mkdir(parents=True)
+            backend.mkdir(parents=True)
+            templates.mkdir(parents=True)
+            (plugin / "index.html").write_text("<title>App Manager</title>", encoding="utf-8")
+            unknown_plugin_file = plugin / "local.js"
+            unknown_plugin_file.write_text("custom", encoding="utf-8")
+            (backend / "app-manager").write_text(
+                '#!/usr/bin/env python3\nAPP_NAME = "app-manager"\n',
+                encoding="utf-8",
+            )
+            (templates / "nginx.conf.tpl").write_text(
+                "{{ app_route_location }}\n",
+                encoding="utf-8",
+            )
+            (templates / "app.service.tpl").write_text(
+                "# Managed by Cockpit App Manager\n",
+                encoding="utf-8",
+            )
+
+            result = self._run_uninstall(temp_root, "--dry-run")
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            normalized_output = result.stdout.replace("\\", "/")
+            for operation in (
+                f"DRY-RUN: remove {plugin / 'index.html'}",
+                f"DRY-RUN: remove {backend / 'app-manager'}",
+                f"DRY-RUN: remove {templates / 'nginx.conf.tpl'}",
+                f"DRY-RUN: rmdir -- {templates}",
+            ):
+                self.assertIn(operation.replace("\\", "/"), normalized_output)
+            self.assertNotIn(str(unknown_plugin_file), result.stdout)
+            self.assertTrue((plugin / "index.html").exists())
+            self.assertTrue((backend / "app-manager").exists())
+            self.assertTrue((templates / "nginx.conf.tpl").exists())
+            self.assertTrue(unknown_plugin_file.exists())
 
     def test_explicit_data_removal_targets_only_app_manager_data(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -675,6 +931,24 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertTrue(unit.exists())
             self.assertFalse((temp_root / "userdel.log").exists())
 
+    def test_user_with_unrelated_group_membership_is_not_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
+            state_root.mkdir(parents=True)
+            self._write_registry(temp_root, "demo")
+            result = self._run_uninstall(
+                temp_root,
+                "--remove-managed-data",
+                "--yes",
+                supplementary_group=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((state_root / "apps.json").exists())
+            self.assertFalse((temp_root / "userdel.log").exists())
+            self.assertIn("additional group", result.stderr)
+
     def test_explicit_cleanup_uses_registered_managed_path_not_same_id_at_default_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp)
@@ -714,6 +988,12 @@ class UninstallScriptTests(unittest.TestCase):
             production_root = temp_root / "opt" / "webapps"
             state_root.mkdir(parents=True)
             self._write_registry(temp_root, "demo")
+            source_path = state_root / "sources" / "demo"
+            home_path = state_root / "homes" / "demo"
+            log_path = temp_root / "var" / "log" / "cockpit-app-manager" / "demo"
+            source_path.mkdir(parents=True)
+            home_path.mkdir(parents=True)
+            log_path.mkdir(parents=True)
             (production_root / "demo").mkdir(parents=True)
             snippet_root = temp_root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
             snippet_root.mkdir(parents=True)
@@ -734,6 +1014,12 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertIn("systemctl disable --now cockpit-app-demo.service", result.stdout)
             self.assertIn("systemctl daemon-reload", result.stdout)
             self.assertIn("demo.conf", result.stdout)
+            normalized_output = result.stdout.replace("\\", "/")
+            for path in (source_path, home_path, log_path, production_root / "demo"):
+                self.assertIn(
+                    f"DRY-RUN: remove {str(path).replace(chr(92), '/')}",
+                    normalized_output,
+                )
             self.assertTrue((state_root / "apps.json").exists())
             self.assertTrue((production_root / "demo").exists())
             self.assertTrue((systemd_dir / "cockpit-app-demo.service").exists())

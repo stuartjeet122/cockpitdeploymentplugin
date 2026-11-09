@@ -22,6 +22,7 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ReadOnlyPaths={{ app_root }}/releases
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

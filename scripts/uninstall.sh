@@ -5,6 +5,7 @@ PLUGIN_DEST="${APP_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/app-manager}"
 BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit}"
 CONFIG_DEST="${APP_MANAGER_CONFIG_DEST:-/etc/cockpit/app-manager}"
 STATE_ROOT="${APP_MANAGER_STATE_ROOT:-/var/lib/cockpit/app-manager}"
+SOURCE_ROOT="${APP_MANAGER_SOURCE_ROOT:-${STATE_ROOT}/sources}"
 PRODUCTION_ROOT="${APP_MANAGER_PRODUCTION_ROOT:-/opt/webapps}"
 LOG_ROOT="${APP_MANAGER_LOG_ROOT:-/var/log/cockpit-app-manager}"
 SYSTEMD_DIR="${APP_MANAGER_SYSTEMD_DIR:-/etc/systemd/system}"
@@ -90,7 +91,7 @@ parse_registry_records() {
   done
   [[ -n "$python_bin" ]] || fail "Python is required to validate the App Manager registry."
 
-  "$python_bin" - "$registry_path" "${STATE_ROOT}/sources" "$PRODUCTION_ROOT" "$LOG_ROOT" <<'PY'
+  "$python_bin" - "$registry_path" "$SOURCE_ROOT" "$PRODUCTION_ROOT" "$LOG_ROOT" <<'PY'
 import json
 import re
 import sys
@@ -188,6 +189,16 @@ remove_managed_user() {
   IFS=: read -r _ _ group_gid _ <<<"$group_entry"
   [[ "$group_gid" == "$gid" ]] ||
     fail "Refusing to remove $username: primary group is not its matching private group."
+  local all_groups group_name group_password group_members
+  all_groups="$(getent group)" ||
+    fail "Could not verify group memberships for managed user $username."
+  [[ -n "$all_groups" ]] ||
+    fail "Could not enumerate group memberships for managed user $username."
+  while IFS=: read -r group_name group_password group_gid group_members; do
+    [[ "$group_name" != "$username" ]] || continue
+    [[ ",${group_members}," != *",${username},"* ]] ||
+      fail "Refusing to remove $username: it belongs to an additional group."
+  done <<<"$all_groups"
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "DRY-RUN: userdel -- $username"
@@ -274,10 +285,75 @@ remove_managed_app_data() {
 }
 
 remove_default_plugin_files() {
-  safe_remove "$PLUGIN_DEST"
-  safe_remove "$CONFIG_DEST"
-  safe_remove "${BACKEND_DEST}/app-manager"
-  safe_remove "${BACKEND_DEST}/adapters.py"
+  local -a planned_removals=()
+  remove_owned_file() {
+    local target="$1"
+    local signature="$2"
+    [[ -e "$target" || -L "$target" ]] || return 0
+    if [[ -L "$target" || ! -f "$target" ]] || has_symlink_ancestor "$target" ||
+      ! grep -Fq -- "$signature" "$target"; then
+      log "Leaving unverified installation file untouched: $target" >&2
+      return 0
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      log "DRY-RUN: remove $target"
+      planned_removals+=("$target")
+    else
+      rm -f -- "$target"
+    fi
+  }
+  remove_empty_directory() {
+    local target="$1"
+    local entries entry candidate planned nonempty
+    [[ -d "$target" && ! -L "$target" ]] || return 0
+    if has_symlink_ancestor "$target"; then
+      log "Leaving installation directory beneath a symlink untouched: $target" >&2
+      return 0
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      entries="$(find "$target" -mindepth 1 -maxdepth 1 -print)"
+      while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        planned=0
+        for candidate in "${planned_removals[@]}"; do
+          if [[ "$candidate" == "$entry" ]]; then
+            planned=1
+            break
+          fi
+        done
+        if [[ "$planned" -eq 0 ]]; then
+          nonempty=1
+          break
+        fi
+      done <<<"$entries"
+      if [[ "${nonempty:-0}" -eq 1 ]]; then
+        log "Leaving non-empty installation directory untouched: $target"
+        return 0
+      fi
+    elif [[ -n "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      log "Leaving non-empty installation directory untouched: $target"
+      return 0
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      log "DRY-RUN: rmdir -- $target"
+      planned_removals+=("$target")
+    else
+      rmdir -- "$target"
+    fi
+  }
+
+  remove_owned_file "${PLUGIN_DEST}/index.html" "<title>App Manager</title>"
+  remove_owned_file "${PLUGIN_DEST}/manifest.json" '"name": "app-manager"'
+  remove_owned_file "${PLUGIN_DEST}/app-manager.js" "App Manager Cockpit UI loaded"
+  remove_owned_file "${CONFIG_DEST}/defaults.json" '"nginx_template"'
+  remove_owned_file "${CONFIG_DEST}/templates/nginx.conf.tpl" "{{ app_route_location }}"
+  remove_owned_file "${CONFIG_DEST}/templates/app.service.tpl" "# Managed by Cockpit App Manager"
+  remove_owned_file "${BACKEND_DEST}/app-manager" 'APP_NAME = "app-manager"'
+  remove_owned_file "${BACKEND_DEST}/adapters.py" "class NextJSAdapter"
+
+  remove_empty_directory "${CONFIG_DEST}/templates"
+  remove_empty_directory "$PLUGIN_DEST"
+  remove_empty_directory "$CONFIG_DEST"
 }
 
 if [[ $# -gt 0 ]]; then
