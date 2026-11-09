@@ -2075,6 +2075,7 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             service_path = _service_path(app_snapshot)
             previous_service_content = service_path.read_bytes() if service_path.exists() else None
             build_environment = _environment_values_app(app_id)
+            _, release_group = _account_ids(username)
             build_result = adapter.build(
                 app_snapshot,
                 source_path,
@@ -2088,9 +2089,10 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                     live_log_path=deployment_log,
                 ),
                 timeout=int(config["build_timeout_seconds"]),
+                group_id=release_group,
+                log=lambda message: _append_deployment_log(deployment_log, message),
             )
             _append_deployment_log(deployment_log, "Build completed; activating the release")
-            _, release_group = _account_ids(username)
             _seal_release(release_dir, release_group, public=framework == "static")
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
             working_directory = None

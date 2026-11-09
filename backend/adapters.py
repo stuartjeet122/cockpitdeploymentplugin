@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import stat
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -13,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 CommandRunner = Callable[[Sequence[str], Path, int], subprocess.CompletedProcess]
 
 
-def _copy_source(repo_path: Path, release_dir: Path) -> Path:
+def _copy_source(repo_path: Path, release_dir: Path, group_id: Optional[int] = None) -> Path:
     app_dir = release_dir / "app"
     shutil.copytree(
         repo_path,
@@ -21,7 +22,82 @@ def _copy_source(repo_path: Path, release_dir: Path) -> Path:
         symlinks=True,
         ignore=shutil.ignore_patterns(".git", "node_modules", ".venv", "__pycache__", ".pytest_cache"),
     )
+    _validate_copy_symlinks(app_dir)
+    if group_id is not None:
+        _prepare_build_copy_permissions(app_dir, group_id)
     return app_dir
+
+
+def _validate_copy_symlinks(app_dir: Path) -> None:
+    root = app_dir.resolve(strict=True)
+    for current, directories, filenames in os.walk(app_dir, topdown=True, followlinks=False):
+        for name in directories + filenames:
+            path = Path(current) / name
+            if not path.is_symlink():
+                continue
+            try:
+                path.resolve(strict=False).relative_to(root)
+            except ValueError as exc:
+                raise ValueError(f"Application source symlink escapes the isolated release copy: {path}") from exc
+
+
+def _prepare_build_copy_permissions(app_dir: Path, group_id: int) -> None:
+    if isinstance(group_id, bool) or not isinstance(group_id, int) or group_id < 0:
+        raise ValueError("Build release group ID is invalid")
+    for current, directories, filenames in os.walk(app_dir, topdown=True, followlinks=False):
+        current_path = Path(current)
+        paths = [current_path]
+        paths.extend(current_path / name for name in directories + filenames)
+        for path in paths:
+            if path.is_symlink():
+                continue
+            metadata = path.stat(follow_symlinks=False)
+            mode = stat.S_IMODE(metadata.st_mode)
+            if path.is_dir():
+                permissions = (mode & 0o700) | 0o070
+            else:
+                group_permissions = 0o060 | (0o010 if mode & 0o100 else 0)
+                permissions = (mode & 0o700) | group_permissions
+            os.chown(str(path), -1, group_id, follow_symlinks=False)
+            os.chmod(str(path), permissions, follow_symlinks=False)
+
+
+def _file_diagnostics(path: Path, *, group_id: Optional[int] = None) -> str:
+    resolved_path = path.resolve(strict=False)
+    if not path.exists() and not path.is_symlink():
+        return f"{path} (resolved: {resolved_path}; exists: no; is_file: no)"
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        return f"{path} (resolved: {resolved_path}; stat error: {exc})"
+    regular_file = stat.S_ISREG(metadata.st_mode)
+    readable = False
+    if regular_file:
+        try:
+            with path.open("rb") as handle:
+                handle.read(1)
+            readable = True
+        except OSError:
+            readable = False
+    app_group_readable = (
+        group_id is None or metadata.st_gid == group_id and bool(metadata.st_mode & stat.S_IRGRP)
+    )
+    return (
+        f"{path} (resolved: {resolved_path}; exists: yes; is_file: {regular_file}; "
+        f"readable: {readable}; app_group_readable: {app_group_readable}; "
+        f"size: {metadata.st_size}; mode: {stat.S_IMODE(metadata.st_mode):04o}; "
+        f"uid: {metadata.st_uid}; gid: {metadata.st_gid})"
+    )
+
+
+def _readable_regular_file(path: Path, description: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{description} must be a regular file: {_file_diagnostics(path)}")
+    try:
+        with path.open("rb") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise ValueError(f"{description} is not readable: {path}: {exc}") from exc
 
 
 def _run_build(
@@ -54,18 +130,15 @@ def _detect_js_package_manager(project_dir: Path) -> tuple[str, Optional[Path]]:
         "yarn": ("yarn.lock",),
         "bun": ("bun.lock", "bun.lockb"),
     }
-    found = {
-        manager: next(
-            (
-                project_dir / name
-                for name in names
-                if (project_dir / name).exists() or (project_dir / name).is_symlink()
-            ),
-            None,
-        )
-        for manager, names in lockfiles.items()
-    }
-    found = {manager: lockfile for manager, lockfile in found.items() if lockfile is not None}
+    found = {}
+    for manager, names in lockfiles.items():
+        existing = [
+            project_dir / name
+            for name in names
+            if (project_dir / name).exists() or (project_dir / name).is_symlink()
+        ]
+        if existing:
+            found[manager] = existing[0]
     if len(found) > 1:
         names = ", ".join(sorted(path.name for path in found.values()))
         raise ValueError(f"Conflicting JavaScript package-manager lockfiles found: {names}")
@@ -73,25 +146,70 @@ def _detect_js_package_manager(project_dir: Path) -> tuple[str, Optional[Path]]:
         return "npm", None
 
     manager, lockfile = next(iter(found.items()))
-    if lockfile.is_symlink() or not lockfile.is_file():
-        raise ValueError(f"Package-manager lockfile must be a regular file: {lockfile}")
+    lock_data_bytes = _readable_regular_file(lockfile, "Package-manager lockfile")
     if manager == "npm":
         try:
-            lock_data = json.loads(lockfile.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            lock_data = json.loads(lock_data_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"Invalid npm lockfile {lockfile}: {exc}") from exc
         if not isinstance(lock_data, dict):
             raise ValueError(f"Invalid npm lockfile {lockfile}: expected a JSON object")
         lockfile_version = lock_data.get("lockfileVersion")
-        if (
-            isinstance(lockfile_version, bool)
-            or not isinstance(lockfile_version, int)
-            or lockfile_version < 1
-        ):
+        if isinstance(lockfile_version, bool) or not isinstance(lockfile_version, int) or lockfile_version not in {1, 2, 3}:
             raise ValueError(
-                f"Unsupported npm lockfile {lockfile}: lockfileVersion must be a number greater than or equal to 1"
+                f"Unsupported npm lockfile {lockfile}: lockfileVersion must be one of 1, 2, or 3"
+            )
+        required_section = "dependencies" if lockfile_version == 1 else "packages"
+        if not isinstance(lock_data.get(required_section), dict):
+            raise ValueError(
+                f"Invalid npm lockfile {lockfile}: lockfileVersion {lockfile_version} requires "
+                f"a {required_section} object"
             )
     return manager, lockfile
+
+
+def _npm_lockfile_version(lockfile: Optional[Path]) -> Optional[int]:
+    if lockfile is None or lockfile.name not in {"package-lock.json", "npm-shrinkwrap.json"}:
+        return None
+    try:
+        lock_data = json.loads(_readable_regular_file(lockfile, "npm lockfile").decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid npm lockfile {lockfile}: {exc}") from exc
+    version = lock_data.get("lockfileVersion") if isinstance(lock_data, dict) else None
+    if isinstance(version, int) and not isinstance(version, bool):
+        return version
+    return None
+
+
+def _log_npm_preflight(
+    app_dir: Path,
+    package_dir: Path,
+    lockfile: Optional[Path],
+    group_id: Optional[int],
+    log: Optional[Callable[[str], None]],
+) -> None:
+    if log is None:
+        return
+    package_path = package_dir / "package.json"
+    lockfile_description = "none"
+    if lockfile is not None:
+        lockfile_description = (
+            f"{lockfile}; lockfileVersion={_npm_lockfile_version(lockfile)}; "
+            f"{_file_diagnostics(lockfile, group_id=group_id)}"
+        )
+    lockfile_candidates = (
+        package_dir / "npm-shrinkwrap.json",
+        package_dir / "package-lock.json",
+    )
+    log(
+        "Next.js npm preflight: "
+        f"working_directory={app_dir}; resolved_working_directory={app_dir.resolve(strict=True)}; "
+        f"package_directory={package_dir}; resolved_package_directory={package_dir.resolve(strict=True)}; "
+        f"package_json={_file_diagnostics(package_path, group_id=group_id)}; "
+        f"npm_shrinkwrap={_file_diagnostics(lockfile_candidates[0], group_id=group_id)}; "
+        f"package_lock={_file_diagnostics(lockfile_candidates[1], group_id=group_id)}; "
+        f"selected_lockfile={lockfile_description}"
+    )
 
 
 def _package_manager_prefix(manager: str, app_dir: Path, package_dir: Path) -> List[str]:
@@ -200,10 +318,18 @@ def _install_js_dependencies(
     timeout: int,
     framework: str,
     package_dir: Optional[Path] = None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> None:
     package_dir = package_dir or app_dir
     install_command = _js_install_command(manager, lockfile, app_dir, package_dir)
     description = f"Installing {framework} dependencies with {manager}"
+    if log is not None:
+        log(
+            f"{description}: working_directory={app_dir}; "
+            f"resolved_working_directory={app_dir.resolve(strict=True)}; "
+            f"package_manager={manager}; lockfile={lockfile if lockfile is not None else 'none'}; "
+            f"command={shlex.join(install_command)}"
+        )
     if runner is None:
         raise RuntimeError("Build commands require an unprivileged application command runner")
     try:
@@ -248,10 +374,17 @@ def _install_js_production_dependencies(
     timeout: int,
     framework: str,
     package_dir: Optional[Path] = None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> None:
+    command = _js_production_install_command(manager, app_dir, package_dir or app_dir)
+    if log is not None:
+        log(
+            f"Preparing {framework} production dependencies: "
+            f"working_directory={app_dir}; package_manager={manager}; command={shlex.join(command)}"
+        )
     _run_build(
         runner,
-        _js_production_install_command(manager, app_dir, package_dir or app_dir),
+        command,
         app_dir,
         timeout,
         f"Preparing {framework} production dependencies with {manager}",
@@ -422,6 +555,8 @@ class FrameworkAdapter(ABC):
         *,
         runner: Optional[CommandRunner] = None,
         timeout: int = 900,
+        group_id: Optional[int] = None,
+        log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -445,6 +580,8 @@ class NextJSAdapter(FrameworkAdapter):
         *,
         runner: Optional[CommandRunner] = None,
         timeout: int = 900,
+        group_id: Optional[int] = None,
+        log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         build_config = app.get("build_config", {})
         if not isinstance(build_config, dict):
@@ -452,10 +589,22 @@ class NextJSAdapter(FrameworkAdapter):
         source_app_dir, source_package_dir = _next_project_directories(repo_path, build_config)
         app_relative_path = source_app_dir.relative_to(repo_path)
         package_relative_path = source_package_dir.relative_to(repo_path)
-        app_dir = _copy_source(repo_path, release_dir)
+        source_package_path = source_app_dir / "package.json"
+        source_package_contents = _readable_regular_file(source_package_path, "Next.js package.json")
+        app_dir = _copy_source(repo_path, release_dir, group_id)
         project_dir = app_dir / app_relative_path
         package_dir = app_dir / package_relative_path
-        package = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
+        copied_package_path = project_dir / "package.json"
+        copied_package_contents = _readable_regular_file(copied_package_path, "Copied Next.js package.json")
+        if copied_package_contents != source_package_contents:
+            raise RuntimeError(
+                f"Next.js package.json changed while copying source: source={source_package_path}; "
+                f"release={copied_package_path}"
+            )
+        try:
+            package = json.loads(copied_package_contents.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid Next.js package.json {copied_package_path}: {exc}") from exc
         dependencies = {**package.get("dependencies", {}), **package.get("devDependencies", {})}
         if "next" not in dependencies:
             raise ValueError(f"Next.js was selected but is not declared in {project_dir / 'package.json'}")
@@ -465,7 +614,26 @@ class NextJSAdapter(FrameworkAdapter):
         if not isinstance(scripts, dict) or not scripts.get("build"):
             raise ValueError(f"Next.js package.json must define a build script: {project_dir / 'package.json'}")
         manager, lockfile = _detect_js_package_manager(package_dir)
-        _install_js_dependencies(manager, lockfile, project_dir, runner, timeout, "Next.js", package_dir)
+        if manager == "npm":
+            source_lockfile = source_package_dir / lockfile.name if lockfile is not None else None
+            if lockfile is not None:
+                source_lockfile_contents = _readable_regular_file(source_lockfile, "Source npm lockfile")
+                copied_lockfile_contents = _readable_regular_file(lockfile, "Copied npm lockfile")
+                if source_lockfile_contents != copied_lockfile_contents:
+                    raise RuntimeError(
+                        f"npm lockfile changed while copying source: source={source_lockfile}; release={lockfile}"
+                    )
+            _log_npm_preflight(project_dir, package_dir, lockfile, group_id, log)
+        _install_js_dependencies(
+            manager,
+            lockfile,
+            project_dir,
+            runner,
+            timeout,
+            "Next.js",
+            package_dir,
+            log,
+        )
         _run_build(
             runner,
             _js_build_command(manager),
@@ -473,7 +641,7 @@ class NextJSAdapter(FrameworkAdapter):
             timeout,
             "Building Next.js application",
         )
-        _install_js_production_dependencies(manager, project_dir, runner, timeout, "Next.js", package_dir)
+        _install_js_production_dependencies(manager, project_dir, runner, timeout, "Next.js", package_dir, log)
         start = _next_start_command(manager, app["port"])
         start = _configured_start(app, start)
         return {
@@ -499,10 +667,13 @@ class GoAdapter(FrameworkAdapter):
         *,
         runner: Optional[CommandRunner] = None,
         timeout: int = 900,
+        group_id: Optional[int] = None,
+        log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
+        del log
         if not (repo_path / "go.mod").is_file():
             raise FileNotFoundError("go.mod not found for Go application")
-        app_dir = _copy_source(repo_path, release_dir)
+        app_dir = _copy_source(repo_path, release_dir, group_id)
         binary_path = release_dir / "server"
         _run_build(runner, ["go", "build", "-o", str(binary_path), "."], app_dir, timeout, "Building Go application")
         start = _configured_start(app, [str(binary_path)])
@@ -524,12 +695,15 @@ class NodeAdapter(FrameworkAdapter):
         *,
         runner: Optional[CommandRunner] = None,
         timeout: int = 900,
+        group_id: Optional[int] = None,
+        log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
+        del log
         package_path = repo_path / "package.json"
         if not package_path.is_file():
             raise FileNotFoundError("package.json not found for Node.js application")
         package = json.loads(package_path.read_text(encoding="utf-8"))
-        app_dir = _copy_source(repo_path, release_dir)
+        app_dir = _copy_source(repo_path, release_dir, group_id)
         installer = "ci" if (app_dir / "package-lock.json").exists() or (app_dir / "npm-shrinkwrap.json").exists() else "install"
         _run_build(runner, ["npm", installer, "--no-fund", "--no-audit"], app_dir, timeout, "Installing Node.js dependencies")
         if package.get("scripts", {}).get("build"):
@@ -556,8 +730,11 @@ class PythonAdapter(FrameworkAdapter):
         *,
         runner: Optional[CommandRunner] = None,
         timeout: int = 900,
+        group_id: Optional[int] = None,
+        log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        app_dir = _copy_source(repo_path, release_dir)
+        del log
+        app_dir = _copy_source(repo_path, release_dir, group_id)
         _run_build(runner, ["python3", "-m", "venv", ".venv"], app_dir, timeout, "Creating Python virtual environment")
         python = str(app_dir / ".venv" / "bin" / "python")
         if (app_dir / "requirements.txt").is_file():
@@ -605,10 +782,13 @@ class StaticAdapter(FrameworkAdapter):
         *,
         runner: Optional[CommandRunner] = None,
         timeout: int = 900,
+        group_id: Optional[int] = None,
+        log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
+        del log
         if not (repo_path / "index.html").is_file():
             raise FileNotFoundError("index.html not found for static application")
-        app_dir = _copy_source(repo_path, release_dir)
+        app_dir = _copy_source(repo_path, release_dir, group_id)
         start = _configured_start(
             app,
             ["python3", "-m", "http.server", str(app["port"]), "--bind", "127.0.0.1", "--directory", str(app_dir)],

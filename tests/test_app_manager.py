@@ -596,6 +596,60 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(stored["deployments"][-1]["status"], "failed")
         self.assertIn("remote unavailable", stored["deployments"][-1]["error"])
 
+    def test_failed_nextjs_deployment_retains_preflight_and_npm_diagnostics(self):
+        app = self.add_app("Next Site", framework="nextjs")["app"]
+        paths = manager._app_paths(app["id"], manager.get_config())
+        paths["source"].mkdir(parents=True)
+        (paths["source"] / "package.json").write_text(
+            json.dumps({
+                "dependencies": {"next": "^15.0.0"},
+                "scripts": {"build": "next build"},
+            }),
+            encoding="utf-8",
+        )
+        (paths["source"] / "package-lock.json").write_text(
+            json.dumps({"lockfileVersion": 3, "packages": {}}),
+            encoding="utf-8",
+        )
+        paths["releases"].mkdir(parents=True)
+        expected_error = (
+            "npm error code ENOLOCK\n"
+            "The `npm ci` command can only install with an existing package-lock.json"
+        )
+
+        def prepare_release(release_dir, username):
+            release_dir.mkdir()
+
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "ensure_app_user", return_value=app["service_user"]
+        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
+            manager, "clone_or_update_repo", return_value={"status": "updated"}
+        ), patch.object(manager, "git_output", return_value="a" * 40), patch.object(
+            manager, "_prepare_release_directory", side_effect=prepare_release
+        ), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
+            manager, "_environment_values_app", return_value={}
+        ), patch.object(manager, "_service_path", return_value=Path(self.temp_dir.name) / "unit.service"), patch.object(
+            manager, "_run_as_user",
+            return_value=subprocess.CompletedProcess(
+                args=["npm", "ci"],
+                returncode=1,
+                stdout="",
+                stderr=expected_error,
+            ),
+        ), patch("backend.adapters._prepare_build_copy_permissions"):
+            with self.assertRaisesRegex(RuntimeError, "ENOLOCK"):
+                manager.deploy_app(app["id"])
+
+        deployment = manager.get_registry()["apps"][0]["deployments"][-1]
+        self.assertEqual(deployment["status"], "failed")
+        self.assertFalse(Path(deployment["release"]).exists())
+        logs = manager.deployment_logs_app(app["id"])["logs"]
+        self.assertIn("Next.js npm preflight", logs)
+        self.assertIn("lockfileVersion=3", logs)
+        self.assertIn("app_group_readable:", logs)
+        self.assertIn("Command: npm ci --include=dev --no-fund --no-audit", logs)
+        self.assertIn(expected_error, logs)
+
     def test_health_check_accepts_only_success_responses(self):
         class Response:
             status = 200
@@ -650,6 +704,9 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         root_package=None,
         app_build_config=None,
         lockfile_subdirectory=None,
+        group_id=None,
+        log=None,
+        restrictive_permissions=False,
     ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -661,11 +718,13 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         package_dir = repo / package_subdirectory if package_subdirectory else repo
         package_dir.mkdir(parents=True, exist_ok=True)
         package_data = {
-                "dependencies": {"next": "^15.0.0", "react": "^19.0.0"},
-                "devDependencies": {"typescript": "^5.0.0"},
-                "scripts": {"build": "next build"},
-            }
+            "dependencies": {"next": "^15.0.0", "react": "^19.0.0"},
+            "devDependencies": {"typescript": "^5.0.0"},
+            "scripts": {"build": "next build"},
+        }
         (package_dir / "package.json").write_text(json.dumps(package_data), encoding="utf-8")
+        (repo / "app").mkdir(exist_ok=True)
+        (repo / "app" / "page.tsx").write_text("export default function Page() { return null; }\n", encoding="utf-8")
         if root_package is not None:
             (repo / "package.json").write_text(json.dumps(root_package), encoding="utf-8")
         lockfile_dir = repo / lockfile_subdirectory if lockfile_subdirectory else package_dir
@@ -676,12 +735,19 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
                 path.write_bytes(contents)
             else:
                 path.write_text(contents, encoding="utf-8")
+        if restrictive_permissions:
+            for current, directories, filenames in os.walk(repo):
+                Path(current).chmod(0o700)
+                for filename in filenames:
+                    (Path(current) / filename).chmod(0o600)
         result = NextJSAdapter().build(
             {"port": 8123, "build_config": app_build_config or {}},
             repo,
             release,
             runner=runner,
             timeout=17,
+            group_id=group_id,
+            log=log,
         )
         return repo, release, result, package_dir.relative_to(repo)
 
@@ -719,6 +785,28 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
             ["npm", "ci", "--include=dev", "--no-fund", "--no-audit"],
         )
 
+    def test_npm_shrinkwrap_takes_precedence_over_package_lock(self):
+        shrinkwrap = json.dumps({"lockfileVersion": 3, "packages": {"source": "shrinkwrap"}})
+        package_lock = json.dumps({"lockfileVersion": 3, "packages": {"source": "package-lock"}})
+        runner = self.successful_runner()
+        repo, release, _, _ = self.build_project(
+            {
+                "npm-shrinkwrap.json": shrinkwrap,
+                "package-lock.json": package_lock,
+            },
+            runner,
+        )
+
+        self.assertEqual(
+            runner.call_args_list[0].args[0],
+            ["npm", "ci", "--include=dev", "--no-fund", "--no-audit"],
+        )
+        self.assertEqual(
+            (release / "app" / "npm-shrinkwrap.json").read_text(encoding="utf-8"),
+            shrinkwrap,
+        )
+        self.assertEqual((repo / "package-lock.json").read_text(encoding="utf-8"), package_lock)
+
     def test_npm_without_lockfile_uses_install_only_in_release_copy(self):
         runner = self.successful_runner()
         repo, release, _, _ = self.build_project({}, runner)
@@ -751,6 +839,67 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
             ],
         )
         self.assertFalse((repo / "frontend" / "node_modules").exists())
+
+    def test_root_package_files_and_next_app_directory_are_copied_and_used_from_package_root(self):
+        package_lock = json.dumps({"lockfileVersion": 3, "packages": {}})
+        runner = self.successful_runner()
+        repo, release, result, _ = self.build_project({"package-lock.json": package_lock}, runner)
+        release_app = release / "app"
+
+        self.assertEqual(result["working_directory"], str(release_app))
+        self.assertTrue(all(call.args[1] == release_app for call in runner.call_args_list))
+        for relative_path in ("package.json", "package-lock.json", "app/page.tsx"):
+            self.assertEqual(
+                (repo / relative_path).read_bytes(),
+                (release_app / relative_path).read_bytes(),
+            )
+        self.assertEqual(runner.call_args_list[0].args[0][1], "ci")
+        self.assertFalse((repo / "node_modules").exists())
+
+    def test_npm_preflight_logs_resolved_paths_sizes_and_lockfile_version_before_install(self):
+        lockfile = json.dumps({"lockfileVersion": 3, "packages": {}})
+        runner = self.successful_runner()
+        messages = []
+        _, release, _, _ = self.build_project(
+            {"package-lock.json": lockfile},
+            runner,
+            log=messages.append,
+        )
+
+        preflight = next(message for message in messages if "Next.js npm preflight" in message)
+        install = next(message for message in messages if "Installing Next.js dependencies" in message)
+        self.assertLess(messages.index(preflight), messages.index(install))
+        self.assertIn(str((release / "app").resolve()), preflight)
+        self.assertIn("package-lock.json", preflight)
+        self.assertIn("lockfileVersion=3", preflight)
+        self.assertIn("size:", preflight)
+        self.assertIn("is_file: True", preflight)
+        self.assertIn("app_group_readable: True", preflight)
+
+    @unittest.skipIf(os.name == "nt", "POSIX group ownership is required")
+    def test_release_copy_is_owned_and_writable_by_the_application_group(self):
+        runner = self.successful_runner()
+        lockfile = json.dumps({"lockfileVersion": 3, "packages": {}})
+        messages = []
+        repo, release, _, _ = self.build_project(
+            {"package-lock.json": lockfile},
+            runner,
+            group_id=os.getgid(),
+            log=messages.append,
+            restrictive_permissions=True,
+        )
+
+        package_path = release / "app" / "package.json"
+        release_app = release / "app"
+        copied_lockfile = release_app / "package-lock.json"
+        self.assertEqual(package_path.stat().st_gid, os.getgid())
+        self.assertEqual(package_path.stat().st_mode & 0o060, 0o060)
+        self.assertEqual(copied_lockfile.stat().st_gid, os.getgid())
+        self.assertEqual(copied_lockfile.stat().st_mode & 0o060, 0o060)
+        self.assertEqual(release_app.stat().st_mode & 0o070, 0o070)
+        self.assertEqual(repo.joinpath("package.json").stat().st_mode & 0o777, 0o600)
+        preflight = next(message for message in messages if "Next.js npm preflight" in message)
+        self.assertIn("app_group_readable: True", preflight)
 
     def test_explicit_application_directory_is_used_by_the_build_adapter(self):
         runner = self.successful_runner()
@@ -814,8 +963,26 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
 
     def test_invalid_npm_lockfile_is_rejected_before_install(self):
         runner = self.successful_runner()
-        with self.assertRaisesRegex(ValueError, "lockfileVersion.*greater than or equal to 1"):
+        with self.assertRaisesRegex(ValueError, "lockfileVersion.*one of 1, 2, or 3"):
             self.build_project({"package-lock.json": '{"lockfileVersion":0,"packages":{}}'}, runner)
+        runner.assert_not_called()
+
+    def test_unsupported_npm_lockfile_version_is_rejected_before_install(self):
+        runner = self.successful_runner()
+        with self.assertRaisesRegex(ValueError, "Unsupported npm lockfile.*lockfileVersion"):
+            self.build_project({"package-lock.json": '{"lockfileVersion":4,"packages":{}}'}, runner)
+        runner.assert_not_called()
+
+    def test_npm_lockfile_with_missing_required_structure_is_rejected(self):
+        runner = self.successful_runner()
+        with self.assertRaisesRegex(ValueError, "requires a packages object"):
+            self.build_project({"package-lock.json": '{"lockfileVersion":3}'}, runner)
+        runner.assert_not_called()
+
+    def test_malformed_npm_lockfile_is_not_treated_as_missing(self):
+        runner = self.successful_runner()
+        with self.assertRaisesRegex(ValueError, "Invalid npm lockfile"):
+            self.build_project({"package-lock.json": '{"lockfileVersion":3,'}, runner)
         runner.assert_not_called()
 
     def test_incorrect_explicit_working_directory_is_reported_before_install(self):
