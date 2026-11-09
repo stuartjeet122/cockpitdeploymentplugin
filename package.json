@@ -1,0 +1,10 @@
+{
+  "name": "cockpit-app-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Native Cockpit plugin for managing deployed websites and applications on Ubuntu Server",
+  "scripts": {
+    "test": "python -m unittest discover -s tests -v",
+    "lint": "python -m compileall backend tests"
+  }
+}

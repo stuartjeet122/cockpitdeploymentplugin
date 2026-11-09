@@ -1,0 +1,21 @@
+{
+  "port_range": {
+    "start": 8100,
+    "end": 8999,
+    "reserved": [8080]
+  },
+  "source_root": "/var/lib/cockpit/app-manager/sources",
+  "production_root": "/opt/webapps",
+  "registry_path": "/var/lib/cockpit/app-manager/apps.json",
+  "allowed_source_dirs": [
+    "/opt",
+    "/home/sjeetoo",
+    "/srv"
+  ],
+  "default_branch": "main",
+  "release_retention": 5,
+  "build_timeout_seconds": 900,
+  "health_timeout_seconds": 30,
+  "nginx_template": "/etc/cockpit/app-manager/templates/nginx.conf.tpl",
+  "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl"
+}

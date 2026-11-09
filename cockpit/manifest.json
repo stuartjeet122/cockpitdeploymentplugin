@@ -1,0 +1,11 @@
+{
+  "name": "app-manager",
+  "version": "1.0.0",
+  "requires": {
+    "cockpit": "318"
+  },
+  "menu": {
+    "label": "App Manager",
+    "path": "/app-manager"
+  }
+}
