@@ -75,7 +75,7 @@ Project conventions and deployment requirements are documented in `AGENTS.md` an
 
 Applications must provide an appropriate start entry point. Framework adapters install/build dependencies and use a conventional start command; applications with nonstandard startup behavior can supply `build_config.start_command` as an array of executable arguments (not a shell string). The app must listen on the assigned `PORT` and on `127.0.0.1`. Health checks use the configured local path and require a 2xx response.
 
-Next.js deployments select npm, pnpm, Yarn, or Bun from the repository lockfile. npm uses `npm ci` when a valid npm lockfile exists and `npm install` otherwise; a mismatched lockfile fails with the complete command output and is never silently replaced. Dependencies are installed and built in an isolated release copy, then development dependencies are pruned before runtime.
+Next.js deployments detect a unique app in the repository or accept its relative path in `build_config.app_directory` (for example, `apps/web`). npm workspaces use the workspace root lockfile while keeping build and runtime working directories at the selected app's `package.json`. The adapter selects npm, pnpm, Yarn, or Bun from the applicable lockfile. npm uses `npm ci` only with a valid npm lockfile and `npm install` otherwise; inconsistent lockfiles include the exact command, working directory, exit status, and complete output. Dependency installation and builds run in an isolated release copy, never in the cloned source checkout, and development dependencies are pruned before runtime.
 
 ## Development tests
 

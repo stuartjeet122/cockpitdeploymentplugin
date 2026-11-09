@@ -352,6 +352,22 @@ def validate_allowed_path(value: Any, allowed_roots: Sequence[str]) -> Path:
     return candidate
 
 
+def _validate_app_directory_setting(value: Any) -> None:
+    if value is None:
+        return
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or "\0" in value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise ValueError(
+            "build_config.app_directory must be a non-empty relative path without '.', '..', or empty components"
+        )
+
+
 def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Application payload must be a JSON object")
@@ -370,6 +386,7 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     build_config = payload.get("build_config") or {}
     if not isinstance(build_config, dict):
         raise ValueError("Build configuration must be a JSON object")
+    _validate_app_directory_setting(build_config.get("app_directory"))
     if "start_command" in build_config:
         command = build_config["start_command"]
         if not isinstance(command, list) or not command or not all(
@@ -525,13 +542,17 @@ def run_command(
     timeout: int = COMMAND_TIMEOUT_SECONDS,
     env: Optional[Dict[str, str]] = None,
     live_log_path: Optional[Path] = None,
+    redact_values: Optional[Sequence[str]] = None,
 ) -> subprocess.CompletedProcess:
     if not args or not all(isinstance(arg, str) and "\0" not in arg for arg in args):
         raise ValueError("Subprocess arguments must be a non-empty list of strings")
     try:
         if live_log_path is not None:
-            return _run_command_with_live_log(args, cwd, timeout, env, live_log_path)
-        return subprocess.run(
+            values = list(redact_values or ())
+            if env:
+                values.extend(env.values())
+            return _run_command_with_live_log(args, cwd, timeout, env, live_log_path, values)
+        result = subprocess.run(
             list(args),
             cwd=str(cwd) if cwd is not None else None,
             env=env,
@@ -540,13 +561,25 @@ def run_command(
             check=False,
             timeout=max(1, int(timeout)),
         )
+        values = list(redact_values or ())
+        if env:
+            values.extend(env.values())
+        return subprocess.CompletedProcess(
+            result.args,
+            result.returncode,
+            _redact_text(result.stdout or "", values),
+            _redact_text(result.stderr or "", values),
+        )
     except subprocess.TimeoutExpired as exc:
+        values = list(redact_values or ())
+        if env:
+            values.extend(env.values())
         details = []
         for label, output in (("stdout", exc.stdout), ("stderr", exc.stderr)):
             if output:
                 if isinstance(output, bytes):
                     output = output.decode("utf-8", errors="replace")
-                details.append(f"{label}:\n{output.rstrip()}")
+                details.append(f"{label}:\n{_redact_text(output.rstrip(), values)}")
         detail = "\n".join(details)
         raise RuntimeError(
             f"Command timed out after {timeout} seconds: {args[0]}"
@@ -562,6 +595,7 @@ def _run_command_with_live_log(
     timeout: int,
     env: Optional[Dict[str, str]],
     live_log_path: Path,
+    redact_values: Optional[Sequence[str]] = None,
 ) -> subprocess.CompletedProcess:
     live_log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if live_log_path.is_symlink() or (live_log_path.exists() and not live_log_path.is_file()):
@@ -570,6 +604,11 @@ def _run_command_with_live_log(
     reader_errors = []
     write_lock = threading.Lock()
     log_truncated = False
+    sensitive_values = sorted(
+        {value for value in (redact_values or ()) if isinstance(value, str) and value},
+        key=len,
+        reverse=True,
+    )
 
     def append_live_text(channel: str, text: str) -> None:
         nonlocal log_truncated
@@ -600,25 +639,46 @@ def _run_command_with_live_log(
     def consume(channel: str, stream: Any) -> None:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         log_write_failed = False
+        pending_text = ""
+
+        def emit_redacted(text: str, final: bool = False) -> None:
+            nonlocal log_write_failed, pending_text
+            pending_text += text
+            if final:
+                safe_end = len(pending_text)
+            elif sensitive_values:
+                safe_end = max(0, len(pending_text) - len(sensitive_values[0]) + 1)
+            else:
+                safe_end = len(pending_text)
+            while safe_end > 0 and not final:
+                crossing = [
+                    index
+                    for secret in sensitive_values
+                    for index in range(max(0, safe_end - len(secret) + 1), safe_end)
+                    if pending_text.startswith(secret, index) and index + len(secret) > safe_end
+                ]
+                if not crossing:
+                    break
+                safe_end = min(crossing)
+            if safe_end:
+                safe_text = _redact_text(pending_text[:safe_end], sensitive_values)
+                pending_text = pending_text[safe_end:]
+                if not log_write_failed:
+                    try:
+                        append_live_text(channel, safe_text)
+                    except Exception as exc:
+                        reader_errors.append(exc)
+                        log_write_failed = True
+
         try:
             while True:
                 chunk = os.read(stream.fileno(), 4096)
                 if not chunk:
                     break
                 output[channel].extend(chunk)
-                text = decoder.decode(chunk)
-                if not log_write_failed:
-                    try:
-                        append_live_text(channel, text)
-                    except Exception as exc:
-                        reader_errors.append(exc)
-                        log_write_failed = True
+                emit_redacted(decoder.decode(chunk))
             remaining = decoder.decode(b"", final=True)
-            if not log_write_failed:
-                try:
-                    append_live_text(channel, remaining)
-                except Exception as exc:
-                    reader_errors.append(exc)
+            emit_redacted(remaining, final=True)
         except Exception as exc:
             reader_errors.append(exc)
             while True:
@@ -649,8 +709,8 @@ def _run_command_with_live_log(
         if process.stderr is not None:
             process.stderr.close()
 
-    stdout = output["stdout"].decode("utf-8", errors="replace")
-    stderr = output["stderr"].decode("utf-8", errors="replace")
+    stdout = _redact_text(output["stdout"].decode("utf-8", errors="replace"), sensitive_values)
+    stderr = _redact_text(output["stderr"].decode("utf-8", errors="replace"), sensitive_values)
     if timed_out:
         details = []
         if stdout:
@@ -665,6 +725,12 @@ def _run_command_with_live_log(
     if reader_errors:
         raise RuntimeError(f"Could not write live deployment output: {reader_errors[0]}")
     return subprocess.CompletedProcess(list(args), returncode, stdout, stderr)
+
+
+def _redact_text(text: str, values: Sequence[str]) -> str:
+    for value in sorted({item for item in values if isinstance(item, str) and item}, key=len, reverse=True):
+        text = text.replace(value, "[REDACTED]")
+    return text
 
 
 def _command_error(result: subprocess.CompletedProcess, description: str) -> None:
@@ -797,6 +863,7 @@ def _run_as_user(
         cwd=cwd,
         timeout=timeout,
         live_log_path=live_log_path,
+        redact_values=list((environment or {}).values()),
     )
 
 
@@ -1206,8 +1273,13 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         app["service_user"] = expected_user
         if app.get("slug", app_id) != app_id:
             raise ValueError(f"Application {app_id!r} has an invalid slug")
-        if not isinstance(app.get("build_config", {}), dict):
+        build_config = app.get("build_config", {})
+        if not isinstance(build_config, dict):
             raise ValueError(f"Application {app_id!r} has an invalid build configuration")
+        try:
+            _validate_app_directory_setting(build_config.get("app_directory"))
+        except ValueError as exc:
+            raise ValueError(f"Application {app_id!r} has an invalid build configuration") from exc
         try:
             app_health_url(app)
         except ValueError as exc:
@@ -1585,11 +1657,20 @@ def _render_service(
     app: Dict[str, Any],
     start_command: Sequence[str],
     config: Dict[str, Any],
+    working_directory: Optional[Path] = None,
 ) -> str:
     if not start_command:
         raise ValueError("Application start command cannot be empty")
     paths = _app_paths(app["id"], config)
-    working_directory = paths["current"] / "app"
+    app_working_directory = paths["current"] / "app"
+    if working_directory is None:
+        working_directory = app_working_directory
+    try:
+        relative_working_directory = working_directory.relative_to(app_working_directory)
+    except ValueError as exc:
+        raise ValueError("Application working directory must be inside its managed release") from exc
+    if ".." in relative_working_directory.parts:
+        raise ValueError("Application working directory must not traverse outside its managed release")
     writable_paths = (
         paths["home"],
         paths["config"],
@@ -1720,8 +1801,14 @@ def _nginx_quote(path: str) -> str:
     return '"' + path.replace("\\", "\\\\") + '"'
 
 
-def _write_service(app: Dict[str, Any], release_dir: Path, start_command: Sequence[str], config: Dict[str, Any]) -> Path:
-    service = _render_service(app, start_command, config)
+def _write_service(
+    app: Dict[str, Any],
+    release_dir: Path,
+    start_command: Sequence[str],
+    config: Dict[str, Any],
+    working_directory: Optional[Path] = None,
+) -> Path:
+    service = _render_service(app, start_command, config, working_directory)
     service_path = _service_path(app)
     service_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{service_path.name}.", dir=str(service_path.parent))
@@ -1971,7 +2058,7 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             )
             framework = app_snapshot.get("framework", "auto")
             if framework == "auto":
-                framework = detect_framework(source_path)
+                framework = detect_framework(source_path, app_snapshot.get("build_config", {}))
             app_snapshot["framework"] = framework
             _append_deployment_log(deployment_log, f"Detected framework: {framework}")
             adapter = get_adapter(framework)
@@ -2006,7 +2093,19 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             _, release_group = _account_ids(username)
             _seal_release(release_dir, release_group, public=framework == "static")
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
-            _write_service(app_snapshot, release_dir, command, config)
+            working_directory = None
+            build_working_directory = build_result.get("working_directory")
+            if build_working_directory is not None:
+                release_app_dir = (release_dir / "app").resolve(strict=True)
+                actual_build_directory = Path(build_working_directory).resolve(strict=True)
+                try:
+                    relative_build_directory = actual_build_directory.relative_to(release_app_dir)
+                except ValueError as exc:
+                    raise RuntimeError("Framework adapter returned a working directory outside its release") from exc
+                if not actual_build_directory.is_dir():
+                    raise RuntimeError("Framework adapter returned a non-directory working directory")
+                working_directory = paths["current"] / "app" / relative_build_directory
+            _write_service(app_snapshot, release_dir, command, config, working_directory)
             unit_written = True
             _systemctl("daemon-reload")
             _retire_legacy_root_service(app_snapshot)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -72,28 +74,61 @@ def _detect_js_package_manager(project_dir: Path) -> tuple[str, Optional[Path]]:
 
     manager, lockfile = next(iter(found.items()))
     if lockfile.is_symlink() or not lockfile.is_file():
-        raise ValueError(f"Package-manager lockfile must be a regular file: {lockfile.name}")
+        raise ValueError(f"Package-manager lockfile must be a regular file: {lockfile}")
     if manager == "npm":
         try:
             lock_data = json.loads(lockfile.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Invalid npm lockfile {lockfile.name}: {exc}") from exc
+            raise ValueError(f"Invalid npm lockfile {lockfile}: {exc}") from exc
         if not isinstance(lock_data, dict):
-            raise ValueError(f"Invalid npm lockfile {lockfile.name}: expected a JSON object")
+            raise ValueError(f"Invalid npm lockfile {lockfile}: expected a JSON object")
+        lockfile_version = lock_data.get("lockfileVersion")
+        if (
+            isinstance(lockfile_version, bool)
+            or not isinstance(lockfile_version, int)
+            or lockfile_version < 1
+        ):
+            raise ValueError(
+                f"Unsupported npm lockfile {lockfile}: lockfileVersion must be a number greater than or equal to 1"
+            )
     return manager, lockfile
 
 
-def _js_install_command(manager: str, lockfile: Optional[Path]) -> List[str]:
+def _package_manager_prefix(manager: str, app_dir: Path, package_dir: Path) -> List[str]:
+    if app_dir == package_dir:
+        return []
+    if manager == "npm":
+        return ["--prefix", str(package_dir)]
+    if manager == "pnpm":
+        return ["--dir", str(package_dir)]
+    if manager == "yarn":
+        return ["--cwd", str(package_dir)]
+    if manager == "bun":
+        return ["--cwd", str(package_dir)]
+    raise ValueError(f"Unsupported JavaScript package manager: {manager}")
+
+
+def _js_install_command(
+    manager: str,
+    lockfile: Optional[Path],
+    app_dir: Optional[Path] = None,
+    package_dir: Optional[Path] = None,
+) -> List[str]:
     has_lockfile = lockfile is not None
+    prefix = (
+        _package_manager_prefix(manager, app_dir, package_dir)
+        if app_dir is not None and package_dir is not None
+        else []
+    )
     if manager == "npm":
         operation = "ci" if has_lockfile else "install"
-        return ["npm", operation, "--include=dev", "--no-fund", "--no-audit"]
+        return ["npm", *prefix, operation, "--include=dev", "--no-fund", "--no-audit"]
     if manager == "pnpm":
-        return ["pnpm", "install", "--frozen-lockfile", "--prod=false"]
+        return ["pnpm", *prefix, "install", "--frozen-lockfile", "--prod=false"]
     if manager == "yarn":
-        return ["yarn", "install", "--frozen-lockfile", "--production=false"]
+        return ["yarn", *prefix, "install", "--frozen-lockfile", "--production=false"]
     if manager == "bun":
-        return ["bun", "install", "--frozen-lockfile"]
+        return ["bun", *prefix, "install", "--frozen-lockfile"]
     raise ValueError(f"Unsupported JavaScript package manager: {manager}")
 
 
@@ -109,15 +144,24 @@ def _js_build_command(manager: str) -> List[str]:
     raise ValueError(f"Unsupported JavaScript package manager: {manager}")
 
 
-def _js_production_install_command(manager: str) -> List[str]:
+def _js_production_install_command(
+    manager: str,
+    app_dir: Optional[Path] = None,
+    package_dir: Optional[Path] = None,
+) -> List[str]:
+    prefix = (
+        _package_manager_prefix(manager, app_dir, package_dir)
+        if app_dir is not None and package_dir is not None
+        else []
+    )
     if manager == "npm":
-        return ["npm", "prune", "--omit=dev", "--no-fund", "--no-audit"]
+        return ["npm", *prefix, "prune", "--omit=dev", "--no-fund", "--no-audit"]
     if manager == "pnpm":
-        return ["pnpm", "install", "--frozen-lockfile", "--prod=true"]
+        return ["pnpm", *prefix, "install", "--frozen-lockfile", "--prod=true"]
     if manager == "yarn":
-        return ["yarn", "install", "--frozen-lockfile", "--production=true"]
+        return ["yarn", *prefix, "install", "--frozen-lockfile", "--production=true"]
     if manager == "bun":
-        return ["bun", "install", "--frozen-lockfile", "--production"]
+        return ["bun", *prefix, "install", "--frozen-lockfile", "--production"]
     raise ValueError(f"Unsupported JavaScript package manager: {manager}")
 
 
@@ -134,15 +178,15 @@ def _next_start_command(manager: str, port: Any) -> List[str]:
     raise ValueError(f"Unsupported JavaScript package manager: {manager}")
 
 
-def _npm_lockfile_inconsistent(error: RuntimeError) -> bool:
-    message = str(error).lower()
+def _npm_lockfile_inconsistent(output: str) -> bool:
+    message = output.lower()
     return any(
         marker in message
         for marker in (
-            "eusage",
             "package.json and package-lock.json",
             "package.json and npm-shrinkwrap.json",
             "must be in sync",
+            "is not in sync",
             "from lock file",
         )
     )
@@ -155,20 +199,46 @@ def _install_js_dependencies(
     runner: Optional[CommandRunner],
     timeout: int,
     framework: str,
+    package_dir: Optional[Path] = None,
 ) -> None:
-    install_command = _js_install_command(manager, lockfile)
+    package_dir = package_dir or app_dir
+    install_command = _js_install_command(manager, lockfile, app_dir, package_dir)
     description = f"Installing {framework} dependencies with {manager}"
+    if runner is None:
+        raise RuntimeError("Build commands require an unprivileged application command runner")
     try:
-        _run_build(runner, install_command, app_dir, timeout, description)
-    except RuntimeError as exc:
-        if manager == "npm" and install_command[1] == "ci" and _npm_lockfile_inconsistent(exc):
-            raise RuntimeError(
-                f"npm ci failed because {lockfile.name} is inconsistent with package.json. "
-                "Update and commit the lockfile in the source repository, then deploy again. "
-                "The source repository was not modified.\n"
-                f"{exc}"
-            ) from exc
-        raise
+        result = runner(install_command, app_dir, timeout)
+    except Exception as exc:
+        raise RuntimeError(
+            f"{description} could not run\n"
+            f"Application working directory: {app_dir}\n"
+            f"Package manager: {manager}\n"
+            f"Lockfile: {lockfile if lockfile is not None else 'none'}\n"
+            f"Command: {shlex.join(install_command)}\n"
+            f"Error: {exc}"
+        ) from exc
+    if result.returncode == 0:
+        return
+
+    output = "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+    message = (
+        f"{description} failed\n"
+        f"Application working directory: {app_dir}\n"
+        f"Package manager: {manager}\n"
+        f"Lockfile: {lockfile if lockfile is not None else 'none'}\n"
+        f"Command: {shlex.join(install_command)}\n"
+        f"Exit code: {result.returncode}"
+    )
+    if manager == "npm" and lockfile is not None and _npm_lockfile_inconsistent(output):
+        message += (
+            f"\nThe npm lockfile {lockfile} is inconsistent with package.json. "
+            "Update the lockfile in the source repository and deploy again."
+        )
+    if result.stdout:
+        message += f"\nstdout:\n{result.stdout.rstrip()}"
+    if result.stderr:
+        message += f"\nstderr:\n{result.stderr.rstrip()}"
+    raise RuntimeError(message)
 
 
 def _install_js_production_dependencies(
@@ -177,14 +247,158 @@ def _install_js_production_dependencies(
     runner: Optional[CommandRunner],
     timeout: int,
     framework: str,
+    package_dir: Optional[Path] = None,
 ) -> None:
     _run_build(
         runner,
-        _js_production_install_command(manager),
+        _js_production_install_command(manager, app_dir, package_dir or app_dir),
         app_dir,
         timeout,
         f"Preparing {framework} production dependencies with {manager}",
     )
+
+
+_NEXT_CONFIG_NAMES = ("next.config.js", "next.config.mjs", "next.config.ts")
+_IGNORED_PACKAGE_DIRS = {".git", "node_modules", ".next", ".venv", "__pycache__"}
+
+
+def _package_has_next(package_path: Path) -> bool:
+    if package_path.is_symlink() or not package_path.is_file():
+        return False
+    try:
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read JavaScript package manifest {package_path}: {exc}") from exc
+    if not isinstance(package, dict):
+        raise ValueError(f"Invalid JavaScript package manifest {package_path}: expected a JSON object")
+    dependencies = package.get("dependencies", {})
+    dev_dependencies = package.get("devDependencies", {})
+    if not isinstance(dependencies, dict) or not isinstance(dev_dependencies, dict):
+        raise ValueError(f"Invalid dependency sections in JavaScript package manifest {package_path}")
+    return "next" in dependencies or "next" in dev_dependencies
+
+
+def _next_config_present(directory: Path) -> bool:
+    return any((directory / name).is_file() for name in _NEXT_CONFIG_NAMES)
+
+
+def _validate_app_directory(repo_path: Path, configured: Any) -> Path:
+    if not isinstance(configured, str) or not configured or "\\" in configured or "\0" in configured:
+        raise ValueError("build_config.app_directory must be a non-empty relative POSIX path")
+    parts = configured.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("build_config.app_directory must not contain empty, '.' or '..' path components")
+    directory = repo_path.joinpath(*parts)
+    current = repo_path
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"Next.js application directory must not contain symlinks: {current}")
+    if not directory.is_dir():
+        raise ValueError(f"Configured Next.js application directory does not exist: {directory}")
+    package_path = directory / "package.json"
+    if package_path.is_symlink() or not package_path.is_file():
+        raise ValueError(f"Configured Next.js application directory has no regular package.json: {package_path}")
+    return directory
+
+
+def _next_project_candidates(repo_path: Path) -> List[Path]:
+    candidates: List[Path] = []
+    for current, directories, filenames in os.walk(repo_path, topdown=True, followlinks=False):
+        directories[:] = sorted(
+            name for name in directories
+            if name not in _IGNORED_PACKAGE_DIRS and not (Path(current) / name).is_symlink()
+        )
+        current_path = Path(current)
+        package_path = current_path / "package.json"
+        has_config = _next_config_present(current_path)
+        try:
+            has_next_package = package_path.is_file() and _package_has_next(package_path)
+        except ValueError:
+            if current_path == repo_path or has_config:
+                raise
+            continue
+        if has_next_package or has_config:
+            candidates.append(current_path)
+    return candidates
+
+
+def _workspace_patterns(package: Dict[str, Any]) -> List[str]:
+    workspaces = package.get("workspaces", [])
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages", [])
+    if not isinstance(workspaces, list) or not all(isinstance(item, str) for item in workspaces):
+        return []
+    return workspaces
+
+
+def _is_npm_workspace(package_dir: Path, workspace_root: Path) -> bool:
+    package_path = workspace_root / "package.json"
+    if not package_path.is_file() or package_path.is_symlink():
+        return False
+    try:
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read workspace package manifest {package_path}: {exc}") from exc
+    if not isinstance(package, dict):
+        return False
+    relative = package_dir.relative_to(workspace_root).as_posix()
+    included = False
+    for pattern in _workspace_patterns(package):
+        if pattern.startswith("!"):
+            matches = workspace_root.glob(pattern[1:])
+            if any(path.resolve() == package_dir.resolve() for path in matches):
+                return False
+        elif not Path(pattern).is_absolute() and ".." not in Path(pattern).parts:
+            if any(path.resolve() == package_dir.resolve() for path in workspace_root.glob(pattern)):
+                included = True
+    return included
+
+
+def _next_project_directories(repo_path: Path, build_config: Dict[str, Any]) -> tuple[Path, Path]:
+    configured = build_config.get("app_directory")
+    if configured is not None:
+        app_dir = _validate_app_directory(repo_path, configured)
+        if not _package_has_next(app_dir / "package.json") and not _next_config_present(app_dir):
+            raise ValueError(f"Configured Next.js application directory does not declare Next.js: {app_dir}")
+    else:
+        candidates = _next_project_candidates(repo_path)
+        if not candidates:
+            raise FileNotFoundError(f"No Next.js package.json was found under {repo_path}")
+        nested_candidates = [path for path in candidates if path != repo_path]
+        root_is_workspace_only = (
+            repo_path in candidates
+            and bool(nested_candidates)
+            and not _next_config_present(repo_path)
+            and bool(_workspace_patterns(
+                json.loads((repo_path / "package.json").read_text(encoding="utf-8"))
+            ))
+        )
+        if repo_path in candidates and not root_is_workspace_only:
+            app_dir = repo_path
+        elif len(nested_candidates) == 1:
+            app_dir = nested_candidates[0]
+        elif not nested_candidates and repo_path in candidates:
+            app_dir = repo_path
+        else:
+            paths = ", ".join(str(path.relative_to(repo_path)) for path in nested_candidates)
+            raise ValueError(
+                f"Multiple Next.js applications were found ({paths}); set build_config.app_directory explicitly"
+            )
+        package_path = app_dir / "package.json"
+        if package_path.is_symlink() or not package_path.is_file():
+            raise FileNotFoundError(f"package.json not found for Next.js application in {app_dir}")
+
+    workspace_root = app_dir
+    for ancestor in app_dir.parents:
+        try:
+            ancestor.relative_to(repo_path)
+        except ValueError:
+            break
+        if _is_npm_workspace(app_dir, ancestor):
+            workspace_root = ancestor
+            break
+    return app_dir, workspace_root
 
 
 def _configured_start(app: Dict[str, Any], default: List[str]) -> List[str]:
@@ -216,18 +430,12 @@ class NextJSAdapter(FrameworkAdapter):
     name = "nextjs"
 
     @staticmethod
-    def detect(repo_path: Path) -> bool:
-        if any((repo_path / name).is_file() for name in ("next.config.js", "next.config.mjs", "next.config.ts")):
-            return True
-        package_path = repo_path / "package.json"
-        if not package_path.is_file():
-            return False
-        package = json.loads(package_path.read_text(encoding="utf-8"))
-        dependencies = {
-            **package.get("dependencies", {}),
-            **package.get("devDependencies", {}),
-        }
-        return "next" in dependencies
+    def detect(repo_path: Path, build_config: Optional[Dict[str, Any]] = None) -> bool:
+        try:
+            _next_project_directories(repo_path, build_config or {})
+        except FileNotFoundError:
+            return _next_config_present(repo_path)
+        return True
 
     def build(
         self,
@@ -238,32 +446,42 @@ class NextJSAdapter(FrameworkAdapter):
         runner: Optional[CommandRunner] = None,
         timeout: int = 900,
     ) -> Dict[str, Any]:
-        package_path = repo_path / "package.json"
-        if not package_path.is_file():
-            raise FileNotFoundError("package.json not found for Next.js application")
+        build_config = app.get("build_config", {})
+        if not isinstance(build_config, dict):
+            raise ValueError("build_config must be a JSON object")
+        source_app_dir, source_package_dir = _next_project_directories(repo_path, build_config)
+        app_relative_path = source_app_dir.relative_to(repo_path)
+        package_relative_path = source_package_dir.relative_to(repo_path)
         app_dir = _copy_source(repo_path, release_dir)
-        package = json.loads((app_dir / "package.json").read_text(encoding="utf-8"))
+        project_dir = app_dir / app_relative_path
+        package_dir = app_dir / package_relative_path
+        package = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
         dependencies = {**package.get("dependencies", {}), **package.get("devDependencies", {})}
         if "next" not in dependencies:
-            raise ValueError("Next.js was selected but is not declared in package.json")
+            raise ValueError(f"Next.js was selected but is not declared in {project_dir / 'package.json'}")
         if "next" not in package.get("dependencies", {}):
-            raise ValueError("Next.js must be listed in package.json dependencies to run in production")
+            raise ValueError(f"Next.js must be listed in dependencies in {project_dir / 'package.json'} to run in production")
         scripts = package.get("scripts", {})
         if not isinstance(scripts, dict) or not scripts.get("build"):
-            raise ValueError("Next.js package.json must define a build script")
-        manager, lockfile = _detect_js_package_manager(app_dir)
-        _install_js_dependencies(manager, lockfile, app_dir, runner, timeout, "Next.js")
+            raise ValueError(f"Next.js package.json must define a build script: {project_dir / 'package.json'}")
+        manager, lockfile = _detect_js_package_manager(package_dir)
+        _install_js_dependencies(manager, lockfile, project_dir, runner, timeout, "Next.js", package_dir)
         _run_build(
             runner,
             _js_build_command(manager),
-            app_dir,
+            project_dir,
             timeout,
             "Building Next.js application",
         )
-        _install_js_production_dependencies(manager, app_dir, runner, timeout, "Next.js")
+        _install_js_production_dependencies(manager, project_dir, runner, timeout, "Next.js", package_dir)
         start = _next_start_command(manager, app["port"])
         start = _configured_start(app, start)
-        return {"status": "success", "release_dir": str(release_dir), "start_command": start}
+        return {
+            "status": "success",
+            "release_dir": str(release_dir),
+            "start_command": start,
+            "working_directory": str(project_dir),
+        }
 
 
 class GoAdapter(FrameworkAdapter):
@@ -398,8 +616,10 @@ class StaticAdapter(FrameworkAdapter):
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
-def detect_framework(repo_path: Path) -> str:
-    for adapter_cls in (NextJSAdapter, GoAdapter, PythonAdapter, NodeAdapter, StaticAdapter):
+def detect_framework(repo_path: Path, build_config: Optional[Dict[str, Any]] = None) -> str:
+    if NextJSAdapter.detect(repo_path, build_config):
+        return NextJSAdapter.name
+    for adapter_cls in (GoAdapter, PythonAdapter, NodeAdapter, StaticAdapter):
         if adapter_cls.detect(repo_path):
             return adapter_cls.name
     raise ValueError("Could not detect a supported framework in the Git repository")

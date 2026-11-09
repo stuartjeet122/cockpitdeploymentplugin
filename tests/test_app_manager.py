@@ -72,6 +72,18 @@ class AppManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Could not detect"):
                 detect_framework(Path(tmp))
 
+    def test_detects_nextjs_inside_a_subdirectory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            project = repo / "apps" / "web"
+            project.mkdir(parents=True)
+            (project / "package.json").write_text(
+                '{"dependencies":{"next":"^15"}}',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(detect_framework(repo), "nextjs")
+
     def test_add_application_sanitizes_generated_id_and_assigns_supported_port(self):
         result = self.add_app("Example Site!")
         self.assertEqual(result["app"]["id"], "example-site")
@@ -82,6 +94,17 @@ class AppManagerTests(unittest.TestCase):
     def test_add_application_accepts_explicit_available_port(self):
         result = self.add_app("Fixed Port", slug="fixed-port", port=8123)
         self.assertEqual(result["app"]["port"], 8123)
+
+    def test_build_config_rejects_unsafe_application_directory(self):
+        for app_directory in ("../outside", "/absolute/path", "apps//web", "apps/./web", "apps\\web"):
+            with self.subTest(app_directory=app_directory):
+                with self.assertRaisesRegex(ValueError, "app_directory"):
+                    manager.validate_app_payload(
+                        self.add_payload(
+                            framework="nextjs",
+                            build_config={"app_directory": app_directory},
+                        )
+                    )
 
     def test_edit_application_updates_supported_fields(self):
         app = self.add_app("Demo App")["app"]
@@ -385,6 +408,26 @@ class AppManagerTests(unittest.TestCase):
         self.assertIn("[stdout] build output", live_log)
         self.assertIn("[stderr] build warning", live_log)
 
+    def test_run_command_redacts_environment_values_from_live_and_captured_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "deployment.log"
+            result = manager.run_command(
+                [
+                    manager.sys.executable,
+                    "-c",
+                    "import sys,time; sys.stdout.write('private-'); sys.stdout.flush(); time.sleep(.05); print('token')",
+                ],
+                timeout=10,
+                live_log_path=log_path,
+                redact_values=["private-token"],
+            )
+            live_log = log_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("private-token", result.stdout)
+        self.assertNotIn("private-token", live_log)
+        self.assertIn("[REDACTED]", result.stdout)
+        self.assertIn("[REDACTED]", live_log)
+
     def test_live_command_timeout_keeps_captured_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(RuntimeError) as raised:
@@ -599,7 +642,15 @@ class AppManagerTests(unittest.TestCase):
 
 
 class NextJSDependencyInstallationTests(unittest.TestCase):
-    def build_project(self, lockfiles, runner):
+    def build_project(
+        self,
+        lockfiles,
+        runner,
+        package_subdirectory=None,
+        root_package=None,
+        app_build_config=None,
+        lockfile_subdirectory=None,
+    ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -607,28 +658,32 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         release = root / "release"
         repo.mkdir()
         release.mkdir()
-        (repo / "package.json").write_text(
-            json.dumps({
+        package_dir = repo / package_subdirectory if package_subdirectory else repo
+        package_dir.mkdir(parents=True, exist_ok=True)
+        package_data = {
                 "dependencies": {"next": "^15.0.0", "react": "^19.0.0"},
                 "devDependencies": {"typescript": "^5.0.0"},
                 "scripts": {"build": "next build"},
-            }),
-            encoding="utf-8",
-        )
+            }
+        (package_dir / "package.json").write_text(json.dumps(package_data), encoding="utf-8")
+        if root_package is not None:
+            (repo / "package.json").write_text(json.dumps(root_package), encoding="utf-8")
+        lockfile_dir = repo / lockfile_subdirectory if lockfile_subdirectory else package_dir
+        lockfile_dir.mkdir(parents=True, exist_ok=True)
         for name, contents in lockfiles.items():
-            path = repo / name
+            path = lockfile_dir / name
             if isinstance(contents, bytes):
                 path.write_bytes(contents)
             else:
                 path.write_text(contents, encoding="utf-8")
         result = NextJSAdapter().build(
-            {"port": 8123},
+            {"port": 8123, "build_config": app_build_config or {}},
             repo,
             release,
             runner=runner,
             timeout=17,
         )
-        return repo, release, result
+        return repo, release, result, package_dir.relative_to(repo)
 
     def successful_runner(self):
         return Mock(side_effect=[
@@ -639,7 +694,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
     def test_npm_lockfile_uses_ci_build_and_production_prune(self):
         package_lock = json.dumps({"lockfileVersion": 3, "packages": {}})
         runner = self.successful_runner()
-        repo, release, result = self.build_project({"package-lock.json": package_lock}, runner)
+        repo, release, result, _ = self.build_project({"package-lock.json": package_lock}, runner)
 
         calls = [call.args[0] for call in runner.call_args_list]
         self.assertEqual(calls, [
@@ -666,7 +721,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
 
     def test_npm_without_lockfile_uses_install_only_in_release_copy(self):
         runner = self.successful_runner()
-        repo, release, _ = self.build_project({}, runner)
+        repo, release, _, _ = self.build_project({}, runner)
 
         self.assertEqual(
             runner.call_args_list[0].args[0],
@@ -674,6 +729,127 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         )
         self.assertFalse((repo / "package-lock.json").exists())
         self.assertTrue((release / "app" / "package.json").is_file())
+
+    def test_nextjs_subdirectory_runs_commands_from_its_package_directory(self):
+        lockfile = json.dumps({"lockfileVersion": 3, "packages": {}})
+        runner = self.successful_runner()
+        repo, release, result, relative_dir = self.build_project(
+            {"package-lock.json": lockfile},
+            runner,
+            package_subdirectory="frontend",
+        )
+
+        expected_cwd = release / "app" / relative_dir
+        self.assertEqual(result["working_directory"], str(expected_cwd))
+        self.assertTrue(all(call.args[1] == expected_cwd for call in runner.call_args_list))
+        self.assertEqual(
+            [call.args[0] for call in runner.call_args_list],
+            [
+                ["npm", "ci", "--include=dev", "--no-fund", "--no-audit"],
+                ["npm", "run", "build"],
+                ["npm", "prune", "--omit=dev", "--no-fund", "--no-audit"],
+            ],
+        )
+        self.assertFalse((repo / "frontend" / "node_modules").exists())
+
+    def test_explicit_application_directory_is_used_by_the_build_adapter(self):
+        runner = self.successful_runner()
+        _, release, result, relative_dir = self.build_project(
+            {},
+            runner,
+            package_subdirectory="frontend",
+            app_build_config={"app_directory": "frontend"},
+        )
+
+        expected_cwd = release / "app" / relative_dir
+        self.assertEqual(result["working_directory"], str(expected_cwd))
+        self.assertTrue(all(call.args[1] == expected_cwd for call in runner.call_args_list))
+
+    def test_nextjs_npm_workspace_uses_root_lockfile_and_package_working_directory(self):
+        package_lock = json.dumps({"lockfileVersion": 3, "packages": {}})
+        runner = self.successful_runner()
+        repo, release, result, relative_dir = self.build_project(
+            {"package-lock.json": package_lock},
+            runner,
+            package_subdirectory="apps/web",
+            root_package={
+                "private": True,
+                "workspaces": ["apps/*"],
+                "dependencies": {"next": "^15.0.0"},
+            },
+            lockfile_subdirectory=".",
+        )
+
+        app_dir = release / "app" / relative_dir
+        workspace_root = release / "app"
+        self.assertEqual(result["working_directory"], str(app_dir))
+        self.assertEqual(
+            [call.args[0] for call in runner.call_args_list],
+            [
+                ["npm", "--prefix", str(workspace_root), "ci", "--include=dev", "--no-fund", "--no-audit"],
+                ["npm", "run", "build"],
+                ["npm", "--prefix", str(workspace_root), "prune", "--omit=dev", "--no-fund", "--no-audit"],
+            ],
+        )
+        self.assertTrue(all(call.args[1] == app_dir for call in runner.call_args_list))
+        self.assertTrue((repo / "package-lock.json").is_file())
+        self.assertEqual((repo / "package-lock.json").read_text(encoding="utf-8"), package_lock)
+        self.assertFalse((repo / "node_modules").exists())
+
+    def test_explicit_application_directory_resolves_multiple_next_apps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            for name in ("apps/admin", "apps/site"):
+                package_dir = repo / name
+                package_dir.mkdir(parents=True)
+                (package_dir / "package.json").write_text(
+                    '{"dependencies":{"next":"^15"}}',
+                    encoding="utf-8",
+                )
+            config = {"app_directory": "apps/site"}
+
+            self.assertEqual(detect_framework(repo, config), "nextjs")
+            with self.assertRaisesRegex(ValueError, "Multiple Next.js applications"):
+                detect_framework(repo)
+
+    def test_invalid_npm_lockfile_is_rejected_before_install(self):
+        runner = self.successful_runner()
+        with self.assertRaisesRegex(ValueError, "lockfileVersion.*greater than or equal to 1"):
+            self.build_project({"package-lock.json": '{"lockfileVersion":0,"packages":{}}'}, runner)
+        runner.assert_not_called()
+
+    def test_incorrect_explicit_working_directory_is_reported_before_install(self):
+        runner = self.successful_runner()
+        with self.assertRaisesRegex(ValueError, "application directory does not exist"):
+            self.build_project(
+                {},
+                runner,
+                app_build_config={"app_directory": "apps/missing"},
+            )
+        runner.assert_not_called()
+
+    def test_missing_lock_install_failure_reports_command_and_does_not_claim_inconsistency(self):
+        stdout = "npm install output"
+        stderr = "npm error code ENOENT"
+        runner = Mock(return_value=subprocess.CompletedProcess(
+            args=["npm", "install"],
+            returncode=127,
+            stdout=stdout,
+            stderr=stderr,
+        ))
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.build_project({}, runner, package_subdirectory="web")
+
+        message = str(raised.exception)
+        self.assertIn("Application working directory:", message)
+        self.assertIn("Package manager: npm", message)
+        self.assertIn("Lockfile: none", message)
+        self.assertIn("Command: npm install --include=dev --no-fund --no-audit", message)
+        self.assertIn("Exit code: 127", message)
+        self.assertIn(stdout, message)
+        self.assertIn(stderr, message)
+        self.assertNotIn("inconsistent", message.lower())
 
     def test_inconsistent_npm_lockfile_reports_complete_output_without_fallback(self):
         package_lock = json.dumps({"lockfileVersion": 3, "packages": {}})
@@ -742,7 +918,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         for lockfiles, install, build, production, start in cases:
             with self.subTest(lockfile=next(iter(lockfiles))):
                 runner = self.successful_runner()
-                repo, _, result = self.build_project(lockfiles, runner)
+                repo, _, result, _ = self.build_project(lockfiles, runner)
                 self.assertEqual(
                     [call.args[0] for call in runner.call_args_list],
                     [install, build, production],
@@ -933,6 +1109,20 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         service = manager._render_service(app, ["/opt/webapps/next-demo/current/app/next"], config)
 
         self.assertIn('Environment="NODE_ENV=production"', service)
+
+    def test_service_can_use_nested_nextjs_working_directory(self):
+        config = manager._default_config()
+        app = {"id": "demo", "service_user": "app-demo", "port": 8123, "framework": "nextjs"}
+        nested_directory = manager._app_paths("demo", config)["current"] / "app" / "frontend"
+
+        service = manager._render_service(
+            app,
+            ["npm", "exec", "--", "next", "start"],
+            config,
+            nested_directory,
+        )
+
+        self.assertIn(f"WorkingDirectory={nested_directory}", service)
 
     def test_release_sealing_removes_app_write_access(self):
         with tempfile.TemporaryDirectory() as tmp:
