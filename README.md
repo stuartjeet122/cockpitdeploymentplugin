@@ -10,7 +10,7 @@ Review `config/defaults.json`, then install from the project directory:
 sudo bash ./scripts/install.sh
 ```
 
-The installer requires Ubuntu, root privileges, Python 3.9 or newer, systemd, and Cockpit 318 or newer. It checks backend imports both before and after installation. It installs the self-contained stylesheet and other Cockpit assets under `/usr/share/cockpit/app-manager`, the backend and adapter module as exact files under the shared `/usr/libexec/cockpit` directory, and state under `/var/lib/cockpit/app-manager`. It does not recursively change ownership of shared Cockpit directories or `/opt/webapps`, and it preserves existing registry/configuration data on repeat installation.
+The installer requires Ubuntu, root privileges, Python 3.9 or newer, systemd, and Cockpit 318 or newer. It checks backend imports both before and after installation. It installs the self-contained stylesheet and other Cockpit assets under `/usr/share/cockpit/app-manager`, the backend and adapter module under the dedicated `/usr/libexec/cockpit/app-manager` directory, and state under `/var/lib/cockpit/app-manager`. It does not recursively change ownership of shared Cockpit directories or `/opt/webapps`, and it preserves existing registry/configuration data on repeat installation.
 
 The UI requests Cockpit's required superuser mode when launching the backend. The user must be authorized for Cockpit privilege escalation by the host's existing polkit/Cockpit policy; the installer does not grant extra users system-wide privileges. Registry and runtime configuration files are mode `0600`; state/source parent directories are not listable by application accounts.
 

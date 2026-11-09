@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PLUGIN_DEST="${APP_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/app-manager}"
-BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit}"
+BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"
 CONFIG_DEST="${APP_MANAGER_CONFIG_DEST:-/etc/cockpit/app-manager}"
 STATE_ROOT="${APP_MANAGER_STATE_ROOT:-/var/lib/cockpit/app-manager}"
 SOURCE_ROOT="${APP_MANAGER_SOURCE_ROOT:-${STATE_ROOT}/sources}"
@@ -353,6 +353,11 @@ remove_default_plugin_files() {
   remove_owned_file "${BACKEND_DEST}/adapters.py" "class NextJSAdapter"
 
   remove_empty_directory "${CONFIG_DEST}/templates"
+  if [[ "$BACKEND_DEST" == "/usr/libexec/cockpit" ]]; then
+    log "Preserving shared Cockpit backend directory: $BACKEND_DEST"
+  else
+    remove_empty_directory "$BACKEND_DEST"
+  fi
   remove_empty_directory "$PLUGIN_DEST"
   remove_empty_directory "$CONFIG_DEST"
 }

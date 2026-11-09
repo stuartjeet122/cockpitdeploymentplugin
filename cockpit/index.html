@@ -97,7 +97,7 @@
 
     <script>
       async function callBackend(command, args = []) {
-        const result = await cockpit.spawn(["/usr/libexec/cockpit/app-manager", command, ...args], { superuser: "require" });
+        const result = await cockpit.spawn(["/usr/libexec/cockpit/app-manager/app-manager", command, ...args], { superuser: "require" });
         return JSON.parse(result);
       }
 

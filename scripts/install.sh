@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN_DEST="${APP_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/app-manager}"
-BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit}"
+BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"
 CONFIG_DEST="${APP_MANAGER_CONFIG_DEST:-/etc/cockpit/app-manager}"
 STATE_ROOT="${APP_MANAGER_STATE_ROOT:-/var/lib/cockpit/app-manager}"
 SOURCE_ROOT="${APP_MANAGER_SOURCE_ROOT:-${STATE_ROOT}/sources}"
@@ -79,8 +79,8 @@ preflight() {
 
 install_files() {
   install -d -o root -g root -m 0755 "$PLUGIN_DEST"
-  # /usr/libexec/cockpit is shared with Cockpit; create it if absent but never
-  # change its ownership or permissions.
+  # /usr/libexec/cockpit is shared with Cockpit; create only this plugin's
+  # dedicated subdirectory and never change shared directory ownership.
   mkdir -p -- "$BACKEND_DEST"
   install -d -o root -g root -m 0755 "$CONFIG_DEST" "$CONFIG_DEST/templates"
 

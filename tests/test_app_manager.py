@@ -611,10 +611,43 @@ class InfrastructureConfigurationTests(unittest.TestCase):
     def test_installer_uses_exact_file_ownership_and_checks_host_and_installed_imports(self):
         project = Path(__file__).resolve().parent.parent
         installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
+        uninstaller = (project / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
         cockpit_page = (project / "cockpit" / "index.html").read_text(encoding="utf-8")
         self.assertNotRegex(installer, r"\bchown\s+-R\b")
         self.assertNotIn('chown root:root "$BACKEND_DEST"', installer)
         self.assertNotIn('chown root:root "$PRODUCTION_ROOT"', installer)
+        self.assertIn('BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"', installer)
+        self.assertIn('mkdir -p -- "$BACKEND_DEST"', installer)
+        self.assertIn(
+            'install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"',
+            installer,
+        )
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/backend/adapters.py" "$BACKEND_DEST/adapters.py"',
+            installer,
+        )
+        self.assertIn(
+            'BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"',
+            uninstaller,
+        )
+        self.assertIn(
+            'cockpit.spawn(["/usr/libexec/cockpit/app-manager/app-manager"',
+            cockpit_page,
+        )
+        self.assertNotIn(
+            'cockpit.spawn(["/usr/libexec/cockpit/app-manager",',
+            cockpit_page,
+        )
+        self.assertIn(
+            'remove_owned_file "${BACKEND_DEST}/app-manager" \'APP_NAME = "app-manager"\'',
+            uninstaller,
+        )
+        self.assertIn(
+            'remove_owned_file "${BACKEND_DEST}/adapters.py" "class NextJSAdapter"',
+            uninstaller,
+        )
+        self.assertIn('remove_empty_directory "$BACKEND_DEST"', uninstaller)
+        self.assertIn('if [[ "$BACKEND_DEST" == "/usr/libexec/cockpit" ]]', uninstaller)
         self.assertIn("dpkg --compare-versions", installer)
         self.assertIn("Python 3.9 or newer is required", installer)
         self.assertIn('python3 "$BACKEND_DEST/app-manager" --help', installer)
@@ -711,7 +744,7 @@ class UninstallScriptTests(unittest.TestCase):
         userdel_log = temp_root / "userdel.log"
         env.update({
             "APP_MANAGER_PLUGIN_DEST": str(temp_root / "usr" / "share" / "cockpit" / "app-manager"),
-            "APP_MANAGER_BACKEND_DEST": str(temp_root / "usr" / "libexec" / "cockpit"),
+            "APP_MANAGER_BACKEND_DEST": str(temp_root / "usr" / "libexec" / "cockpit" / "app-manager"),
             "APP_MANAGER_CONFIG_DEST": str(temp_root / "etc" / "cockpit" / "app-manager"),
             "APP_MANAGER_STATE_ROOT": str(temp_root / "var" / "lib" / "cockpit" / "app-manager"),
             "APP_MANAGER_PRODUCTION_ROOT": str(temp_root / "opt" / "webapps"),
@@ -734,7 +767,8 @@ class UninstallScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp)
             plugin = temp_root / "usr" / "share" / "cockpit" / "app-manager"
-            backend = temp_root / "usr" / "libexec" / "cockpit"
+            backend = temp_root / "usr" / "libexec" / "cockpit" / "app-manager"
+            shared_backend = backend.parent
             state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
             production_root = temp_root / "opt" / "webapps"
             plugin.mkdir(parents=True)
@@ -759,6 +793,8 @@ class UninstallScriptTests(unittest.TestCase):
             result = self._run_uninstall(temp_root)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertFalse(plugin.exists())
+            self.assertFalse(backend.exists())
+            self.assertTrue(shared_backend.exists())
             self.assertFalse((backend / "app-manager").exists())
             self.assertFalse((backend / "adapters.py").exists())
             self.assertFalse(config.exists())
@@ -769,7 +805,8 @@ class UninstallScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp)
             plugin = temp_root / "usr" / "share" / "cockpit" / "app-manager"
-            backend = temp_root / "usr" / "libexec" / "cockpit"
+            backend = temp_root / "usr" / "libexec" / "cockpit" / "app-manager"
+            shared_backend = backend.parent
             plugin.mkdir(parents=True)
             backend.mkdir(parents=True)
             (plugin / "index.html").write_text("<title>App Manager</title>", encoding="utf-8")
@@ -780,15 +817,19 @@ class UninstallScriptTests(unittest.TestCase):
                 encoding="utf-8",
             )
             unrelated_backend_file = backend / "other-tool"
+            unrelated_shared_file = shared_backend / "other-tool"
             unrelated_backend_file.write_text("keep", encoding="utf-8")
+            unrelated_shared_file.write_text("keep", encoding="utf-8")
 
             result = self._run_uninstall(temp_root)
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue(unrelated_plugin_file.exists())
             self.assertTrue(unrelated_backend_file.exists())
+            self.assertTrue(unrelated_shared_file.exists())
             self.assertTrue(plugin.exists())
             self.assertTrue(backend.exists())
+            self.assertTrue(shared_backend.exists())
             self.assertFalse((plugin / "index.html").exists())
             self.assertFalse((backend / "app-manager").exists())
 
@@ -813,7 +854,8 @@ class UninstallScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp)
             plugin = temp_root / "usr" / "share" / "cockpit" / "app-manager"
-            backend = temp_root / "usr" / "libexec" / "cockpit"
+            backend = temp_root / "usr" / "libexec" / "cockpit" / "app-manager"
+            shared_backend = backend.parent
             config = temp_root / "etc" / "cockpit" / "app-manager"
             templates = config / "templates"
             plugin.mkdir(parents=True)
@@ -828,6 +870,10 @@ class UninstallScriptTests(unittest.TestCase):
             unknown_plugin_file.write_text("custom", encoding="utf-8")
             (backend / "app-manager").write_text(
                 '#!/usr/bin/env python3\nAPP_NAME = "app-manager"\n',
+                encoding="utf-8",
+            )
+            (backend / "adapters.py").write_text(
+                "class NextJSAdapter:\n    pass\n",
                 encoding="utf-8",
             )
             (templates / "nginx.conf.tpl").write_text(
@@ -847,6 +893,8 @@ class UninstallScriptTests(unittest.TestCase):
                 f"DRY-RUN: remove {plugin / 'index.html'}",
                 f"DRY-RUN: remove {plugin / 'app-manager.css'}",
                 f"DRY-RUN: remove {backend / 'app-manager'}",
+                f"DRY-RUN: remove {backend / 'adapters.py'}",
+                f"DRY-RUN: rmdir -- {backend}",
                 f"DRY-RUN: remove {templates / 'nginx.conf.tpl'}",
                 f"DRY-RUN: rmdir -- {templates}",
             ):
@@ -854,6 +902,7 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertNotIn(str(unknown_plugin_file), result.stdout)
             self.assertTrue((plugin / "index.html").exists())
             self.assertTrue((backend / "app-manager").exists())
+            self.assertTrue(shared_backend.exists())
             self.assertTrue((templates / "nginx.conf.tpl").exists())
             self.assertTrue(unknown_plugin_file.exists())
 
