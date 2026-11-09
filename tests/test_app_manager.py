@@ -11,7 +11,7 @@ import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import call as mock_call, patch
+from unittest.mock import Mock, call as mock_call, patch
 
 import backend.app_manager as manager
 from backend.adapters import NextJSAdapter, detect_framework
@@ -50,26 +50,21 @@ class AppManagerTests(unittest.TestCase):
             return manager.add_app(self.add_payload(name, **overrides))
 
     def test_detect_frameworks(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            (repo / "package.json").write_text('{"dependencies":{"next":"^15"}}', encoding="utf-8")
-            self.assertEqual(detect_framework(repo), "nextjs")
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            (repo / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
-            self.assertEqual(detect_framework(repo), "go")
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            (repo / "requirements.txt").write_text("flask\n", encoding="utf-8")
-            self.assertEqual(detect_framework(repo), "python")
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            (repo / "package.json").write_text('{"scripts":{"start":"node server.js"}}', encoding="utf-8")
-            self.assertEqual(detect_framework(repo), "node")
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            (repo / "index.html").write_text("<html></html>", encoding="utf-8")
-            self.assertEqual(detect_framework(repo), "static")
+        cases = (
+            ("nextjs-package", {"package.json": '{"dependencies":{"next":"^15"}}'}, "nextjs"),
+            ("nextjs-config", {"next.config.mjs": "export default {}"}, "nextjs"),
+            ("go", {"go.mod": "module example.com/demo\n"}, "go"),
+            ("python-requirements", {"requirements.txt": "flask\n"}, "python"),
+            ("python-pyproject", {"pyproject.toml": "[project]\nname = 'demo'\n"}, "python"),
+            ("node", {"package.json": '{"scripts":{"start":"node server.js"}}'}, "node"),
+            ("static", {"index.html": "<html></html>"}, "static"),
+        )
+        for name, files, expected in cases:
+            with self.subTest(framework=name), tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                for filename, contents in files.items():
+                    (repo / filename).write_text(contents, encoding="utf-8")
+                self.assertEqual(detect_framework(repo), expected)
 
     def test_unsupported_framework_detection_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,10 +149,37 @@ class AppManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid JSON"):
             manager.get_registry()
 
+    def test_registry_structure_corruption_is_reported_instead_of_reset(self):
+        registry_path = Path(manager.DEFAULT_REGISTRY_PATH)
+        registry_path.parent.mkdir(parents=True)
+        for payload in ([], {}, {"apps": None}, {"apps": [None]}):
+            with self.subTest(payload=payload):
+                registry_path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    manager.get_registry()
+
     def test_registry_write_is_atomic_and_creates_private_json(self):
         manager.save_registry({"apps": []})
         registry_path = Path(manager.DEFAULT_REGISTRY_PATH)
         self.assertEqual(json.loads(registry_path.read_text(encoding="utf-8")), {"apps": []})
+        self.assertFalse(list(registry_path.parent.glob(".apps.json.*.tmp")))
+
+    @unittest.skipIf(os.name == "nt", "POSIX file modes are not available")
+    def test_registry_file_permissions_are_private(self):
+        manager.save_registry({"apps": []})
+        registry_path = Path(manager.DEFAULT_REGISTRY_PATH)
+        self.assertEqual(registry_path.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_atomic_registry_replacement_preserves_existing_json(self):
+        registry_path = Path(manager.DEFAULT_REGISTRY_PATH)
+        manager.save_registry({"apps": []})
+        original_contents = registry_path.read_bytes()
+
+        with patch.object(manager.os, "replace", side_effect=OSError("simulated replacement failure")):
+            with self.assertRaisesRegex(OSError, "simulated replacement failure"):
+                manager.save_registry({"apps": [{"id": "demo"}]})
+
+        self.assertEqual(registry_path.read_bytes(), original_contents)
         self.assertFalse(list(registry_path.parent.glob(".apps.json.*.tmp")))
 
     def test_concurrent_adds_reserve_unique_ports(self):
@@ -288,14 +310,11 @@ class AppManagerTests(unittest.TestCase):
         class Response:
             status = 200
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
         app = {"port": 8100, "health_check_url": "/health"}
-        with patch("backend.app_manager.urllib.request.OpenerDirector.open", return_value=Response()):
+        with patch(
+            "backend.app_manager.urllib.request.OpenerDirector.open",
+            return_value=contextlib.nullcontext(Response()),
+        ):
             self.assertTrue(manager.check_app_health(app))
         with patch(
             "backend.app_manager.urllib.request.OpenerDirector.open",
@@ -322,11 +341,11 @@ class AppManagerTests(unittest.TestCase):
             (repo / "package.json").write_text('{"dependencies":{"next":"^15"}}', encoding="utf-8")
             failed = subprocess.CompletedProcess(args=["npm"], returncode=2, stdout="", stderr="compile failed")
 
-            def runner(command, cwd, timeout):
-                return failed
+            runner = Mock(return_value=failed)
 
             with self.assertRaisesRegex(RuntimeError, "compile failed"):
                 NextJSAdapter().build({"port": 8100}, repo, release, runner=runner, timeout=1)
+            runner.assert_called_once()
 
 
 class InfrastructureConfigurationTests(unittest.TestCase):
@@ -660,7 +679,6 @@ class UninstallScriptTests(unittest.TestCase):
         for executable in (systemctl, getent, userdel):
             executable.chmod(0o755)
         env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
-        state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
         systemctl_log = temp_root / "systemctl.log"
         userdel_log = temp_root / "userdel.log"
         env.update({
