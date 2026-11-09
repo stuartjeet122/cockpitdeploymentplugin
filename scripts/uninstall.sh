@@ -8,11 +8,14 @@ STATE_ROOT="${APP_MANAGER_STATE_ROOT:-/var/lib/cockpit/app-manager}"
 PRODUCTION_ROOT="${APP_MANAGER_PRODUCTION_ROOT:-/opt/webapps}"
 LOG_ROOT="${APP_MANAGER_LOG_ROOT:-/var/log/cockpit-app-manager}"
 SYSTEMD_DIR="${APP_MANAGER_SYSTEMD_DIR:-/etc/systemd/system}"
+NGINX_SNIPPET_DIR="${APP_MANAGER_NGINX_SNIPPET_DIR:-/etc/nginx/snippets/cockpit-app-manager}"
+NGINX_CONFIG_ROOT="${APP_MANAGER_NGINX_CONFIG_ROOT:-/etc/nginx}"
 
 DRY_RUN=0
 REMOVE_MANAGED_DATA=0
 AUTO_CONFIRM=0
 UNITS_CHANGED=0
+APP_CLEANUP_BLOCKED=0
 
 print_usage() {
   cat <<'EOF'
@@ -64,13 +67,12 @@ safe_remove() {
   if has_symlink_ancestor "$target"; then
     fail "Refusing to remove a path beneath a symlink: $target"
   fi
+  [[ -e "$target" || -L "$target" ]] || return 0
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "DRY-RUN: remove $target"
     return 0
   fi
-  if [[ -e "$target" || -L "$target" ]]; then
-    rm -rf -- "$target"
-  fi
+  rm -rf -- "$target"
 }
 
 parse_registry_records() {
@@ -144,9 +146,11 @@ remove_managed_unit() {
   fi
 
   if [[ -L "$service_path" || ! -f "$service_path" ]] ||
+    ! grep -Fqx "# Managed by Cockpit App Manager" "$service_path" ||
     ! grep -Fqx "Description=Cockpit App Manager - ${app_id}" "$service_path" ||
     ! grep -Fqx "User=app-${app_id}" "$service_path"; then
     log "Leaving unverified systemd unit untouched: $service_name" >&2
+    APP_CLEANUP_BLOCKED=1
     return 0
   fi
 
@@ -164,15 +168,86 @@ remove_managed_unit() {
   UNITS_CHANGED=1
 }
 
+remove_managed_user() {
+  local username="app-${1}"
+  local passwd_entry group_entry uid gid group_gid account_name password account_tail expected_home_suffix
+  command -v getent >/dev/null 2>&1 ||
+    fail "getent is required to verify managed user $username."
+  passwd_entry="$(getent passwd "$username" || true)"
+  [[ -n "$passwd_entry" ]] || return 0
+  IFS=: read -r account_name password uid gid _ <<<"$passwd_entry"
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -gt 0 ]] ||
+    fail "Refusing to remove $username: account UID is invalid or privileged."
+  account_tail="${passwd_entry#"$username:"}"
+  expected_home_suffix=":${STATE_ROOT}/homes/${1}:/usr/sbin/nologin"
+  [[ "$account_name" == "$username" && "$account_tail" == *"$expected_home_suffix" ]] ||
+    fail "Refusing to remove $username: home or shell does not match App Manager's managed account."
+  group_entry="$(getent group "$username" || true)"
+  [[ -n "$group_entry" ]] ||
+    fail "Refusing to remove $username: its private group cannot be verified."
+  IFS=: read -r _ _ group_gid _ <<<"$group_entry"
+  [[ "$group_gid" == "$gid" ]] ||
+    fail "Refusing to remove $username: primary group is not its matching private group."
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: userdel -- $username"
+    return 0
+  fi
+  command -v userdel >/dev/null 2>&1 ||
+    fail "userdel is required to remove verified App Manager account $username."
+  userdel -- "$username" ||
+    fail "Could not remove verified App Manager account $username."
+}
+
+remove_managed_snippet() {
+  local app_id="$1"
+  local snippet="${NGINX_SNIPPET_DIR}/${app_id}.conf"
+  [[ -e "$snippet" || -L "$snippet" ]] || return 0
+  if [[ -L "$snippet" || ! -f "$snippet" ]] ||
+    ! grep -Fqx "# Managed by Cockpit App Manager: ${app_id}" "$snippet"; then
+    log "Leaving unverified Nginx snippet untouched: $snippet" >&2
+    APP_CLEANUP_BLOCKED=1
+    return 0
+  fi
+  if has_symlink_ancestor "$snippet"; then
+    fail "Refusing to modify an Nginx snippet beneath a symlink: $snippet"
+  fi
+
+  if [[ -d "$NGINX_CONFIG_ROOT" ]] &&
+    { grep -R -F -q -- "$snippet" "$NGINX_CONFIG_ROOT" ||
+      grep -R -F -q -- "$NGINX_SNIPPET_DIR" "$NGINX_CONFIG_ROOT" ||
+      grep -R -F -q -- "$(basename "$NGINX_SNIPPET_DIR")" "$NGINX_CONFIG_ROOT" ||
+      grep -R -F -q -- "${app_id}.conf" "$NGINX_CONFIG_ROOT"; }; then
+    log "Preserving active Nginx snippet because an existing Nginx config includes it: $snippet" >&2
+    APP_CLEANUP_BLOCKED=1
+    return 0
+  fi
+  safe_remove "$snippet"
+}
+
 remove_managed_app_data() {
   local registry_records
   registry_records="$(parse_registry_records)" || fail "The registry could not be validated; no managed app data was removed."
+  local apps_preserved=0
   local app_id source_dir app_dir app_log_dir
   while IFS=$'\t' read -r app_id source_dir app_dir app_log_dir; do
     [[ -n "$app_id" ]] || continue
     is_valid_app_id "$app_id" || fail "Invalid application ID in registry."
 
+    APP_CLEANUP_BLOCKED=0
+    remove_managed_snippet "$app_id"
+    if [[ "$APP_CLEANUP_BLOCKED" -eq 1 ]]; then
+      log "Preserving application, account, and service because its Nginx snippet is active or unverified: $app_id" >&2
+      apps_preserved=1
+      continue
+    fi
     remove_managed_unit "$app_id"
+    if [[ "$APP_CLEANUP_BLOCKED" -eq 1 ]]; then
+      log "Preserving application data and account because its systemd unit is not verifiably managed: $app_id" >&2
+      apps_preserved=1
+      continue
+    fi
+    remove_managed_user "$app_id"
     safe_remove "$source_dir"
     safe_remove "${STATE_ROOT}/homes/${app_id}"
     safe_remove "${STATE_ROOT}/locks/${app_id}.lock"
@@ -180,13 +255,21 @@ remove_managed_app_data() {
     safe_remove "$app_dir"
   done <<<"$registry_records"
 
-  safe_remove "${STATE_ROOT}/apps.json"
-  safe_remove "${STATE_ROOT}/apps.json.lock"
-  safe_remove "${STATE_ROOT}/config.json"
-  safe_remove "${STATE_ROOT}/config.json.lock"
+  if [[ "$apps_preserved" -eq 1 ]]; then
+    log "Preserving App Manager registry and global state because one or more applications were retained."
+  else
+    safe_remove "${STATE_ROOT}/apps.json"
+    safe_remove "${STATE_ROOT}/apps.json.lock"
+    safe_remove "${STATE_ROOT}/config.json"
+    safe_remove "${STATE_ROOT}/config.json.lock"
+  fi
 
-  if [[ "$UNITS_CHANGED" -eq 1 && "$DRY_RUN" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload || fail "Could not reload systemd after removing App Manager units."
+  if [[ "$UNITS_CHANGED" -eq 1 ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      log "DRY-RUN: systemctl daemon-reload"
+    elif command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload || fail "Could not reload systemd after removing App Manager units."
+    fi
   fi
 }
 

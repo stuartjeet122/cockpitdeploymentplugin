@@ -1103,7 +1103,6 @@ def _render_service(
     paths = _app_paths(app["id"], config)
     working_directory = paths["current"] / "app"
     writable_paths = (
-        paths["current"] / "app",
         paths["home"],
         paths["config"],
         paths["logs"],
@@ -1112,6 +1111,7 @@ def _render_service(
     exec_start = " ".join(_systemd_quote(part) for part in start_command)
     return (
         "[Unit]\n"
+        "# Managed by Cockpit App Manager\n"
         f"Description=Cockpit App Manager - {app['id']}\n"
         "After=network.target\n\n"
         "[Service]\n"
@@ -1122,6 +1122,7 @@ def _render_service(
         f"ExecStart={exec_start}\n"
         f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
         f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
+        f"Environment={_systemd_quote('APP_BASE_PATH=/' + app['id'])}\n"
         f"Environment={_systemd_quote('APP_CONFIG_DIR=' + str(paths['config']))}\n"
         f"Environment={_systemd_quote('HOME=' + str(paths['home']))}\n"
         "Restart=on-failure\n"
@@ -1148,20 +1149,73 @@ def _render_service(
     )
 
 
-def _render_nginx_config(app_id: str, port: int, template_path: Optional[Path] = None) -> str:
+def _render_nginx_config(
+    app_id: str,
+    port: int,
+    template_path: Optional[Path] = None,
+    framework: str = "nextjs",
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
     app_id = validate_app_id(app_id)
     if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
         raise ValueError("Nginx upstream port must be an available managed application port")
+    if framework not in FRAMEWORKS - {"auto"}:
+        raise ValueError("Nginx framework must be a detected, supported application framework")
     if template_path is None:
-        template_path = Path(get_config()["nginx_template"])
+        config = config or get_config()
+        template_path = Path(config["nginx_template"])
     try:
         template = template_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise RuntimeError(f"Could not read Nginx template {template_path}: {exc}") from exc
-    rendered = template.replace("{{ app_slug }}", app_id).replace("{{ app_port }}", str(port))
+    proxy_uri = "" if framework == "nextjs" else "/"
+    if framework == "static":
+        config = config or get_config()
+        app_root = _app_paths(app_id, config)["current"] / "app"
+        route_location = (
+            f"# Managed by Cockpit App Manager: {app_id}\n"
+            f"location ^~ /{app_id}/ {{\n"
+            f"    alias {_nginx_quote(str(app_root) + os.sep)};\n"
+            "    index index.html;\n"
+            f"    try_files $uri $uri/ /{app_id}/index.html;\n"
+            "}\n"
+        )
+    else:
+        proxy_redirect = (
+            "    proxy_redirect off;\n"
+            if framework == "nextjs"
+            else f"    proxy_redirect / /{app_id}/;\n"
+        )
+        route_location = (
+            f"# Managed by Cockpit App Manager: {app_id}\n"
+            f"location ^~ /{app_id}/ {{\n"
+            f"    proxy_pass http://127.0.0.1:{port}{proxy_uri};\n"
+            "    proxy_http_version 1.1;\n"
+            "    proxy_set_header Host $host;\n"
+            "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+            "    proxy_set_header X-Forwarded-Proto $scheme;\n"
+            "    proxy_set_header X-Real-IP $remote_addr;\n"
+            f"    proxy_set_header X-Forwarded-Prefix /{app_id};\n"
+            "    proxy_set_header Upgrade $http_upgrade;\n"
+            "    proxy_set_header Connection \"upgrade\";\n"
+            + proxy_redirect
+            + "}\n"
+        )
+    rendered = (
+        template.replace("{{ app_slug }}", app_id)
+        .replace("{{ app_port }}", str(port))
+        .replace("{{ app_proxy_uri }}", proxy_uri)
+        .replace("{{ app_route_location }}", route_location.rstrip())
+    )
     if "{{" in rendered or "}}" in rendered:
         raise ValueError("Nginx template contains an unresolved placeholder")
     return rendered
+
+
+def _nginx_quote(path: str) -> str:
+    if any(char in path for char in ('"', "\r", "\n", ";", "{", "}")):
+        raise ValueError("Path cannot be safely represented in an Nginx configuration")
+    return '"' + path.replace("\\", "\\\\") + '"'
 
 
 def _write_service(app: Dict[str, Any], release_dir: Path, start_command: Sequence[str], config: Dict[str, Any]) -> Path:

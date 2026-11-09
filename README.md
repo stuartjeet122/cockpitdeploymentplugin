@@ -26,16 +26,16 @@ sudo bash ./scripts/uninstall.sh
 
 Default behavior removes only App Manager-owned Cockpit plugin and backend files. It preserves application source repositories, production deployments under `/opt/webapps`, and the existing server infrastructure.
 
-For a full destructive removal of App Manager-managed application data, run the explicit cleanup path with confirmation:
+For full destructive removal, use the explicit cleanup path. It removes only registry-identified app data, verified dedicated `app-<id>` accounts, positively marked App Manager service units, and positively marked snippets that are not referenced by active Nginx configuration. Unverified or active snippets block cleanup of that app and its account/service; Nginx configuration is never edited:
 
 ```bash
 sudo bash ./scripts/uninstall.sh --remove-managed-data --yes
 ```
 
-To preview the actions without deleting anything:
+To preview the destructive cleanup plan without deleting anything:
 
 ```bash
-sudo bash ./scripts/uninstall.sh --dry-run
+sudo bash ./scripts/uninstall.sh --remove-managed-data --dry-run
 ```
 
 Never run the destructive uninstall path unless you intentionally want to remove App Manager-managed application state and deployed releases.
@@ -63,9 +63,9 @@ Project conventions and deployment requirements are documented in `AGENTS.md` an
 - Ports are allocated from 8100–8999. Port 8080 is excluded. Registration holds the registry lock while checking existing allocations and listening sockets and recording the new port.
 - Git remotes must use HTTPS or SSH. Updates reject local changes and branch changes, fetch the selected branch, and only merge with `--ff-only`.
 - Each app uses a dedicated system account named `app-<app-id>`. Git operations, dependency installation, and build commands run as that account, never as root. The generated systemd service also uses that account and binds framework defaults to loopback where the framework supports it.
-- Generated systemd services drop all capabilities and enable filesystem, device, kernel, namespace/personality, and privilege-escalation hardening. Writes are limited to that app's active release, private home, config, and log paths so normal runtime caches remain usable; other applications and host paths stay read-only. App ports are unprivileged, so `CAP_NET_BIND_SERVICE` is not granted.
+- Generated systemd services drop all capabilities and enable filesystem, device, kernel, namespace/personality, and privilege-escalation hardening. The deployed release is read-only at runtime; writes are limited to that app's private home, config, and log paths. App ports are unprivileged, so `CAP_NET_BIND_SERVICE` is not granted.
 - Source trees, releases, application configuration, and logs use app-specific paths. Deployment history and retained releases support rollback.
-- The backend does not edit an existing Nginx server configuration or Cloudflare Tunnel configuration. The Nginx location template is a separately installed snippet: it redirects `/app` to `/app/`, preserves the `/app/` prefix upstream for nested routes, API requests, Next.js `/_next` assets, and WebSocket upgrades, and never rewrites the host's root route. An application must support its configured URL base path; for Next.js set `basePath` to `/<app-id>` when building. Operators must integrate and validate the snippet in the intended Nginx `server` block themselves.
+- The backend does not edit an existing Nginx server configuration or Cloudflare Tunnel configuration. The generated Nginx location redirects `/app` to `/app/`. Next.js receives the full path prefix and must be built with `basePath: "/<app-id>"`. Go, Node.js, and Python proxy routes strip the prefix upstream and send `X-Forwarded-Prefix` plus `APP_BASE_PATH` so application routers and generated URLs can honor it. Static routes serve the release tree directly and fall back to `index.html` for nested pages. The proxy emits the WebSocket `Upgrade` header and a fixed `Connection: upgrade` header without requiring a global `map` or editing unrelated Nginx config; ordinary requests continue to be proxied (with upstream keep-alive disabled). Operators must integrate and validate snippets in the intended Nginx `server` block themselves.
 - Removing an app unregisters it and stops/removes its App Manager service, but intentionally retains source and release data.
 
 Applications must provide an appropriate start entry point. Framework adapters install/build dependencies and use a conventional start command; applications with nonstandard startup behavior can supply `build_config.start_command` as an array of executable arguments (not a shell string). The app must listen on the assigned `PORT` and on `127.0.0.1`. Health checks use the configured local path and require a 2xx response.

@@ -1,4 +1,5 @@
 [Unit]
+# Managed by Cockpit App Manager
 Description=Cockpit App Manager - {{ app_id }}
 After=network.target
 
@@ -10,6 +11,7 @@ WorkingDirectory={{ app_root }}/current/app
 Environment=NODE_ENV=production
 Environment=PORT={{ app_port }}
 Environment=HOST=127.0.0.1
+Environment=APP_BASE_PATH=/{{ app_id }}
 ExecStart={{ start_command }}
 Restart=on-failure
 RestartSec=5
@@ -29,7 +31,7 @@ RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 UMask=0027
-ReadWritePaths={{ app_root }}/current/app {{ app_home }} {{ app_config_dir }} {{ app_log_dir }}
+ReadWritePaths={{ app_home }} {{ app_config_dir }} {{ app_log_dir }}
 
 [Install]
 WantedBy=multi-user.target
