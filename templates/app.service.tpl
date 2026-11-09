@@ -8,6 +8,7 @@ Type=simple
 User={{ app_user }}
 Group={{ app_user }}
 WorkingDirectory={{ app_root }}/current/app
+EnvironmentFile=-{{ app_env_file }}
 Environment=NODE_ENV=production
 Environment=PORT={{ app_port }}
 Environment=HOST=127.0.0.1

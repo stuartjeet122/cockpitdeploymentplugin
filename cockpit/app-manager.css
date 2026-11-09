@@ -929,6 +929,45 @@
   overflow-wrap: anywhere;
 }
 
+.am-env-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.625rem;
+  margin-bottom: 1rem;
+}
+
+.am-env-label {
+  display: block;
+  margin-bottom: 0.4rem;
+  color: var(--am-text);
+  font-weight: 650;
+}
+
+.am-env-editor {
+  display: block;
+  width: 100%;
+  min-height: 16rem;
+  resize: vertical;
+  border: 1px solid var(--am-border);
+  border-radius: var(--am-radius-sm);
+  background: var(--am-surface);
+  color: var(--am-text);
+  padding: 0.875rem;
+  font: 0.85rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+  tab-size: 2;
+}
+
+.am-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+
 @media (max-width: 1100px) {
   .am-metrics {
     grid-template-columns: repeat(3, minmax(0, 1fr));

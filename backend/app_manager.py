@@ -10,6 +10,7 @@ import re
 import shutil
 import socket
 import subprocess
+import stat
 import sys
 import tempfile
 import threading
@@ -63,8 +64,10 @@ PORT_END = 8999
 RESERVED_PORTS = {8080}
 COMMAND_TIMEOUT_SECONDS = 30
 MAX_DEPLOYMENT_LOG_BYTES = 5 * 1024 * 1024
+MAX_ENV_FILE_BYTES = 64 * 1024
 APP_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FRAMEWORKS = {"auto", "nextjs", "go", "node", "python", "static"}
 
 
@@ -962,7 +965,9 @@ def _app_paths(app_id: str, config: Dict[str, Any]) -> Dict[str, Path]:
     source = source_root / app_id
     production = production_root / app_id
     log_root = _resolved_path(Path(config["log_root"]))
-    home_root = _resolved_path(Path(DEFAULT_STATE_ROOT) / "homes")
+    state_root = _resolved_path(Path(DEFAULT_STATE_ROOT))
+    home_root = state_root / "homes"
+    environment_root = state_root / "environment"
     paths = {
         "source": source,
         "production": production,
@@ -971,6 +976,7 @@ def _app_paths(app_id: str, config: Dict[str, Any]) -> Dict[str, Path]:
         "config": production / "config",
         "logs": log_root / app_id,
         "home": home_root / app_id,
+        "environment": environment_root / f"{app_id}.env",
     }
     if (
         not _path_is_within(source, source_root)
@@ -980,9 +986,184 @@ def _app_paths(app_id: str, config: Dict[str, Any]) -> Dict[str, Path]:
         or not _path_is_within(paths["config"], production)
         or not _path_is_within(paths["logs"], log_root)
         or not _path_is_within(paths["home"], home_root)
+        or not _path_is_within(paths["environment"], environment_root)
     ):
         raise ValueError("Application paths resolve outside their managed roots")
     return paths
+
+
+def _environment_file_path(
+    app: Dict[str, Any],
+    config: Dict[str, Any],
+    *,
+    create_directory: bool = False,
+) -> Path:
+    paths = _app_paths(app["id"], config)
+    state_root = Path(DEFAULT_STATE_ROOT)
+    environment_root = paths["environment"].parent
+    env_path = paths["environment"]
+    if state_root.is_symlink() or environment_root.is_symlink():
+        raise RuntimeError("Application environment directory must not be a symlink")
+    if create_directory:
+        username = ensure_app_user(app["id"])
+        environment_root.mkdir(parents=True, exist_ok=True, mode=0o711)
+        if environment_root.is_symlink():
+            raise RuntimeError("Application environment directory must not be a symlink")
+        if hasattr(os, "chown"):
+            os.chown(str(environment_root), 0, 0)
+        os.chmod(str(environment_root), 0o711)
+    if env_path.is_symlink() or (env_path.exists() and not env_path.is_file()):
+        raise RuntimeError("Application environment file must be a regular file")
+    return env_path
+
+
+def _parse_environment_data(contents: str) -> Tuple[str, Dict[str, str]]:
+    if not isinstance(contents, str):
+        raise ValueError("Environment file content must be text")
+    if "\0" in contents or len(contents.encode("utf-8")) > MAX_ENV_FILE_BYTES:
+        raise ValueError(f"Environment file must be smaller than {MAX_ENV_FILE_BYTES} bytes and contain no NUL bytes")
+    normalized_lines = []
+    values = {}
+    for line_number, raw_line in enumerate(contents.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            normalized_lines.append(raw_line)
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not match:
+            raise ValueError(f"Invalid environment assignment on line {line_number}")
+        key, raw_value = match.groups()
+        if key in values:
+            raise ValueError(f"Duplicate environment key {key!r} on line {line_number}")
+        if key in {
+            "HOME",
+            "PATH",
+            "PORT",
+            "HOST",
+            "NODE_ENV",
+            "APP_BASE_PATH",
+            "APP_CONFIG_DIR",
+        }:
+            raise ValueError(f"Environment key {key!r} is reserved by App Manager")
+        raw_value = raw_value.strip()
+        if raw_value.startswith(("'", '"')):
+            quote = raw_value[0]
+            value_chars = []
+            index = 1
+            while index < len(raw_value):
+                char = raw_value[index]
+                if quote == '"' and char == "\\" and index + 1 < len(raw_value):
+                    index += 1
+                    escaped = raw_value[index]
+                    if escaped in {'"', "\\", "$", "`"}:
+                        value_chars.append(escaped)
+                    else:
+                        value_chars.extend(("\\", escaped))
+                elif char == quote:
+                    suffix = raw_value[index + 1:].strip()
+                    if suffix and not suffix.startswith("#"):
+                        raise ValueError(f"Unexpected text after quoted value on line {line_number}")
+                    break
+                else:
+                    value_chars.append(char)
+                index += 1
+            else:
+                raise ValueError(f"Unclosed quoted value on line {line_number}")
+            value = "".join(value_chars)
+        else:
+            value = re.split(r"\s+#", raw_value, maxsplit=1)[0].strip()
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"Multiline environment values are not supported (line {line_number})")
+        values[key] = value
+        escaped_value = (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("$", "\\$")
+            .replace("`", "\\`")
+        )
+        normalized_lines.append(f'{key}="{escaped_value}"')
+    normalized = "\n".join(normalized_lines)
+    if normalized and not normalized.endswith("\n"):
+        normalized += "\n"
+    if len(normalized.encode("utf-8")) > MAX_ENV_FILE_BYTES:
+        raise ValueError(f"Normalized environment file exceeds {MAX_ENV_FILE_BYTES} bytes")
+    return normalized, values
+
+
+def _parse_environment_file(contents: str) -> str:
+    return _parse_environment_data(contents)[0]
+
+
+def get_environment_app(app_id: str) -> Dict[str, Any]:
+    app_id = validate_app_id(app_id)
+    app = _find_app(get_registry(), app_id)
+    path = _environment_file_path(app, get_config())
+    if not path.exists():
+        return {"ok": True, "app_id": app_id, "content": ""}
+    if path.stat().st_size > MAX_ENV_FILE_BYTES:
+        raise RuntimeError(f"Application environment file exceeds {MAX_ENV_FILE_BYTES} bytes")
+    _validate_environment_file_permissions(path, app)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"Could not read application environment file: {exc}") from exc
+    return {"ok": True, "app_id": app_id, "content": content}
+
+
+def _environment_values_app(app_id: str) -> Dict[str, str]:
+    content = get_environment_app(app_id)["content"]
+    return _parse_environment_data(content)[1] if content else {}
+
+
+def _validate_environment_file_permissions(path: Path, app: Dict[str, Any]) -> None:
+    if os.name == "nt":
+        return
+    _, gid = _account_ids(app["service_user"])
+    metadata = path.stat()
+    if (
+        stat.S_IMODE(metadata.st_mode) != 0o640
+        or metadata.st_uid != 0
+        or metadata.st_gid != gid
+        or metadata.st_nlink != 1
+    ):
+        raise RuntimeError("Application environment file has unsafe ownership or permissions")
+
+
+def save_environment_app(app_id: str, contents: str) -> Dict[str, Any]:
+    app_id = validate_app_id(app_id)
+    normalized, values = _parse_environment_data(contents)
+    with _app_lock(app_id):
+        app = _find_app(get_registry(), app_id)
+        path = _environment_file_path(app, get_config(), create_directory=True)
+        username = app["service_user"]
+        _, gid = _account_ids(username)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".env.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                descriptor = -1
+                handle.write(normalized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if hasattr(os, "chown"):
+                os.chown(str(temporary_path), 0, gid)
+            temporary_path.chmod(0o640)
+            os.replace(str(temporary_path), str(path))
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            with contextlib.suppress(FileNotFoundError):
+                temporary_path.unlink()
+            raise
+    return {"ok": True, "app_id": app_id, "key_count": len(values), "restart_required": app.get("status") == "running"}
 
 
 def _validate_registry(registry: Dict[str, Any]) -> None:
@@ -1432,6 +1613,7 @@ def _render_service(
         f"Group={app['service_user']}\n"
         f"WorkingDirectory={working_directory}\n"
         f"ExecStart={exec_start}\n"
+        f"EnvironmentFile=-{_systemd_quote(str(paths['environment']))}\n"
         f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
         f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
         f"{node_environment}"
@@ -1805,6 +1987,7 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             record["commit"] = commit or None
             service_path = _service_path(app_snapshot)
             previous_service_content = service_path.read_bytes() if service_path.exists() else None
+            build_environment = _environment_values_app(app_id)
             build_result = adapter.build(
                 app_snapshot,
                 source_path,
@@ -1814,6 +1997,7 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                     args,
                     cwd,
                     timeout,
+                    environment=build_environment,
                     live_log_path=deployment_log,
                 ),
                 timeout=int(config["build_timeout_seconds"]),
@@ -2174,6 +2358,10 @@ def _build_parser() -> argparse.ArgumentParser:
     logs = commands.add_parser("logs")
     logs.add_argument("app_id")
     logs.add_argument("--lines", type=int, default=100)
+    env_get = commands.add_parser("env-get")
+    env_get.add_argument("app_id")
+    env_save = commands.add_parser("env-save")
+    env_save.add_argument("app_id")
     rollback = commands.add_parser("rollback")
     rollback.add_argument("app_id")
     rollback.add_argument("release_id", nargs="?")
@@ -2214,6 +2402,13 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         return health_check_app(args.app_id)
     if args.command == "open":
         return open_app(args.app_id)
+    if args.command == "env-get":
+        return get_environment_app(args.app_id)
+    if args.command == "env-save":
+        contents = sys.stdin.read(MAX_ENV_FILE_BYTES + 1)
+        if len(contents.encode("utf-8")) > MAX_ENV_FILE_BYTES:
+            raise ValueError(f"Environment file must be smaller than {MAX_ENV_FILE_BYTES} bytes")
+        return save_environment_app(args.app_id, contents)
     operations = {
         "deploy": deploy_app,
         "pull": pull_app,

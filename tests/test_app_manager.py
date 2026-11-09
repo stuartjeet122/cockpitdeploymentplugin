@@ -96,6 +96,117 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(result["config"]["release_retention"], 9)
         self.assertEqual(result["config"]["health_timeout_seconds"], 45)
 
+    def test_environment_file_normalizes_supported_dotenv_values(self):
+        normalized = manager._parse_environment_file(
+            "# Runtime secrets\n"
+            "export API_KEY=abc123\n"
+            "DATABASE_URL=\"postgres://user:pass@localhost/db\"\n"
+            "FEATURE_LABEL='beta release'\n"
+            "HASH_VALUE=part # trailing comment\n"
+        )
+
+        self.assertIn("# Runtime secrets\n", normalized)
+        self.assertIn('API_KEY="abc123"\n', normalized)
+        self.assertIn('DATABASE_URL="postgres://user:pass@localhost/db"\n', normalized)
+        self.assertIn('FEATURE_LABEL="beta release"\n', normalized)
+        self.assertIn('HASH_VALUE="part"\n', normalized)
+
+    def test_environment_file_rejects_malformed_or_ambiguous_values(self):
+        invalid_contents = (
+            "not an assignment",
+            "KEY=one\nKEY=two",
+            'KEY="unclosed',
+            "KEY=value\nNEXT=bad\x00value",
+            "KEY=value\n" + ("LARGE=" + "x" * manager.MAX_ENV_FILE_BYTES),
+            "PORT=8080",
+        )
+        for contents in invalid_contents:
+            with self.subTest(contents=contents[:40]):
+                with self.assertRaises(ValueError):
+                    manager._parse_environment_file(contents)
+
+    def test_environment_file_permission_validation_rejects_public_or_unowned_files(self):
+        if os.name == "nt":
+            self.skipTest("POSIX ownership and permission checks are unavailable")
+        app = {"service_user": "app-demo"}
+        path = Mock()
+        with patch.object(manager, "_account_ids", return_value=(1001, 1001)):
+            path.stat.return_value = Mock(
+                st_mode=0o100640,
+                st_uid=0,
+                st_gid=1001,
+                st_nlink=1,
+            )
+            manager._validate_environment_file_permissions(path, app)
+            path.stat.return_value = Mock(
+                st_mode=0o100644,
+                st_uid=0,
+                st_gid=1001,
+                st_nlink=1,
+            )
+            with self.assertRaisesRegex(RuntimeError, "unsafe ownership or permissions"):
+                manager._validate_environment_file_permissions(path, app)
+
+    def test_environment_values_are_available_to_build_commands(self):
+        contents = '# Build variables\nAPI_TOKEN="secret token"\nAPP_MODE=production\n'
+        with patch.object(
+            manager,
+            "get_environment_app",
+            return_value={"content": contents},
+        ):
+            values = manager._environment_values_app("demo")
+
+        self.assertEqual(values, {"API_TOKEN": "secret token", "APP_MODE": "production"})
+
+    def test_environment_file_is_saved_privately_and_returned_for_export(self):
+        app = self.add_app()["app"]
+        with patch.object(manager, "ensure_app_user", return_value=app["service_user"]), patch.object(
+            manager, "_account_ids", return_value=(1001, 1001)
+        ), patch.object(manager.os, "chown", create=True), patch.object(
+            manager, "_validate_environment_file_permissions"
+        ):
+            result = manager.save_environment_app(
+                app["id"],
+                "# app config\nAPI_KEY=\"secret-value\"\n",
+            )
+            saved = manager.get_environment_app(app["id"])
+
+        self.assertEqual(result["key_count"], 1)
+        self.assertFalse(result["restart_required"])
+        self.assertEqual(saved["content"], '# app config\nAPI_KEY="secret-value"\n')
+        env_path = manager._app_paths(app["id"], manager.get_config())["environment"]
+        self.assertTrue(env_path.is_file())
+        if os.name != "nt":
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o640)
+
+    def test_environment_file_rejects_symlink_before_read_or_write(self):
+        app = self.add_app()["app"]
+        env_path = manager._app_paths(app["id"], manager.get_config())["environment"]
+        env_path.parent.mkdir(parents=True)
+        outside = env_path.parent / "other.env"
+        outside.write_text("SECRET=keep\n", encoding="utf-8")
+        try:
+            env_path.symlink_to(outside)
+        except OSError:
+            self.skipTest("Symlink creation is not permitted on this host")
+
+        with self.assertRaisesRegex(RuntimeError, "must be a regular file"):
+            manager.get_environment_app(app["id"])
+
+    def test_environment_save_cli_reads_secrets_from_stdin(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.object(manager.sys, "stdin", io.StringIO("API_TOKEN=private\n")), patch.object(
+            manager, "save_environment_app", return_value={"ok": True, "key_count": 1}
+        ) as save, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = manager.main(["env-save", "demo"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(save.call_args.args, ("demo", "API_TOKEN=private\n"))
+        self.assertNotIn("private", str(save.call_args_list[0].args[0]))
+        self.assertEqual(json.loads(stdout.getvalue())["key_count"], 1)
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_duplicate_ids_and_ports_are_rejected(self):
         self.add_app()
         with self.assertRaisesRegex(ValueError, "already registered"):
@@ -700,7 +811,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("globalThis.cockpit", frontend)
         self.assertIn("Cockpit API is unavailable.", frontend)
         self.assertIn('const BACKEND = "/usr/libexec/cockpit/app-manager/app-manager";', frontend)
-        for action in ("deploy", "pull", "edit", "health", "restart", "stop", "start", "logs", "remove", "rollback"):
+        for action in ("deploy", "pull", "edit", "health", "environment", "restart", "stop", "start", "logs", "remove", "rollback"):
             self.assertIn(f'data-action="{action}"', frontend)
         for endpoint in (
             'callBackend("add", [JSON.stringify(payload)])',
@@ -713,13 +824,21 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             'callBackend("deployment-logs", [appId])',
             'callBackend("plugin-update-check")',
             'callBackend("plugin-update")',
+            'callBackend("env-get", [app.id])',
+            'callBackendInput("env-save", [app.id], content)',
         ):
             self.assertIn(endpoint, frontend)
+        self.assertIn('accept=".env,text/plain"', frontend)
+        self.assertIn('download = ".env"', frontend)
+        self.assertIn("Maximum size: 64 KiB.", frontend)
         self.assertIn('id="checkUpdateButton"', html)
         self.assertIn('function deployWithLiveLog(appId)', frontend)
         self.assertIn('class="am-log-output"', frontend)
         self.assertIn('if (result.available)', frontend)
         backend = (project / "backend" / "app_manager.py").read_text(encoding="utf-8")
+        self.assertIn('EnvironmentFile=-{_systemd_quote(str(paths[\'environment\']))}', backend)
+        self.assertIn("def get_environment_app(", backend)
+        self.assertIn("def save_environment_app(", backend)
         self.assertIn('PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"', backend)
         self.assertIn('PLUGIN_UPDATE_USER = "nobody"', backend)
         self.assertIn('["runuser", "--user", PLUGIN_UPDATE_USER, "--", *env_args]', backend)
@@ -780,11 +899,16 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("CapabilityBoundingSet=\n", service)
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", service)
         self.assertIn("Environment=\"APP_BASE_PATH=/demo\"", service)
+        self.assertIn(
+            f"EnvironmentFile=-{manager._systemd_quote(str(paths['environment']))}",
+            service,
+        )
         self.assertIn(f"ReadOnlyPaths={manager._systemd_quote(str(paths['releases']))}", service)
         template = (Path(__file__).resolve().parent.parent / "templates" / "app.service.tpl").read_text(
             encoding="utf-8"
         )
         self.assertIn("ReadOnlyPaths={{ app_root }}/releases", template)
+        self.assertIn("EnvironmentFile=-{{ app_env_file }}", template)
         self.assertIn("CapabilityBoundingSet=", template)
         self.assertNotIn("CAP_NET_BIND_SERVICE", service)
         self.assertNotIn("AmbientCapabilities=", service)

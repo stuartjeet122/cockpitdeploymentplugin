@@ -35,6 +35,27 @@
     return result;
   }
 
+  async function callBackendInput(command, args, input) {
+    const cockpitApi = globalThis.cockpit;
+    if (!cockpitApi || typeof cockpitApi.spawn !== "function") {
+      throw new Error("Cockpit API is unavailable. Ensure ../base1/cockpit.js loads before app-manager.js.");
+    }
+    const process = cockpitApi.spawn([BACKEND, command, ...args], { superuser: "require" });
+    process.input(input);
+    process.close();
+    const output = await process;
+    let result;
+    try {
+      result = JSON.parse(output);
+    } catch (error) {
+      throw new Error(`Backend returned invalid JSON: ${error.message}`);
+    }
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(result?.error || "The backend returned an invalid response.");
+    }
+    return result;
+  }
+
   async function waitForCockpitApi(timeoutMs = 5000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -214,6 +235,7 @@
             <button type="button" class="am-button" data-action="pull" data-id="${escapeHtml(app.id)}">Pull</button>
             <button type="button" class="am-button" data-action="edit" data-id="${escapeHtml(app.id)}">Edit</button>
             <button type="button" class="am-button" data-action="health" data-id="${escapeHtml(app.id)}">Health</button>
+            <button type="button" class="am-button" data-action="environment" data-id="${escapeHtml(app.id)}">Environment</button>
             ${serviceControl}
             <button type="button" class="am-button" data-action="restart" data-id="${escapeHtml(app.id)}">Restart</button>
             <button type="button" class="am-button" data-action="logs" data-id="${escapeHtml(app.id)}">Logs</button>
@@ -459,6 +481,64 @@
     });
   }
 
+  async function manageEnvironment(app) {
+    const result = await callBackend("env-get", [app.id]);
+    const body = `
+      <p class="am-dialog-intro">Manage private runtime variables for ${escapeHtml(app.name)}. Secrets are stored outside the source checkout and are not included in deployments.</p>
+      <div class="am-env-tools">
+        <label class="am-button" for="environmentImport">Import .env file</label>
+        <input id="environmentImport" class="am-visually-hidden" type="file" accept=".env,text/plain">
+        <button type="button" class="am-button" data-env-export>Export .env</button>
+      </div>
+      <label class="am-env-label" for="environmentContent">Environment variables</label>
+      <textarea id="environmentContent" class="am-env-editor" name="environment_content" rows="16" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="DATABASE_URL=…&#10;API_KEY=…">${escapeHtml(result.content || "")}</textarea>
+      <small class="am-field-hint">Use KEY=value assignments, one per line. Values are applied when the application next starts or deploys. Maximum size: 64 KiB.</small>
+    `;
+    openDialog(`Environment: ${app.name}`, body, "Save .env", async (form) => {
+      const content = form.elements.namedItem("environment_content").value;
+      if (new TextEncoder().encode(content).length > 64 * 1024) {
+        throw new Error("The .env file must be no larger than 64 KiB.");
+      }
+      const saved = await runOperation(
+        async () => {
+          const response = await callBackendInput("env-save", [app.id], content);
+          showNotice(
+            `${response.key_count} environment ${response.key_count === 1 ? "variable" : "variables"} saved. Restart or deploy the application to apply changes.`,
+          );
+        },
+        "",
+      );
+      return saved;
+    });
+
+    const dialog = byId("appManagerDialog");
+    const importInput = byId("environmentImport");
+    const editor = byId("environmentContent");
+    importInput.addEventListener("change", async () => {
+      const file = importInput.files && importInput.files[0];
+      if (!file) return;
+      if (file.size > 64 * 1024) {
+        showError(new Error("The selected .env file is larger than 64 KiB."));
+        importInput.value = "";
+        return;
+      }
+      try {
+        editor.value = await file.text();
+      } catch (error) {
+        showError(new Error(`Could not read the selected .env file: ${error.message}`));
+      }
+    });
+    dialog.querySelector("[data-env-export]").addEventListener("click", () => {
+      const file = new Blob([editor.value], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(file);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = ".env";
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    });
+  }
+
   function showLogs(appId) {
     void runOperation(async () => {
       const result = await callBackend("logs", [appId, "--lines", "200"]);
@@ -564,6 +644,10 @@
     }
     if (action === "logs") {
       showLogs(appId);
+      return;
+    }
+    if (action === "environment") {
+      void manageEnvironment(app).catch(showError);
       return;
     }
     if (action === "remove") {
