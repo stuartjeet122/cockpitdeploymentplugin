@@ -20,7 +20,7 @@
   async function callBackend(command, args = []) {
     const cockpitApi = globalThis.cockpit;
     if (!cockpitApi || typeof cockpitApi.spawn !== "function") {
-      throw new Error("Cockpit API is unavailable. Open App Manager inside Cockpit and verify that /cockpit/cockpit.js loaded.");
+      throw new Error("Cockpit API is unavailable. Ensure ../base1/cockpit.js loads before app-manager.js.");
     }
     const output = await cockpitApi.spawn([BACKEND, command, ...args], { superuser: "require" });
     let result;
@@ -33,6 +33,17 @@
       throw new Error(result?.error || "The backend returned an invalid response.");
     }
     return result;
+  }
+
+  async function waitForCockpitApi(timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (globalThis.cockpit && typeof globalThis.cockpit.spawn === "function") {
+        return globalThis.cockpit;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    }
+    throw new Error("Cockpit API failed to load from ../base1/cockpit.js. Reload App Manager inside Cockpit and check for blocked or missing scripts.");
   }
 
   function showNotice(message) {
@@ -569,10 +580,17 @@
     if (event.target === event.currentTarget) event.currentTarget.close();
   });
   bindTabs();
-  if (globalThis.cockpit && typeof globalThis.cockpit.spawn === "function") {
-    void runOperation(refreshData, "", false);
-  } else {
-    setBusy(false);
-    showError(new Error("Cockpit API is unavailable. Open App Manager inside Cockpit and verify that /cockpit/cockpit.js loaded."));
+  async function initialize() {
+    setBusy(true);
+    try {
+      await waitForCockpitApi();
+      setBusy(false);
+      await runOperation(refreshData, "", false);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
   }
+  void initialize();
 })();

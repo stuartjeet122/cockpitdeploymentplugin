@@ -414,6 +414,33 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('type="text" inputmode="url"', html)
         self.assertIn('autocomplete="url"', html)
 
+    def test_cockpit_api_reference_is_package_relative_and_initialization_waits(self):
+        project = Path(__file__).resolve().parent.parent
+        cockpit_dir = project / "cockpit"
+        html = (cockpit_dir / "index.html").read_text(encoding="utf-8")
+        frontend = (cockpit_dir / "app-manager.js").read_text(encoding="utf-8")
+        installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
+
+        self.assertIn('<script src="../base1/cockpit.js"></script>', html)
+        self.assertNotIn("/cockpit/login.js", html)
+        self.assertNotIn("/cockpit/cockpit.js", html)
+        self.assertIn("async function waitForCockpitApi(", frontend)
+        self.assertIn("await waitForCockpitApi();", frontend)
+        self.assertLess(
+            frontend.index("await waitForCockpitApi();"),
+            frontend.index("await runOperation(refreshData,"),
+        )
+        self.assertIn("Cockpit API failed to load from ../base1/cockpit.js.", frontend)
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/index.html" "$PLUGIN_DEST/index.html"',
+            installer,
+        )
+
+        for source in cockpit_dir.glob("*.js"):
+            contents = source.read_text(encoding="utf-8")
+            self.assertNotIn("/cockpit/login.js", contents, source.name)
+            self.assertNotIn("/cockpit/cockpit.js", contents, source.name)
+
     def test_generated_service_has_no_network_capability_and_is_hardened(self):
         config = manager._default_config()
         config["production_root"] = "/opt/webapps"
