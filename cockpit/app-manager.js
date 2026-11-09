@@ -36,6 +36,8 @@
     notice.textContent = message;
     notice.classList.remove("hidden");
     byId("appManagerError").classList.add("hidden");
+    const connection = byId("appManagerConnection");
+    if (connection.dataset.state === "error") updateConnection("connected", "Ready");
   }
 
   function showError(error) {
@@ -43,6 +45,13 @@
     byId("appManagerError").textContent = message;
     byId("appManagerError").classList.remove("hidden");
     byId("appManagerNotice").classList.add("hidden");
+    updateConnection("error", "Action needs attention");
+  }
+
+  function updateConnection(status, message) {
+    const connection = byId("appManagerConnection");
+    connection.dataset.state = status;
+    connection.lastElementChild.textContent = message;
   }
 
   function setBusy(busy) {
@@ -51,12 +60,19 @@
       .forEach((control) => {
         control.disabled = busy;
       });
-    byId("refreshButton").textContent = busy ? "Working…" : "Refresh";
+    const refreshButton = byId("refreshButton");
+    refreshButton.querySelector("span").textContent = busy ? "Working…" : "Refresh";
+    refreshButton.setAttribute("aria-label", busy ? "App Manager is working" : "Refresh application data");
     document.querySelector(".am-app-manager").setAttribute("aria-busy", String(busy));
+    if (busy) updateConnection("busy", "Working…");
+    else if (byId("appManagerConnection").dataset.state === "busy") updateConnection("connected", "Ready");
   }
 
   async function runOperation(operation, successMessage, refresh = true) {
-    if (state.busy) return false;
+    if (state.busy) {
+      showNotice("Another operation is still in progress. Please wait a moment.");
+      return false;
+    }
     setBusy(true);
     try {
       await operation();
@@ -73,31 +89,41 @@
 
   function renderStatus(status) {
     const value = status || "unknown";
-    return `<span class="status-pill" data-status="${escapeHtml(value)}">${escapeHtml(value)}</span>`;
+    return `<span class="am-status-pill" data-status="${escapeHtml(value)}">${escapeHtml(value)}</span>`;
   }
 
   function renderOverview(data) {
     const cards = [
       ["Total applications", data.total_apps],
-      ["Running applications", data.running_apps],
-      ["Stopped applications", data.stopped_apps],
+      ["Running", data.running_apps],
+      ["Stopped", data.stopped_apps],
       ["Failed deployments", data.failed_deployments],
       ["Available ports", Array.isArray(data.available_ports) ? data.available_ports.length : 0],
     ];
     byId("overviewCards").innerHTML = cards.map(([label, value]) => `
-      <div class="card">
-        <small>${escapeHtml(label)}</small>
-        <h3>${escapeHtml(value)}</h3>
+      <div class="am-metric">
+        <span class="am-metric-label">${escapeHtml(label)}</span>
+        <strong class="am-metric-value">${escapeHtml(value)}</strong>
       </div>
     `).join("");
 
     const activity = (data.recent_activity || []).map((item) => `
-      <div class="card">
-        <strong>${escapeHtml(item.name)}</strong>
-        <div>${escapeHtml(item.action)} · ${escapeHtml(item.when)}</div>
+      <div class="am-activity-item">
+        <span class="am-activity-icon" aria-hidden="true">↗</span>
+        <div>
+          <strong class="am-activity-title">${escapeHtml(item.name || "Application")}</strong>
+          <span class="am-activity-description">${escapeHtml(item.action || "Updated")}</span>
+        </div>
+        <time class="am-activity-time">${escapeHtml(item.when || "Recently")}</time>
       </div>
     `).join("");
-    byId("recentActivity").innerHTML = activity || "<p>No recent deployment activity.</p>";
+    byId("recentActivity").innerHTML = activity || `
+      <div class="am-empty-state">
+        <span class="am-empty-state__icon" aria-hidden="true">↗</span>
+        <h3>Nothing to report yet</h3>
+        <p>Your recent application activity will appear here.</p>
+      </div>
+    `;
   }
 
   function getSafePublicUrl(value) {
@@ -112,66 +138,78 @@
   function renderApps(data) {
     state.apps = data.apps || [];
     if (!state.apps.length) {
-      byId("appsTableContainer").innerHTML = "<p>No applications registered yet.</p>";
+      byId("appsTableContainer").innerHTML = `
+        <div class="am-empty-state">
+          <span class="am-empty-state__icon" aria-hidden="true">+</span>
+          <h3>No applications yet</h3>
+          <p>Connect a Git repository to create your first managed application.</p>
+          <button type="button" class="am-button am-button--primary" data-tab-target="add-app">Add your first application</button>
+        </div>
+      `;
       return;
     }
 
-    const rows = state.apps.map((app) => {
+    const cards = state.apps.map((app) => {
       const safeUrl = getSafePublicUrl(app.public_url);
       const openControl = safeUrl
-        ? `<a class="am-button-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Open</a>`
-        : "<span>Unavailable</span>";
+        ? `<a class="am-button am-app-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Open application</a>`
+        : "";
+      const serviceControl = app.status === "running"
+        ? `<button type="button" class="am-button" data-action="stop" data-id="${escapeHtml(app.id)}" title="Stop ${escapeHtml(app.name)}">Stop</button>`
+        : `<button type="button" class="am-button" data-action="start" data-id="${escapeHtml(app.id)}" title="Start ${escapeHtml(app.name)}">Start</button>`;
+      const appInitial = String(app.name || "A").trim().charAt(0).toUpperCase() || "A";
       return `
-        <tr>
-          <td>${escapeHtml(app.name)}</td>
-          <td>${escapeHtml(app.framework)}</td>
-          <td>${escapeHtml(app.repo_url)}</td>
-          <td>${escapeHtml(app.branch)}</td>
-          <td>${safeUrl ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(app.public_url)}</a>` : escapeHtml(app.public_url)}</td>
-          <td>${escapeHtml(app.port)}</td>
-          <td>${renderStatus(app.status)}</td>
-          <td>${escapeHtml(app.last_deploy || "Not yet")}</td>
-          <td>${escapeHtml(app.latest_commit || "n/a")}</td>
-          <td class="action-row">
+        <article class="am-app-card">
+          <header class="am-app-card__heading">
+            <span class="am-app-avatar" aria-hidden="true">${escapeHtml(appInitial)}</span>
+            <div class="am-app-title-wrap">
+              <h3>${escapeHtml(app.name)}</h3>
+              <span class="am-app-framework">${escapeHtml(app.framework || "Framework not detected")}</span>
+            </div>
+            ${renderStatus(app.status)}
+          </header>
+          <dl class="am-app-meta">
+            <div><dt>Repository</dt><dd title="${escapeHtml(app.repo_url)}">${escapeHtml(app.repo_url || "Not provided")}</dd></div>
+            <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
+            <div><dt>Port</dt><dd>${escapeHtml(app.port || "—")}</dd></div>
+            <div><dt>Last deployed</dt><dd>${escapeHtml(app.last_deploy || "Not yet deployed")}</dd></div>
+            <div><dt>Latest commit</dt><dd title="${escapeHtml(app.latest_commit || "No commit yet")}">${escapeHtml(app.latest_commit || "—")}</dd></div>
+            <div><dt>Public URL</dt><dd>${safeUrl ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(app.public_url)}</a>` : escapeHtml(app.public_url || "Not available")}</dd></div>
+          </dl>
+          <div class="am-app-actions" aria-label="Actions for ${escapeHtml(app.name)}">
             ${openControl}
-            <button type="button" data-action="deploy" data-id="${escapeHtml(app.id)}">Deploy</button>
-            <button type="button" data-action="pull" data-id="${escapeHtml(app.id)}">Pull</button>
-            <button type="button" data-action="edit" data-id="${escapeHtml(app.id)}">Edit</button>
-            <button type="button" data-action="health" data-id="${escapeHtml(app.id)}">Health</button>
-            <button type="button" data-action="restart" data-id="${escapeHtml(app.id)}">Restart</button>
-            <button type="button" data-action="stop" data-id="${escapeHtml(app.id)}">Stop</button>
-            <button type="button" data-action="start" data-id="${escapeHtml(app.id)}">Start</button>
-            <button type="button" data-action="logs" data-id="${escapeHtml(app.id)}">Logs</button>
-            <button type="button" data-action="remove" data-id="${escapeHtml(app.id)}">Remove</button>
-          </td>
-        </tr>
+            <button type="button" class="am-button am-button--primary" data-action="deploy" data-id="${escapeHtml(app.id)}">Deploy</button>
+            <button type="button" class="am-button" data-action="pull" data-id="${escapeHtml(app.id)}">Pull</button>
+            <button type="button" class="am-button" data-action="edit" data-id="${escapeHtml(app.id)}">Edit</button>
+            <button type="button" class="am-button" data-action="health" data-id="${escapeHtml(app.id)}">Health</button>
+            ${serviceControl}
+            <button type="button" class="am-button" data-action="restart" data-id="${escapeHtml(app.id)}">Restart</button>
+            <button type="button" class="am-button" data-action="logs" data-id="${escapeHtml(app.id)}">Logs</button>
+            <button type="button" class="am-button am-button--danger" data-action="remove" data-id="${escapeHtml(app.id)}">Remove</button>
+          </div>
+        </article>
       `;
     }).join("");
 
-    byId("appsTableContainer").innerHTML = `
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Name</th><th>Framework</th><th>Repository</th><th>Branch</th>
-            <th>Public URL</th><th>Port</th><th>Status</th><th>Last deploy</th>
-            <th>Latest commit</th><th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    `;
+    byId("appsTableContainer").innerHTML = cards;
   }
 
   function renderDeployments(data) {
     state.deployments = data.deployments || [];
     if (!state.deployments.length) {
-      byId("deploymentHistory").innerHTML = "<p>No deployment history.</p>";
+      byId("deploymentHistory").innerHTML = `
+        <div class="am-empty-state">
+          <span class="am-empty-state__icon" aria-hidden="true">↗</span>
+          <h3>No deployments yet</h3>
+          <p>Once you deploy an application, its release history will appear here.</p>
+        </div>
+      `;
       return;
     }
     const rows = state.deployments.map((deployment) => {
       const canRollback = deployment.status === "deployed" && deployment.release_available !== false;
       const rollbackControl = canRollback
-        ? `<button type="button" data-action="rollback" data-id="${escapeHtml(deployment.app_id)}" data-release="${escapeHtml(deployment.id)}">Rollback</button>`
+        ? `<button type="button" class="am-button" data-action="rollback" data-id="${escapeHtml(deployment.app_id)}" data-release="${escapeHtml(deployment.id)}">Rollback</button>`
         : "";
       return `
         <tr>
@@ -186,6 +224,7 @@
       `;
     }).join("");
     byId("deploymentHistory").innerHTML = `
+      <div class="am-deployment-table-wrap">
       <table class="table">
         <thead><tr>
           <th>Name</th><th>Date</th><th>Commit</th><th>Build status</th>
@@ -193,34 +232,49 @@
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
+      </div>
     `;
   }
 
   function renderSettings(data) {
     const config = data.config || {};
     byId("settingsPanel").innerHTML = `
-      <div class="card">
-        <h3>Deployment settings</h3>
-        <ul>
-          <li>Port range: ${escapeHtml(config.port_range ? `${config.port_range.start}-${config.port_range.end}` : "8100-8999")}</li>
-          <li>Source root: ${escapeHtml(config.source_root || "/var/lib/cockpit/app-manager/sources")}</li>
-          <li>Production root: ${escapeHtml(config.production_root || "/opt/webapps")}</li>
-          <li>Log root: ${escapeHtml(config.log_root || "/var/log/cockpit-app-manager")}</li>
-        </ul>
-        <form id="settingsForm">
-          <div class="row">
-            <div><label for="settingRetention">Release retention</label>
-              <input id="settingRetention" type="number" min="0" max="100" step="1" name="release_retention" value="${escapeHtml(config.release_retention ?? 5)}" required></div>
-            <div><label for="settingBuildTimeout">Build timeout (seconds)</label>
-              <input id="settingBuildTimeout" type="number" min="1" max="86400" step="1" name="build_timeout_seconds" value="${escapeHtml(config.build_timeout_seconds ?? 900)}" required></div>
-            <div><label for="settingHealthTimeout">Health timeout (seconds)</label>
-              <input id="settingHealthTimeout" type="number" min="1" max="3600" step="1" name="health_timeout_seconds" value="${escapeHtml(config.health_timeout_seconds ?? 30)}" required></div>
-            <div><label for="settingCommandTimeout">Command timeout (seconds)</label>
-              <input id="settingCommandTimeout" type="number" min="1" max="86400" step="1" name="command_timeout_seconds" value="${escapeHtml(config.command_timeout_seconds ?? 30)}" required></div>
+      <section class="am-surface am-settings">
+        <div class="am-surface-heading">
+          <div>
+            <h3>Deployment settings</h3>
+            <p>All managed applications use these safe, isolated host locations.</p>
           </div>
-          <button type="submit">Save settings</button>
+        </div>
+        <dl class="am-settings-paths">
+          <div><dt>Port range</dt><dd>${escapeHtml(config.port_range ? `${config.port_range.start}-${config.port_range.end}` : "8100-8999")}</dd></div>
+          <div><dt>Source root</dt><dd>${escapeHtml(config.source_root || "/var/lib/cockpit/app-manager/sources")}</dd></div>
+          <div><dt>Production root</dt><dd>${escapeHtml(config.production_root || "/opt/webapps")}</dd></div>
+          <div><dt>Log root</dt><dd>${escapeHtml(config.log_root || "/var/log/cockpit-app-manager")}</dd></div>
+        </dl>
+        <form id="settingsForm" class="am-settings-form">
+          <div class="am-form-grid">
+            <div>
+              <label for="settingRetention">Release retention</label>
+              <input id="settingRetention" type="number" min="0" max="100" step="1" name="release_retention" value="${escapeHtml(config.release_retention ?? 5)}" required>
+              <small class="am-field-hint">Number of previous releases to keep.</small>
+            </div>
+            <div>
+              <label for="settingBuildTimeout">Build timeout (seconds)</label>
+              <input id="settingBuildTimeout" type="number" min="1" max="86400" step="1" name="build_timeout_seconds" value="${escapeHtml(config.build_timeout_seconds ?? 900)}" required>
+            </div>
+            <div>
+              <label for="settingHealthTimeout">Health timeout (seconds)</label>
+              <input id="settingHealthTimeout" type="number" min="1" max="3600" step="1" name="health_timeout_seconds" value="${escapeHtml(config.health_timeout_seconds ?? 30)}" required>
+            </div>
+            <div>
+              <label for="settingCommandTimeout">Command timeout (seconds)</label>
+              <input id="settingCommandTimeout" type="number" min="1" max="86400" step="1" name="command_timeout_seconds" value="${escapeHtml(config.command_timeout_seconds ?? 30)}" required>
+            </div>
+          </div>
+          <div class="am-form-actions"><button type="submit" class="am-button am-button--primary">Save settings</button></div>
         </form>
-      </div>
+      </section>
     `;
     byId("settingsForm").addEventListener("submit", (event) => {
       event.preventDefault();
@@ -235,16 +289,22 @@
   }
 
   async function refreshData() {
-    const [overview, apps, deployments, settings] = await Promise.all([
-      callBackend("overview"),
-      callBackend("list"),
-      callBackend("deployments"),
-      callBackend("settings"),
-    ]);
-    renderOverview(overview);
-    renderApps(apps);
-    renderDeployments(deployments);
-    renderSettings(settings);
+    try {
+      const [overview, apps, deployments, settings] = await Promise.all([
+        callBackend("overview"),
+        callBackend("list"),
+        callBackend("deployments"),
+        callBackend("settings"),
+      ]);
+      renderOverview(overview);
+      renderApps(apps);
+      renderDeployments(deployments);
+      renderSettings(settings);
+      updateConnection("connected", `${state.apps.length} ${state.apps.length === 1 ? "application" : "applications"}`);
+    } catch (error) {
+      updateConnection("error", "Could not load data");
+      throw error;
+    }
   }
 
   function openDialog(title, body, submitLabel, onSubmit) {
@@ -421,25 +481,52 @@
   }
 
   function bindTabs() {
-    document.querySelectorAll(".am-app-manager .tab").forEach((tab) => {
-      tab.addEventListener("click", () => {
-        document.querySelectorAll(".am-app-manager .tab").forEach((item) => item.classList.remove("active"));
-        document.querySelectorAll(".am-app-manager .tab-panel").forEach((panel) => panel.classList.add("hidden"));
-        tab.classList.add("active");
-        byId(tab.dataset.tab).classList.remove("hidden");
+    const tabs = Array.from(document.querySelectorAll('.am-app-manager [role="tab"][data-tab]'));
+    function activate(tab) {
+      tabs.forEach((item) => {
+        const selected = item === tab;
+        item.classList.toggle("active", selected);
+        item.setAttribute("aria-selected", String(selected));
+        item.tabIndex = selected ? 0 : -1;
+        const panel = byId(item.dataset.tab);
+        panel.classList.toggle("hidden", !selected);
+        panel.hidden = !selected;
+      });
+    }
+
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => activate(tab));
+      tab.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const currentIndex = tabs.indexOf(tab);
+        const nextIndex = event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? tabs.length - 1
+            : (currentIndex + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
+        tabs[nextIndex].focus();
+        activate(tabs[nextIndex]);
       });
     });
   }
 
+  document.querySelector(".am-app-manager").addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("[data-tab-target]") : null;
+    if (!target || state.busy) return;
+    const tab = Array.from(document.querySelectorAll('.am-app-manager [role="tab"][data-tab]'))
+      .find((item) => item.dataset.tab === target.dataset.tabTarget);
+    if (tab) tab.click();
+  });
   byId("refreshButton").addEventListener("click", () => {
-    void runOperation(refreshData, "Data refreshed.", false);
+    void runOperation(refreshData, "Application data refreshed.", false);
   });
   byId("appsTableContainer").addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-action]");
-    if (button) void handleAppAction(button.dataset.action, button.dataset.id);
+    const button = event.target instanceof Element ? event.target.closest("button[data-action]") : null;
+    if (button) void handleAppAction(button.dataset.action, button.dataset.id).catch(showError);
   });
   byId("deploymentHistory").addEventListener("click", (event) => {
-    const button = event.target.closest('button[data-action="rollback"]');
+    const button = event.target instanceof Element ? event.target.closest('button[data-action="rollback"]') : null;
     if (button) handleRollback(button);
   });
   byId("appManagerDialog").addEventListener("click", (event) => {

@@ -2,6 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>App Manager</title>
     <link rel="stylesheet" href="app-manager.css">
     <script src="/cockpit/login.js"></script>
@@ -9,93 +11,167 @@
     <script src="app-manager.js" defer></script>
   </head>
   <body>
-    <div class="container am-app-manager">
-      <div class="toolbar">
-        <h2>App Manager</h2>
-        <button id="refreshButton" class="pf-m-primary">Refresh</button>
-      </div>
+    <main class="am-app-manager" aria-busy="true">
+      <header class="am-header">
+        <div class="am-brand">
+          <div class="am-brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M4 19V5h7v14H4Zm9 0V10h7v9h-7ZM13 5h7v3h-7V5Z" />
+            </svg>
+          </div>
+          <div>
+            <p class="am-eyebrow">APPLICATION CONTROL CENTER</p>
+            <h1>App Manager</h1>
+            <p class="am-header-copy">Deploy, monitor, and manage your hosted applications.</p>
+          </div>
+        </div>
+        <div class="am-header-actions">
+          <span id="appManagerConnection" class="am-connection-status" role="status" aria-live="polite">
+            <span class="am-status-dot" aria-hidden="true"></span>
+            <span>Connecting…</span>
+          </span>
+          <button id="refreshButton" class="am-button am-button--quiet" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-3M4 4v4h4m-4 5a8 8 0 0 0 14.9 3M20 20v-4h-4" /></svg>
+            <span>Refresh</span>
+          </button>
+          <button class="am-button am-button--primary" type="button" data-tab-target="add-app">
+            <span aria-hidden="true">+</span>
+            Add application
+          </button>
+        </div>
+      </header>
+
       <div id="appManagerNotice" class="am-notice hidden" role="status" aria-live="polite"></div>
       <div id="appManagerError" class="am-error hidden" role="alert" aria-live="assertive"></div>
 
-      <div class="tabs">
-        <button class="tab active" data-tab="overview">Overview</button>
-        <button class="tab" data-tab="websites">Websites</button>
-        <button class="tab" data-tab="add-app">Add Application</button>
-        <button class="tab" data-tab="deployments">Deployments</button>
-        <button class="tab" data-tab="settings">Settings</button>
-      </div>
+      <nav class="am-tabs" role="tablist" aria-label="App Manager sections">
+        <button id="tab-overview" class="am-tab tab active" type="button" role="tab" aria-selected="true" aria-controls="overview" tabindex="0" data-tab="overview">Overview</button>
+        <button id="tab-websites" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="websites" tabindex="-1" data-tab="websites">Applications</button>
+        <button id="tab-add-app" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="add-app" tabindex="-1" data-tab="add-app">Add application</button>
+        <button id="tab-deployments" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="deployments" tabindex="-1" data-tab="deployments">Deployments</button>
+        <button id="tab-settings" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="settings" tabindex="-1" data-tab="settings">Settings</button>
+      </nav>
 
-      <section id="overview" class="tab-panel">
-        <div id="overviewCards" class="cards"></div>
-        <div class="card">
-          <h3>Recent deployment activity</h3>
-          <div id="recentActivity"></div>
+      <section id="overview" class="am-panel tab-panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+        <div class="am-section-heading">
+          <div>
+            <p class="am-eyebrow">AT A GLANCE</p>
+            <h2>Overview</h2>
+            <p class="am-section-copy">A live snapshot of your managed applications and deployments.</p>
+          </div>
         </div>
+        <div id="overviewCards" class="am-metrics"></div>
+        <section class="am-surface am-activity-panel" aria-labelledby="activityHeading">
+          <div class="am-surface-heading">
+            <div>
+              <h3 id="activityHeading">Recent activity</h3>
+              <p>Latest changes across your applications.</p>
+            </div>
+          </div>
+          <div id="recentActivity" class="am-activity-list"></div>
+        </section>
       </section>
 
-      <section id="websites" class="tab-panel hidden">
-        <div id="appsTableContainer"></div>
+      <section id="websites" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-websites" tabindex="0">
+        <div class="am-section-heading">
+          <div>
+            <p class="am-eyebrow">YOUR HOSTED PROJECTS</p>
+            <h2>Applications</h2>
+            <p class="am-section-copy">Deploy releases, check health, and control each service.</p>
+          </div>
+          <button class="am-button am-button--primary" type="button" data-tab-target="add-app">Add application</button>
+        </div>
+        <div id="appsTableContainer" class="am-app-grid"></div>
       </section>
 
-      <section id="add-app" class="tab-panel hidden">
-        <form id="addAppForm">
-          <div class="row">
-            <div>
-              <label>Website name</label>
-              <input required name="name" />
-            </div>
-            <div>
-              <label>Application slug</label>
-              <input required name="slug" />
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>Git repository URL</label>
-              <input required name="repo_url" />
-            </div>
-            <div>
-              <label>Production branch</label>
-              <input name="branch" value="main" />
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>Framework</label>
-              <select name="framework">
-                <option value="auto">Auto detect</option>
-                <option value="nextjs">Next.js</option>
-                <option value="go">Go</option>
-                <option value="node">Node.js</option>
-                <option value="python">Python</option>
-                <option value="static">Static</option>
-              </select>
-            </div>
-            <div>
-              <label>Health-check URL</label>
-              <input name="health_check_url" placeholder="/health" />
-            </div>
-          </div>
+      <section id="add-app" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-add-app" tabindex="0">
+        <div class="am-section-heading">
           <div>
-            <label>Optional description</label>
-            <textarea name="description" rows="3"></textarea>
+            <p class="am-eyebrow">GET STARTED</p>
+            <h2>Add an application</h2>
+            <p class="am-section-copy">Connect a Git repository. App Manager can detect the framework for you.</p>
           </div>
-          <div>
-            <label>Build configuration</label>
-            <textarea name="build_config" rows="3" placeholder='{"build_command": "npm run build"}'></textarea>
+        </div>
+        <form id="addAppForm" class="am-form am-surface">
+          <div class="am-form-section">
+            <h3>Project details</h3>
+            <p>Choose a memorable name and a path-safe slug for the application.</p>
+            <div class="am-form-grid">
+              <div>
+                <label for="appName">Website name</label>
+                <input id="appName" required name="name" autocomplete="organization" placeholder="My application" />
+              </div>
+              <div>
+                <label for="appSlug">Application slug</label>
+                <input id="appSlug" required name="slug" autocomplete="off" placeholder="my-application" />
+                <small class="am-field-hint">Used in the application URL path.</small>
+              </div>
+              <div class="am-form-grid__wide">
+                <label for="appRepo">Git repository URL</label>
+                <input id="appRepo" required name="repo_url" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://github.com/owner/project.git or git@github.com:owner/project.git" />
+                <small class="am-field-hint">Use an HTTPS or SSH remote. SSH keys must already be configured on the host.</small>
+              </div>
+              <div>
+                <label for="appBranch">Production branch</label>
+                <input id="appBranch" name="branch" value="main" autocomplete="off" />
+              </div>
+              <div>
+                <label for="appFramework">Framework</label>
+                <select id="appFramework" name="framework">
+                  <option value="auto">Auto detect</option>
+                  <option value="nextjs">Next.js</option>
+                  <option value="go">Go</option>
+                  <option value="node">Node.js</option>
+                  <option value="python">Python</option>
+                  <option value="static">Static</option>
+                </select>
+              </div>
+              <div>
+                <label for="appHealthCheck">Health-check path</label>
+                <input id="appHealthCheck" name="health_check_url" placeholder="/health" />
+              </div>
+              <div>
+                <label for="appDescription">Description <span class="am-optional">Optional</span></label>
+                <input id="appDescription" name="description" placeholder="What does this application do?" />
+              </div>
+            </div>
           </div>
-          <button type="submit">Add application</button>
+          <details class="am-advanced">
+            <summary>Advanced build configuration</summary>
+            <div>
+              <label for="appBuildConfig">Build configuration <span class="am-optional">JSON object</span></label>
+              <textarea id="appBuildConfig" name="build_config" rows="5" spellcheck="false" placeholder='{"build_command": "npm run build"}'></textarea>
+              <small class="am-field-hint">Leave blank to use the framework defaults. Add a start command only when automatic detection is not suitable.</small>
+            </div>
+          </details>
+          <div class="am-form-actions">
+            <button type="submit" class="am-button am-button--primary">Add application</button>
+          </div>
         </form>
       </section>
 
-      <section id="deployments" class="tab-panel hidden">
+      <section id="deployments" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-deployments" tabindex="0">
+        <div class="am-section-heading">
+          <div>
+            <p class="am-eyebrow">RELEASE HISTORY</p>
+            <h2>Deployments</h2>
+            <p class="am-section-copy">Review recent releases and roll back to an available version.</p>
+          </div>
+        </div>
         <div id="deploymentHistory"></div>
       </section>
 
-      <section id="settings" class="tab-panel hidden">
+      <section id="settings" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
+        <div class="am-section-heading">
+          <div>
+            <p class="am-eyebrow">CONFIGURATION</p>
+            <h2>Settings</h2>
+            <p class="am-section-copy">Review managed paths and tune deployment behavior.</p>
+          </div>
+        </div>
         <div id="settingsPanel"></div>
       </section>
-    </div>
+    </main>
     <dialog id="appManagerDialog" class="am-dialog" aria-labelledby="appManagerDialogTitle"></dialog>
   </body>
 </html>

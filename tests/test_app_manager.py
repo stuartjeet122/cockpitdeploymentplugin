@@ -400,6 +400,12 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         ):
             self.assertIn(endpoint, frontend)
         self.assertIn('target="_blank" rel="noopener noreferrer"', frontend)
+        self.assertIn('Another operation is still in progress.', frontend)
+        self.assertIn('updateConnection("error", "Could not load data")', frontend)
+        self.assertIn('data-tab-target="add-app"', html)
+        self.assertIn('role="tablist"', html)
+        self.assertIn('type="text" inputmode="url"', html)
+        self.assertIn('autocomplete="url"', html)
 
     def test_generated_service_has_no_network_capability_and_is_hardened(self):
         config = manager._default_config()
@@ -723,6 +729,9 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotRegex(stylesheet, r"url\(\s*['\"]?https?://")
         self.assertIn(".am-app-manager", stylesheet)
         self.assertIn("@media (prefers-color-scheme: dark)", stylesheet)
+        self.assertIn('name="viewport"', cockpit_page)
+        self.assertIn(".am-app-grid", stylesheet)
+        self.assertIn("@media (max-width: 520px)", stylesheet)
         self.assertIn('[[ -f "$APP_DIR/cockpit/app-manager.css" ]]', installer)
         self.assertIn(
             'install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.css" "$PLUGIN_DEST/app-manager.css"',
