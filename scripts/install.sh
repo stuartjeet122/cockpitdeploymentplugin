@@ -20,11 +20,20 @@ require_directory_path() {
   local parent="$path"
   while [[ -n "$parent" && "$parent" == */* ]]; do
     parent="${parent%/*}"
-    [[ -n "$parent" ]] || parent="/"
-    [[ -L "$parent" ]] && fail "Refusing to use a symlink in an installation path: $parent"
-    [[ "$parent" == "/" ]] && break
+    if [[ -z "$parent" ]]; then
+      parent="/"
+    fi
+    if [[ -L "$parent" ]]; then
+      fail "Refusing to use a symlink in an installation path: $parent"
+    fi
+    if [[ "$parent" == "/" ]]; then
+      break
+    fi
   done
-  [[ -L "$path" ]] && fail "Refusing to use a symlink as an installation directory: $path"
+  if [[ -L "$path" ]]; then
+    fail "Refusing to use a symlink as an installation directory: $path"
+  fi
+  return 0
 }
 
 preflight() {
