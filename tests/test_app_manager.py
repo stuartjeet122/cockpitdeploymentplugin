@@ -466,6 +466,11 @@ class InfrastructureConfigurationTests(unittest.TestCase):
                     manager._render_service(app, ["/bin/true"], config),
                     encoding="utf-8",
                 )
+                generated_unit = unit_path.read_text(encoding="utf-8")
+                self.assertIn(
+                    f"WorkingDirectory={paths['current'] / 'app'}",
+                    generated_unit,
+                )
             result = subprocess.run(
                 [analyzer, "verify", str(unit_path)],
                 capture_output=True,
@@ -571,7 +576,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
                 "pid " + str(Path(tmp) / "nginx.pid") + ";\n"
                 "error_log stderr;\n"
                 "events { worker_connections 16; }\n"
-                "http { server { listen 127.0.0.1:8080;\n"
+                "http { access_log off; server { listen 127.0.0.1:8080;\n"
                 + snippet
                 + "\n} }\n",
                 encoding="utf-8",

@@ -1144,7 +1144,7 @@ def _render_service(
         "Type=simple\n"
         f"User={app['service_user']}\n"
         f"Group={app['service_user']}\n"
-        f"WorkingDirectory={_systemd_quote(str(working_directory))}\n"
+        f"WorkingDirectory={working_directory}\n"
         f"ExecStart={exec_start}\n"
         f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
         f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
