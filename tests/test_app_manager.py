@@ -327,9 +327,98 @@ class AppManagerTests(unittest.TestCase):
                 NextJSAdapter().build({"port": 8100}, repo, release, runner=runner, timeout=1)
 
 
+class InfrastructureConfigurationTests(unittest.TestCase):
+    def test_generated_service_has_no_network_capability_and_is_hardened(self):
+        config = manager._default_config()
+        config["production_root"] = "/opt/webapps"
+        config["log_root"] = "/var/log/cockpit-app-manager"
+        config["source_root"] = "/var/lib/cockpit/app-manager/sources"
+        app = {"id": "demo", "service_user": "app-demo", "port": 8100}
+        service = manager._render_service(app, ["/opt/webapps/demo/current/app/server"], config)
+        self.assertIn("User=app-demo", service)
+        self.assertIn("NoNewPrivileges=true", service)
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("ProtectHome=true", service)
+        self.assertIn("PrivateDevices=true", service)
+        self.assertIn("CapabilityBoundingSet=\n", service)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", service)
+        self.assertNotIn("CAP_NET_BIND_SERVICE", service)
+        self.assertNotIn("AmbientCapabilities=", service)
+        paths = manager._app_paths("demo", config)
+        expected_write_paths = "ReadWritePaths=" + " ".join(
+            manager._systemd_quote(str(path))
+            for path in (paths["current"] / "app", paths["home"], paths["config"], paths["logs"])
+        )
+        self.assertIn(expected_write_paths, service)
+
+    def test_nginx_prefix_preserves_nested_api_and_next_asset_paths_and_websocket_headers(self):
+        template = Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
+        rendered = manager._render_nginx_config("demo", 8123, template)
+        self.assertIn("location = /demo", rendered)
+        self.assertIn("return 308 /demo/;", rendered)
+        self.assertIn("location ^~ /demo/", rendered)
+        self.assertIn("proxy_pass http://127.0.0.1:8123;", rendered)
+        self.assertNotIn("rewrite ", rendered)
+        self.assertIn("proxy_set_header Upgrade $http_upgrade;", rendered)
+        self.assertIn("proxy_set_header Connection $http_connection;", rendered)
+
+        for request_path in (
+            "/demo/",
+            "/demo/account/profile",
+            "/demo/api/items?page=1",
+            "/demo/_next/static/chunks/app.js",
+            "/demo/socket.io/?EIO=4&transport=websocket",
+        ):
+            location_prefix = "/demo/"
+            self.assertTrue(request_path.startswith(location_prefix))
+            self.assertIn("proxy_pass http://127.0.0.1:8123;", rendered)
+        self.assertNotIn("proxy_pass http://127.0.0.1:8123/;", rendered)
+        with self.assertRaises(ValueError):
+            manager._render_nginx_config("../outside", 8123, template)
+        with self.assertRaises(ValueError):
+            manager._render_nginx_config("demo", 8080, template)
+
+    def test_installer_uses_exact_file_ownership_and_checks_host_and_installed_imports(self):
+        project = Path(__file__).resolve().parent.parent
+        installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
+        cockpit_page = (project / "cockpit" / "index.html").read_text(encoding="utf-8")
+        self.assertNotRegex(installer, r"\bchown\s+-R\b")
+        self.assertNotIn('chown root:root "$BACKEND_DEST"', installer)
+        self.assertNotIn('chown root:root "$PRODUCTION_ROOT"', installer)
+        self.assertIn("dpkg --compare-versions", installer)
+        self.assertIn("Python 3.9 or newer is required", installer)
+        self.assertIn('python3 "$BACKEND_DEST/app-manager" --help', installer)
+        self.assertIn('"$STATE_ROOT/apps.json" "$STATE_ROOT/config.json"', installer)
+        self.assertIn('chmod 0600 "$STATE_ROOT/apps.json" "$STATE_ROOT/config.json"', installer)
+        self.assertIn('if [[ ! -e "$STATE_ROOT/config.json" ]]', installer)
+        self.assertIn('superuser: "require"', cockpit_page)
+
+
 class UninstallScriptTests(unittest.TestCase):
+    def _write_registry(self, temp_root: Path, app_id: str, production_path=None) -> Path:
+        state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
+        production_root = temp_root / "opt" / "webapps"
+        log_root = temp_root / "var" / "log" / "cockpit-app-manager"
+        app = {
+            "id": app_id,
+            "source_path": str(state_root / "sources" / app_id),
+            "production_path": str(production_path or production_root / app_id),
+            "log_path": str(log_root / app_id),
+        }
+        registry_path = state_root / "apps.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps({"apps": [app]}), encoding="utf-8")
+        return registry_path
+
     def _run_uninstall(self, temp_root: Path, *args: str) -> subprocess.CompletedProcess:
-        env = dict(__import__("os").environ)
+        operating_system = __import__("os")
+        env = dict(operating_system.environ)
+        fake_bin = temp_root / "fake-bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        systemctl = fake_bin / "systemctl"
+        systemctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        systemctl.chmod(0o755)
+        env["PATH"] = str(fake_bin) + operating_system.pathsep + env.get("PATH", "")
         env.update({
             "APP_MANAGER_PLUGIN_DEST": str(temp_root / "usr" / "share" / "cockpit" / "app-manager"),
             "APP_MANAGER_BACKEND_DEST": str(temp_root / "usr" / "libexec" / "cockpit"),
@@ -358,7 +447,7 @@ class UninstallScriptTests(unittest.TestCase):
             config = temp_root / "etc" / "cockpit" / "app-manager"
             config.mkdir(parents=True)
             state_root.mkdir(parents=True)
-            (state_root / "apps.json").write_text('{"apps": [{"id": "demo"}]}', encoding="utf-8")
+            self._write_registry(temp_root, "demo")
             (production_root / "demo").mkdir(parents=True)
             result = self._run_uninstall(temp_root)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
@@ -381,12 +470,19 @@ class UninstallScriptTests(unittest.TestCase):
             (state_root / "sources" / "demo").mkdir(parents=True)
             (state_root / "homes").mkdir(parents=True)
             (state_root / "homes" / "demo").mkdir(parents=True)
-            (state_root / "apps.json").write_text('{"apps": [{"id": "demo"}]}', encoding="utf-8")
+            self._write_registry(temp_root, "demo")
             (production_root / "demo").mkdir(parents=True)
             (production_root / "shared").mkdir(parents=True)
             (log_root / "demo").mkdir(parents=True)
             systemd_dir.mkdir(parents=True)
-            (systemd_dir / "cockpit-app-demo.service").write_text("[Unit]\n", encoding="utf-8")
+            (systemd_dir / "cockpit-app-demo.service").write_text(
+                "[Unit]\nDescription=Cockpit App Manager - demo\n[Service]\nUser=app-demo\n",
+                encoding="utf-8",
+            )
+            (systemd_dir / "cockpit-app-unregistered.service").write_text(
+                "[Unit]\nDescription=Unrelated service\n[Service]\nUser=app-unregistered\n",
+                encoding="utf-8",
+            )
             result = self._run_uninstall(temp_root, "--remove-managed-data", "--yes")
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertFalse((production_root / "demo").exists())
@@ -394,6 +490,42 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertFalse((state_root / "sources" / "demo").exists())
             self.assertFalse((state_root / "apps.json").exists())
             self.assertFalse((systemd_dir / "cockpit-app-demo.service").exists())
+            self.assertTrue((systemd_dir / "cockpit-app-unregistered.service").exists())
+            self.assertTrue((state_root / "sources").exists())
+            self.assertTrue((log_root).exists())
+            self.assertTrue((production_root).exists())
+
+    def test_explicit_cleanup_uses_registered_managed_path_not_same_id_at_default_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            production_root = temp_root / "opt" / "webapps"
+            custom_app = production_root / "custom-root" / "demo"
+            unrelated_app = production_root / "demo"
+            custom_app.mkdir(parents=True)
+            unrelated_app.mkdir(parents=True)
+            self._write_registry(temp_root, "demo", custom_app)
+
+            result = self._run_uninstall(temp_root, "--remove-managed-data", "--yes")
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertFalse(custom_app.exists())
+            self.assertTrue(unrelated_app.exists())
+
+    def test_invalid_registry_ids_abort_destructive_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
+            production_root = temp_root / "opt" / "webapps"
+            state_root.mkdir(parents=True)
+            (state_root / "apps.json").write_text(
+                '{"apps": [{"id": "../../outside"}]}',
+                encoding="utf-8",
+            )
+            (production_root / "outside").mkdir(parents=True)
+            result = self._run_uninstall(temp_root, "--remove-managed-data", "--yes")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((state_root / "apps.json").exists())
+            self.assertTrue((production_root / "outside").exists())
 
     def test_dry_run_does_not_change_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -401,7 +533,7 @@ class UninstallScriptTests(unittest.TestCase):
             state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"
             production_root = temp_root / "opt" / "webapps"
             state_root.mkdir(parents=True)
-            (state_root / "apps.json").write_text('{"apps": [{"id": "demo"}]}', encoding="utf-8")
+            self._write_registry(temp_root, "demo")
             (production_root / "demo").mkdir(parents=True)
             result = self._run_uninstall(temp_root, "--remove-managed-data", "--yes", "--dry-run")
             self.assertEqual(result.returncode, 0, msg=result.stderr)

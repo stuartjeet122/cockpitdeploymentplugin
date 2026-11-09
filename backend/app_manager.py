@@ -78,6 +78,8 @@ def _default_config() -> Dict[str, Any]:
         "health_timeout_seconds": 30,
         "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
         "log_root": DEFAULT_LOG_ROOT,
+        "nginx_template": "/etc/cockpit/app-manager/templates/nginx.conf.tpl",
+        "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl",
     }
 
 
@@ -232,7 +234,9 @@ def ensure_runtime_dirs() -> Dict[str, str]:
     production_root = Path(config["production_root"])
     log_root = Path(config["log_root"])
     for path in (state_root, source_root, production_root, log_root):
-        path.mkdir(parents=True, exist_ok=True, mode=0o700 if path == state_root else 0o755)
+        path.mkdir(parents=True, exist_ok=True, mode=0o711 if path in (state_root, source_root) else 0o755)
+    os.chmod(state_root, 0o711)
+    os.chmod(source_root, 0o711)
     return {
         "source_root": str(source_root),
         "production_root": str(production_root),
@@ -1089,13 +1093,24 @@ def _systemd_quote(argument: str) -> str:
     return '"' + argument.replace("%", "%%").replace("$", "$$").replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _write_service(app: Dict[str, Any], release_dir: Path, start_command: Sequence[str], config: Dict[str, Any]) -> Path:
+def _render_service(
+    app: Dict[str, Any],
+    start_command: Sequence[str],
+    config: Dict[str, Any],
+) -> str:
     if not start_command:
         raise ValueError("Application start command cannot be empty")
     paths = _app_paths(app["id"], config)
     working_directory = paths["current"] / "app"
+    writable_paths = (
+        paths["current"] / "app",
+        paths["home"],
+        paths["config"],
+        paths["logs"],
+    )
+    read_write_paths = " ".join(_systemd_quote(str(path)) for path in writable_paths)
     exec_start = " ".join(_systemd_quote(part) for part in start_command)
-    service = (
+    return (
         "[Unit]\n"
         f"Description=Cockpit App Manager - {app['id']}\n"
         "After=network.target\n\n"
@@ -1115,12 +1130,42 @@ def _write_service(app: Dict[str, Any], release_dir: Path, start_command: Sequen
         f"StandardError=append:{paths['logs'] / 'stderr.log'}\n"
         "NoNewPrivileges=true\n"
         "PrivateTmp=true\n"
+        "PrivateDevices=true\n"
         "ProtectSystem=strict\n"
         "ProtectHome=true\n"
-        f"ReadWritePaths={_systemd_quote(str(paths['config']))} {_systemd_quote(str(paths['logs']))}\n\n"
+        "ProtectKernelTunables=true\n"
+        "ProtectKernelModules=true\n"
+        "ProtectControlGroups=true\n"
+        "LockPersonality=true\n"
+        "RestrictSUIDSGID=true\n"
+        "RestrictRealtime=true\n"
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n"
+        "CapabilityBoundingSet=\n"
+        "UMask=0027\n"
+        f"ReadWritePaths={read_write_paths}\n\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n"
     )
+
+
+def _render_nginx_config(app_id: str, port: int, template_path: Optional[Path] = None) -> str:
+    app_id = validate_app_id(app_id)
+    if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
+        raise ValueError("Nginx upstream port must be an available managed application port")
+    if template_path is None:
+        template_path = Path(get_config()["nginx_template"])
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Could not read Nginx template {template_path}: {exc}") from exc
+    rendered = template.replace("{{ app_slug }}", app_id).replace("{{ app_port }}", str(port))
+    if "{{" in rendered or "}}" in rendered:
+        raise ValueError("Nginx template contains an unresolved placeholder")
+    return rendered
+
+
+def _write_service(app: Dict[str, Any], release_dir: Path, start_command: Sequence[str], config: Dict[str, Any]) -> Path:
+    service = _render_service(app, start_command, config)
     service_path = _service_path(app)
     service_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{service_path.name}.", dir=str(service_path.parent))
@@ -1216,6 +1261,8 @@ def _app_lock(app_id: str) -> contextlib.AbstractContextManager:
 
 def _setup_app_directories(app: Dict[str, Any], username: str, config: Dict[str, Any]) -> Dict[str, Path]:
     paths = _app_paths(app["id"], config)
+    paths["home"].parent.mkdir(parents=True, exist_ok=True, mode=0o711)
+    os.chmod(paths["home"].parent, 0o711)
     for key in ("source", "production", "releases", "config", "logs", "home"):
         paths[key].mkdir(parents=True, exist_ok=True, mode=0o750)
         _chown_tree(paths[key], username)
