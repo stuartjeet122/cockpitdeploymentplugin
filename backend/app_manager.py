@@ -1056,11 +1056,14 @@ def app_metadata(app: Dict[str, Any]) -> Dict[str, Any]:
     if source.is_dir():
         metadata["latest_commit"] = git_output(source, "rev-parse", "HEAD", username=app.get("service_user")) or metadata.get("latest_commit")
     route = validate_app_route(app.get("route"), app["id"])
-    published_route = app.get("active_route") or route
+    active_route = app.get("active_route")
+    if active_route is not None:
+        active_route = validate_app_route(active_route, app["id"])
+    hosting_active = bool(app.get("hosting_active", False) and active_route)
     metadata["route"] = route
-    metadata["hosting_active"] = bool(app.get("hosting_active", False))
-    metadata["active_route"] = app.get("active_route")
-    metadata["public_url"] = _public_url_for_route(published_route)
+    metadata["hosting_active"] = hosting_active
+    metadata["active_route"] = active_route
+    metadata["public_url"] = _public_url_for_route(active_route) if hosting_active else None
     return metadata
 
 
@@ -1399,7 +1402,7 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
             "health_check_url": normalized["health_check_url"],
             "build_config": normalized["build_config"],
             "port": port,
-            "public_url": _public_url_for_route(normalized["route"]),
+            "public_url": None,
             "source_path": str(paths["source"]),
             "production_path": str(paths["production"]),
             "config_path": str(paths["config"]),
@@ -2669,7 +2672,13 @@ def remove_app(app_id: str) -> Dict[str, Any]:
 
 def open_app(app_id: str) -> Dict[str, Any]:
     app = _find_app(get_registry(), app_id)
-    route = app.get("active_route") or validate_app_route(app.get("route"), app_id)
+    route = app.get("active_route")
+    if not app.get("hosting_active") or not route:
+        raise RuntimeError(
+            "Application route is not active in Nginx. Add the App Manager snippets include "
+            "inside the intended site's server block, run nginx -t and reload Nginx, then deploy again."
+        )
+    route = validate_app_route(route, app_id)
     return {"ok": True, "app_id": app_id, "url": _public_url_for_route(route)}
 
 

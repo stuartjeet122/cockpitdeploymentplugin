@@ -20,7 +20,7 @@ The UI requests Cockpit's required superuser mode when launching the backend. Th
 
 The backend stores its registry at `/var/lib/cockpit/app-manager/apps.json` and configuration at `/var/lib/cockpit/app-manager/config.json`. Registry/configuration JSON is atomically replaced and protected by file locks. App environment files are stored outside source and release trees at `/var/lib/cockpit/app-manager/environment/<app-id>.env`, owned by root and readable only by that application's service group. Values are applied by systemd when the application starts; restart or redeploy after editing.
 
-Each application has a configurable single-prefix route such as `/shop/`. On deployment, App Manager writes its own Nginx snippet to `/etc/nginx/snippets/cockpit-app-manager/<app-id>.conf`. It runs `nginx -t` and reloads Nginx only when `nginx -T` confirms the snippet is included in the active configuration. To preserve the existing site configuration, the installer does not edit any server block. Add this one-time include inside the intended site's existing `server {}` block:
+Each application has a configurable single-prefix route such as `/shop/`. On deployment, App Manager writes its own Nginx snippet to `/etc/nginx/snippets/cockpit-app-manager/<app-id>.conf`. It runs `nginx -t` and reloads Nginx only when `nginx -T` confirms the snippet is included in the active configuration. The public URL and Open action are withheld until that activation is confirmed. To preserve the existing site configuration, the installer does not edit any server block. Add this one-time include inside the intended site's existing `server {}` block:
 
 ```nginx
 include /etc/nginx/snippets/cockpit-app-manager/*.conf;

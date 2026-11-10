@@ -98,7 +98,7 @@ class AppManagerTests(unittest.TestCase):
     def test_application_route_is_validated_normalized_and_unique(self):
         created = self.add_app("Public Site", route="/public-site")
         self.assertEqual(created["app"]["route"], "/public-site/")
-        self.assertEqual(created["app"]["public_url"], f"{manager.DEFAULT_PUBLIC_ORIGIN}/public-site/")
+        self.assertIsNone(created["app"]["public_url"])
 
         with self.assertRaisesRegex(ValueError, "already assigned"):
             self.add_app("Other Site", slug="other-site", route="/public-site/")
@@ -133,6 +133,32 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(updated["app"]["active_route"], "/old-route/")
         metadata = manager.list_apps()["apps"][0]
         self.assertEqual(metadata["public_url"], f"{manager.DEFAULT_PUBLIC_ORIGIN}/old-route/")
+
+    def test_public_url_is_withheld_until_the_route_is_active(self):
+        created = self.add_app("Pending Site", route="/pending-site")["app"]
+        metadata = manager.app_metadata(created)
+        self.assertFalse(metadata["hosting_active"])
+        self.assertIsNone(metadata["public_url"])
+
+        with manager._registry_transaction() as registry:
+            app = manager._find_app(registry, created["id"])
+            app["active_route"] = "/pending-site/"
+            app["hosting_active"] = True
+        active = manager.app_metadata(manager.get_registry()["apps"][0])
+        self.assertTrue(active["hosting_active"])
+        self.assertEqual(active["public_url"], f"{manager.DEFAULT_PUBLIC_ORIGIN}/pending-site/")
+
+    def test_open_app_refuses_to_return_a_url_for_an_inactive_nginx_route(self):
+        app = self.add_app("Pending Site", route="/pending-site")["app"]
+        with self.assertRaisesRegex(RuntimeError, "route is not active in Nginx"):
+            manager.open_app(app["id"])
+
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored["active_route"] = stored["route"]
+            stored["hosting_active"] = True
+        result = manager.open_app(app["id"])
+        self.assertEqual(result["url"], f"{manager.DEFAULT_PUBLIC_ORIGIN}/pending-site/")
 
     def test_build_config_rejects_unsafe_application_directory(self):
         for app_directory in ("../outside", "/absolute/path", "apps//web", "apps/./web", "apps\\web"):
@@ -381,7 +407,11 @@ class AppManagerTests(unittest.TestCase):
             manager.open_app("missing")
 
     def test_frontend_action_convention_supports_open(self):
-        self.add_app()
+        app = self.add_app()["app"]
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored["active_route"] = stored["route"]
+            stored["hosting_active"] = True
         result = manager.action("example-site", "open")
         self.assertEqual(result["url"], "https://stuserver.online/example-site/")
 
