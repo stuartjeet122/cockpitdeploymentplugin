@@ -215,7 +215,7 @@
         ? "Active"
         : routeIsActive
           ? `Change pending (currently live: ${app.active_route})`
-          : "Nginx include required";
+          : "Deploy to activate";
       const appInitial = String(app.name || "A").trim().charAt(0).toUpperCase() || "A";
       return `
         <article class="am-app-card">
@@ -248,7 +248,7 @@
             <button type="button" class="am-button" data-action="logs" data-id="${escapeHtml(app.id)}">Logs</button>
             <button type="button" class="am-button am-button--danger" data-action="remove" data-id="${escapeHtml(app.id)}">Remove</button>
           </div>
-          ${routeIsActive ? "" : `<p class="am-field-hint" role="note">To activate this route, add <code>include /etc/nginx/snippets/cockpit-app-manager/*.conf;</code> inside the intended site's Nginx server block, run <code>sudo nginx -t &amp;&amp; sudo systemctl reload nginx</code>, then deploy this application again.</p>`}
+          ${routeIsActive ? "" : `<p class="am-field-hint" role="note">Deploy will add the managed route include to the matching HTTPS site, validate Nginx, and reload it. If the site is ambiguous or invalid, the deployment reports the error and restores its configuration.</p>`}
         </article>
       `;
     }).join("");

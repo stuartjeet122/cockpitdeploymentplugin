@@ -1239,6 +1239,14 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
 
 
 class InfrastructureConfigurationTests(unittest.TestCase):
+    def _nginx_site_fixture(self, root: Path, contents: str) -> tuple[Path, Path, str]:
+        config_root = root / "etc" / "nginx"
+        site_path = config_root / "sites-available" / "stuserver"
+        site_path.parent.mkdir(parents=True)
+        site_path.write_text(contents, encoding="utf-8")
+        listing = f"# configuration file {site_path}:\n{contents}"
+        return config_root, site_path, listing
+
     def test_cockpit_manifest_registers_menu_entry_and_installed_assets(self):
         project = Path(__file__).resolve().parent.parent
         cockpit_dir = project / "cockpit"
@@ -1639,56 +1647,127 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("proxy_redirect / /customer-portal/;", config)
         self.assertNotIn("/website1/", config)
 
-    def test_nginx_snippet_is_staged_until_managed_site_include_is_active(self):
+    def test_nginx_deploy_adds_managed_include_to_matching_https_server(self):
         with tempfile.TemporaryDirectory() as tmp:
-            snippet_root = Path(tmp) / "nginx" / "snippets" / "cockpit-app-manager"
+            root = Path(tmp)
+            snippet_root = root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
             config = manager._default_config()
             config["nginx_template"] = (
                 Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
             )
-            app = {"id": "demo", "port": 8123, "route": "/customer-portal/"}
-            result = subprocess.CompletedProcess(
-                args=["nginx", "-T"],
-                returncode=0,
-                stdout="# active Nginx configuration\n",
-                stderr="",
+            config_root, site_path, listing = self._nginx_site_fixture(
+                root,
+                "server {\n    listen 443 ssl;\n    server_name stuserver.online;\n    location / { proxy_pass http://127.0.0.1:8080; }\n}\n",
             )
-            with patch.object(manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)), patch.object(
-                manager, "run_command", return_value=result
-            ) as run:
+            app = {"id": "demo", "port": 8123, "route": "/customer-portal/"}
+            valid = subprocess.CompletedProcess(args=["nginx", "-t"], returncode=0, stdout="", stderr="")
+
+            def run(args, **kwargs):
+                if args == ["nginx", "-T"]:
+                    site_contents = site_path.read_text(encoding="utf-8")
+                    output = f"# configuration file {site_path}:\n{site_contents}"
+                    snippet = snippet_root / "demo.conf"
+                    if "include /etc/nginx/snippets/cockpit-app-manager/*.conf;" in site_contents:
+                        output += f"\n# configuration file {snippet}:\n{snippet.read_text(encoding='utf-8')}"
+                    return subprocess.CompletedProcess(args=args, returncode=0, stdout=output, stderr="")
+                return valid
+
+            with patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)), patch.object(
+                manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)
+            ), patch.object(manager, "run_command", side_effect=run) as run_command, patch.object(
+                manager, "DEFAULT_STATE_ROOT", str(root / "state")
+            ), patch.object(manager, "_systemctl") as systemctl:
                 activation = manager._activate_nginx_config(app, "node", config)
 
             snippet = snippet_root / "demo.conf"
             self.assertTrue(snippet.is_file())
             self.assertIn("location ^~ /customer-portal/ {", snippet.read_text(encoding="utf-8"))
-            self.assertFalse(activation["active"])
-            self.assertIn("not included", activation["message"])
-            self.assertEqual(run.call_args.args[0], ["nginx", "-T"])
+            site_contents = site_path.read_text(encoding="utf-8")
+            self.assertIn("server_name stuserver.online;", site_contents)
+            self.assertIn("location / { proxy_pass http://127.0.0.1:8080; }", site_contents)
+            self.assertIn("include /etc/nginx/snippets/cockpit-app-manager/*.conf;", site_contents)
+            self.assertTrue(activation["active"])
+            self.assertIn("Added the managed include", activation["message"])
+            self.assertEqual([call.args[0] for call in run_command.call_args_list], [
+                ["nginx", "-T"], ["nginx", "-t"], ["nginx", "-T"],
+            ])
+            systemctl.assert_called_once_with(
+                "reload",
+                "nginx",
+                timeout=config["command_timeout_seconds"],
+            )
+            backup = next((root / "state" / "nginx-backups").glob("*.before-app-manager"))
+            self.assertIn("server_name stuserver.online;", backup.read_text(encoding="utf-8"))
+
+    def test_nginx_site_include_targets_https_server_not_http_redirect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_root, site_path, listing = self._nginx_site_fixture(
+                root,
+                "server {\n    listen 80;\n    server_name stuserver.online;\n    return 301 https://$host$request_uri;\n}\n"
+                "server {\n    listen 443 ssl;\n    server_name stuserver.online;\n    location / { proxy_pass http://127.0.0.1:8080; }\n}\n",
+            )
+            with patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)), patch.object(
+                manager, "DEFAULT_NGINX_SNIPPET_DIR", str(config_root / "snippets" / "cockpit-app-manager")
+            ), patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")):
+                updated_path, old_source = manager._ensure_nginx_site_include(listing)
+
+            self.assertEqual(updated_path, site_path.resolve())
+            self.assertIsNotNone(old_source)
+            contents = site_path.read_text(encoding="utf-8")
+            http_block, https_block = contents.split("server {", 2)[1:]
+            self.assertNotIn(manager.NGINX_MANAGED_INCLUDE, http_block.split("}", 1)[0])
+            self.assertIn(manager.NGINX_MANAGED_INCLUDE, https_block.split("}", 1)[0])
+
+    def test_nginx_site_include_refuses_ambiguous_matching_https_servers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_root, site_path, _ = self._nginx_site_fixture(
+                root,
+                "server { listen 443 ssl; server_name stuserver.online; }\n"
+                "server { listen 443 ssl; server_name stuserver.online; }\n",
+            )
+            listing = f"# configuration file {site_path}:\n{site_path.read_text(encoding='utf-8')}"
+            with patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)):
+                with self.assertRaisesRegex(RuntimeError, "multiple Nginx server blocks"):
+                    manager._ensure_nginx_site_include(listing)
+            self.assertNotIn(manager.NGINX_MANAGED_INCLUDE, site_path.read_text(encoding="utf-8"))
 
     def test_nginx_snippet_activation_tests_and_reloads_only_managed_config(self):
         with tempfile.TemporaryDirectory() as tmp:
-            snippet_root = Path(tmp) / "nginx" / "snippets" / "cockpit-app-manager"
+            root = Path(tmp)
+            snippet_root = root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
             snippet_path = snippet_root / "demo.conf"
             config = manager._default_config()
             config["nginx_template"] = (
                 Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
             )
-            app = {"id": "demo", "port": 8123, "route": "/customer-portal/"}
-            listing = subprocess.CompletedProcess(
-                args=["nginx", "-T"],
-                returncode=0,
-                stdout=f"# configuration file {snippet_path.resolve(strict=False)}:\n",
-                stderr="",
+            config_root, site_path, listing = self._nginx_site_fixture(
+                root,
+                "server {\n    listen 443 ssl;\n    server_name stuserver.online;\n}\n",
             )
-            test = subprocess.CompletedProcess(args=["nginx", "-t"], returncode=0, stdout="", stderr="")
+            app = {"id": "demo", "port": 8123, "route": "/customer-portal/"}
+
+            def run(args, **kwargs):
+                if args == ["nginx", "-T"]:
+                    site_contents = site_path.read_text(encoding="utf-8")
+                    output = f"# configuration file {site_path}:\n{site_contents}"
+                    if "include /etc/nginx/snippets/cockpit-app-manager/*.conf;" in site_contents:
+                        output += f"\n# configuration file {snippet_path}:\n{snippet_path.read_text(encoding='utf-8')}"
+                    return subprocess.CompletedProcess(args=args, returncode=0, stdout=output, stderr="")
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
             with patch.object(manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)), patch.object(
-                manager, "run_command", side_effect=[listing, test]
+                manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)
+            ), patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")), patch.object(
+                manager, "run_command", side_effect=run
             ) as run, patch.object(manager, "_systemctl") as systemctl:
                 activation = manager._activate_nginx_config(app, "node", config)
 
             self.assertTrue(activation["active"])
-            self.assertEqual(run.call_args_list[0].args[0], ["nginx", "-T"])
-            self.assertEqual(run.call_args_list[1].args[0], ["nginx", "-t"])
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ["nginx", "-T"], ["nginx", "-t"], ["nginx", "-T"],
+            ])
             systemctl.assert_called_once_with(
                 "reload",
                 "nginx",
@@ -1697,7 +1776,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
 
     def test_nginx_syntax_failure_restores_previous_app_snippet(self):
         with tempfile.TemporaryDirectory() as tmp:
-            snippet_root = Path(tmp) / "nginx" / "snippets" / "cockpit-app-manager"
+            root = Path(tmp)
+            snippet_root = root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
             snippet_root.mkdir(parents=True)
             snippet_path = snippet_root / "demo.conf"
             previous = b"# Managed by Cockpit App Manager: demo\nlocation /old/ {}\n"
@@ -1706,28 +1786,79 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             config["nginx_template"] = (
                 Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
             )
-            app = {"id": "demo", "port": 8123, "route": "/new/"}
-            listing = subprocess.CompletedProcess(
-                args=["nginx", "-T"],
-                returncode=0,
-                stdout=f"# configuration file {snippet_path.resolve(strict=False)}:\n",
-                stderr="",
+            config_root, site_path, listing = self._nginx_site_fixture(
+                root,
+                "server {\n    listen 443 ssl;\n    server_name stuserver.online;\n}\n",
             )
+            previous_site = site_path.read_bytes()
+            app = {"id": "demo", "port": 8123, "route": "/new/"}
             invalid = subprocess.CompletedProcess(
                 args=["nginx", "-t"],
                 returncode=1,
                 stdout="",
                 stderr="invalid location",
             )
-            with patch.object(manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)), patch.object(
-                manager, "run_command", side_effect=[listing, invalid]
-            ), patch.object(manager, "_systemctl") as systemctl:
-                activation = manager._activate_nginx_config(app, "node", config)
+            def run(args, **kwargs):
+                if args == ["nginx", "-T"]:
+                    return subprocess.CompletedProcess(
+                        args=args,
+                        returncode=0,
+                        stdout=f"# configuration file {site_path}:\n{site_path.read_text(encoding='utf-8')}",
+                        stderr="",
+                    )
+                return invalid
 
-            self.assertFalse(activation["active"])
-            self.assertIn("invalid location", activation["message"])
+            with patch.object(manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)), patch.object(
+                manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)
+            ), patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")), patch.object(
+                manager, "run_command", side_effect=run
+            ), patch.object(manager, "_systemctl") as systemctl:
+                with self.assertRaisesRegex(RuntimeError, "invalid location"):
+                    manager._activate_nginx_config(app, "node", config)
+
             self.assertEqual(snippet_path.read_bytes(), previous)
+            self.assertEqual(site_path.read_bytes(), previous_site)
             systemctl.assert_not_called()
+
+    def test_nginx_reload_failure_restores_managed_include_and_snippet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snippet_root = root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
+            config_root, site_path, _ = self._nginx_site_fixture(
+                root,
+                "server { listen 443 ssl; server_name stuserver.online; }\n",
+            )
+            previous_site = site_path.read_bytes()
+            snippet_path = snippet_root / "demo.conf"
+            previous_snippet = b"# Managed by Cockpit App Manager: demo\nlocation /old/ {}\n"
+            snippet_root.mkdir(parents=True)
+            snippet_path.write_bytes(previous_snippet)
+            config = manager._default_config()
+            config["nginx_template"] = (
+                Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
+            )
+
+            def run(args, **kwargs):
+                if args == ["nginx", "-T"]:
+                    site_contents = site_path.read_text(encoding="utf-8")
+                    output = f"# configuration file {site_path}:\n{site_contents}"
+                    if manager.NGINX_MANAGED_INCLUDE in site_contents:
+                        output += f"\n# configuration file {snippet_path}:\n{snippet_path.read_text(encoding='utf-8')}"
+                    return subprocess.CompletedProcess(args=args, returncode=0, stdout=output, stderr="")
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+            with patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)), patch.object(
+                manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)
+            ), patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")), patch.object(
+                manager, "run_command", side_effect=run
+            ), patch.object(manager, "_systemctl", side_effect=RuntimeError("reload failed")):
+                with self.assertRaisesRegex(RuntimeError, "reload failed"):
+                    manager._activate_nginx_config(
+                        {"id": "demo", "port": 8123, "route": "/demo/"}, "node", config
+                    )
+
+            self.assertEqual(site_path.read_bytes(), previous_site)
+            self.assertEqual(snippet_path.read_bytes(), previous_snippet)
 
     def test_removing_app_deactivates_only_its_active_nginx_snippet(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1859,11 +1990,10 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("A single URL prefix on the existing site", cockpit_page)
         self.assertTrue((cockpit_dir / "app-manager.js").is_file())
         frontend = (cockpit_dir / "app-manager.js").read_text(encoding="utf-8")
-        self.assertIn("Nginx include required", frontend)
+        self.assertIn("Deploy to activate", frontend)
         self.assertIn("const routeIsActive = Boolean(app.hosting_active && app.active_route);", frontend)
         self.assertIn("safeUrl && routeIsActive", frontend)
-        self.assertIn("include /etc/nginx/snippets/cockpit-app-manager/*.conf;", frontend)
-        self.assertIn("then deploy this application again.", frontend)
+        self.assertIn("Deploy will add the managed route include", frontend)
         self.assertNotIn("@import", stylesheet)
         self.assertNotRegex(stylesheet, r"url\(\s*['\"]?https?://")
         self.assertIn(".am-app-manager", stylesheet)

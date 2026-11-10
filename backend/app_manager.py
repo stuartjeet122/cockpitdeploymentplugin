@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,8 @@ DEFAULT_PRODUCTION_ROOT = "/opt/webapps"
 DEFAULT_SOURCE_ROOT = f"{DEFAULT_STATE_ROOT}/sources"
 DEFAULT_LOG_ROOT = "/var/log/cockpit-app-manager"
 DEFAULT_NGINX_SNIPPET_DIR = "/etc/nginx/snippets/cockpit-app-manager"
+DEFAULT_NGINX_CONFIG_ROOT = "/etc/nginx"
+NGINX_MANAGED_INCLUDE = f"include {DEFAULT_NGINX_SNIPPET_DIR}/*.conf;"
 DEFAULT_PUBLIC_ORIGIN = "https://stuserver.online"
 DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
 PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
@@ -1955,7 +1958,245 @@ def _restore_nginx_snippet(path: Path, previous_content: Optional[bytes]) -> Non
         raise
 
 
+def _nginx_tokens(source: str) -> List[Tuple[str, int, int]]:
+    tokens: List[Tuple[str, int, int]] = []
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if character.isspace():
+            index += 1
+            continue
+        if character == "#":
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline + 1
+            continue
+        if character in "{};":
+            tokens.append((character, index, index + 1))
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            start = index
+            index += 1
+            value: List[str] = []
+            while index < len(source) and source[index] != quote:
+                if source[index] == "\\" and index + 1 < len(source):
+                    index += 1
+                value.append(source[index])
+                index += 1
+            if index >= len(source):
+                raise ValueError("Nginx configuration contains an unterminated quoted string")
+            index += 1
+            tokens.append(("".join(value), start, index))
+            continue
+        start = index
+        while index < len(source) and not source[index].isspace() and source[index] not in "{};#":
+            index += 1
+        tokens.append((source[start:index], start, index))
+    return tokens
+
+
+def _nginx_server_blocks(source: str) -> List[Dict[str, Any]]:
+    tokens = _nginx_tokens(source)
+    blocks: List[Dict[str, Any]] = []
+    for index, token in enumerate(tokens[:-1]):
+        if token[0] != "server" or tokens[index + 1][0] != "{":
+            continue
+        depth = 1
+        statement: List[str] = []
+        directives: List[Tuple[str, List[str]]] = []
+        cursor = index + 2
+        closing_index = None
+        while cursor < len(tokens):
+            value = tokens[cursor][0]
+            if value == "{":
+                depth += 1
+                statement.clear()
+            elif value == "}":
+                depth -= 1
+                if depth == 0:
+                    closing_index = cursor
+                    break
+                if depth == 1:
+                    statement.clear()
+            elif depth == 1 and value == ";":
+                if statement:
+                    directives.append((statement[0], statement[1:]))
+                statement = []
+            elif depth == 1:
+                statement.append(value)
+            cursor += 1
+        if closing_index is None:
+            raise ValueError("Nginx configuration contains an unterminated server block")
+        blocks.append({
+            "open_end": tokens[index + 1][2],
+            "close_start": tokens[closing_index][1],
+            "directives": directives,
+        })
+    return blocks
+
+
+def _nginx_config_sections(output: str) -> List[Tuple[Path, str]]:
+    sections: List[Tuple[Path, str]] = []
+    current_path: Optional[Path] = None
+    current_lines: List[str] = []
+    header = re.compile(r"^# configuration file (.+):\s*$")
+    for line in output.splitlines(keepends=True):
+        match = header.match(line.rstrip("\r\n"))
+        if match:
+            if current_path is not None:
+                sections.append((current_path, "".join(current_lines)))
+            current_path = Path(match.group(1))
+            current_lines = []
+        elif current_path is not None:
+            current_lines.append(line)
+    if current_path is not None:
+        sections.append((current_path, "".join(current_lines)))
+    return sections
+
+
+def _select_nginx_site_server(output: str, hostname: str) -> Tuple[Path, str, Dict[str, Any]]:
+    matches: List[Tuple[Path, str, Dict[str, Any], bool]] = []
+    config_root = Path(DEFAULT_NGINX_CONFIG_ROOT).resolve(strict=False)
+    for listed_path, source in _nginx_config_sections(output):
+        try:
+            resolved_path = listed_path.resolve(strict=True)
+            resolved_path.relative_to(config_root)
+        except (OSError, ValueError):
+            continue
+        if not resolved_path.is_file():
+            continue
+        for block in _nginx_server_blocks(source):
+            directives = block["directives"]
+            names = [
+                name
+                for directive, values in directives
+                if directive == "server_name"
+                for name in values
+            ]
+            if hostname not in names:
+                continue
+            listeners = [
+                values
+                for directive, values in directives
+                if directive == "listen"
+            ]
+            is_https = any(
+                "ssl" in values
+                or any(re.search(r":443$", value) or value == "443" for value in values)
+                for values in listeners
+            )
+            matches.append((resolved_path, source, block, is_https))
+    https_matches = [item for item in matches if item[3]]
+    candidates = https_matches or matches
+    unique = {(path, block["open_end"]): (path, source, block) for path, source, block, _ in candidates}
+    if len(unique) != 1:
+        if not unique:
+            raise RuntimeError(
+                f"Could not find an Nginx server block with the exact server_name {hostname!r}; "
+                "no site configuration was changed."
+            )
+        raise RuntimeError(
+            f"Found multiple Nginx server blocks for {hostname!r}; refusing to modify an ambiguous site configuration."
+        )
+    return next(iter(unique.values()))
+
+
+def _write_nginx_site_file(path: Path, source: str) -> None:
+    _assert_no_symlink_components(path.parent)
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Refusing to edit a non-regular Nginx site configuration: {path}")
+    metadata = path.stat()
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.app-manager.", dir=str(path.parent))
+    temporary_path = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode))
+        if hasattr(os, "fchown") and os.name != "nt":
+            os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(source)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary_path), str(path))
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+        raise
+
+
+def _backup_nginx_site_file(path: Path, contents: bytes) -> Path:
+    backup_root = Path(DEFAULT_STATE_ROOT) / "nginx-backups"
+    if backup_root.is_symlink():
+        raise RuntimeError("Nginx backup directory must not be a symlink")
+    backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(backup_root, 0o700)
+    digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    backup_path = backup_root / f"{path.name}.{digest}.before-app-manager"
+    if backup_path.exists() or backup_path.is_symlink():
+        if backup_path.is_symlink() or not backup_path.is_file():
+            raise RuntimeError("Existing Nginx site backup is not a regular file")
+        return backup_path
+    descriptor = os.open(
+        str(backup_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(contents)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return backup_path
+
+
+def _ensure_nginx_site_include(output: str) -> Tuple[Path, Optional[str]]:
+    hostname = urlsplit(DEFAULT_PUBLIC_ORIGIN).hostname
+    if not hostname:
+        raise RuntimeError("App Manager public origin does not contain a valid hostname")
+    site_path, source, block = _select_nginx_site_server(output, hostname)
+    wanted = NGINX_MANAGED_INCLUDE
+    if any(
+        directive == "include"
+        and len(values) == 1
+        and values[0] == f"{DEFAULT_NGINX_SNIPPET_DIR}/*.conf"
+        for directive, values in block["directives"]
+    ):
+        return site_path, None
+    original_bytes = site_path.read_bytes()
+    current_source = original_bytes.decode("utf-8")
+    _, _, current_block = _select_nginx_site_server(
+        f"# configuration file {site_path}:\n{current_source}",
+        hostname,
+    )
+    if any(
+        directive == "include"
+        and len(values) == 1
+        and values[0] == f"{DEFAULT_NGINX_SNIPPET_DIR}/*.conf"
+        for directive, values in current_block["directives"]
+    ):
+        return site_path, None
+    insert_at = current_block["open_end"]
+    newline = "\r\n" if "\r\n" in current_source else "\n"
+    addition = (
+        f"{newline}    # Managed by Cockpit App Manager{newline}"
+        f"    {wanted}{newline}"
+    )
+    updated_source = current_source[:insert_at] + addition + current_source[insert_at:]
+    _backup_nginx_site_file(site_path, original_bytes)
+    _write_nginx_site_file(site_path, updated_source)
+    return site_path, current_source
+
+
 def _activate_nginx_config(
+    app: Dict[str, Any],
+    framework: str,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    with _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / "nginx.lock"):
+        return _activate_nginx_config_locked(app, framework, config)
+
+
+def _activate_nginx_config_locked(
     app: Dict[str, Any],
     framework: str,
     config: Dict[str, Any],
@@ -1970,60 +2211,58 @@ def _activate_nginx_config(
         route=app.get("route"),
     )
     previous_content = _write_nginx_snippet(snippet_path, rendered)
+    site_path: Optional[Path] = None
+    previous_site_source: Optional[str] = None
     try:
         config_listing = run_command(["nginx", "-T"], timeout=int(config["command_timeout_seconds"]))
-    except Exception as exc:
-        _restore_nginx_snippet(snippet_path, previous_content)
-        return {
-            "active": False,
-            "route": app.get("route"),
-            "config_path": str(snippet_path),
-            "message": f"Nginx could not inspect its active configuration; the previous snippet was restored. {exc}",
-        }
-    config_output = (config_listing.stdout or "") + "\n" + (config_listing.stderr or "")
-    snippet_marker = f"# configuration file {snippet_path.resolve(strict=False)}:"
-    if config_listing.returncode != 0:
-        _restore_nginx_snippet(snippet_path, previous_content)
-        detail = (config_listing.stderr or config_listing.stdout or "").strip()[-2000:]
-        return {
-            "active": False,
-            "route": app.get("route"),
-            "config_path": str(snippet_path),
-            "message": f"Nginx could not inspect its active configuration; the previous snippet was restored. {detail}".strip(),
-        }
-    if snippet_marker not in config_output:
-        return {
-            "active": False,
-            "route": app.get("route"),
-            "config_path": str(snippet_path),
-            "message": (
-                f"The Nginx snippet is staged at {snippet_path} but is not included in the site configuration. "
-                f"Add `include {DEFAULT_NGINX_SNIPPET_DIR}/*.conf;` inside the intended site's server block, "
-                "then validate and reload Nginx."
-            ),
-        }
-
-    try:
+        _command_error(config_listing, "nginx -T")
+        site_path, previous_site_source = _ensure_nginx_site_include(
+            (config_listing.stdout or "") + "\n" + (config_listing.stderr or "")
+        )
         test_result = run_command(["nginx", "-t"], timeout=int(config["command_timeout_seconds"]))
         _command_error(test_result, "nginx -t")
+        verification = run_command(["nginx", "-T"], timeout=int(config["command_timeout_seconds"]))
+        _command_error(verification, "nginx -T after managed include")
+        snippet_marker = f"# configuration file {snippet_path.resolve(strict=False)}:"
+        if snippet_marker not in ((verification.stdout or "") + "\n" + (verification.stderr or "")):
+            raise RuntimeError(
+                f"Nginx did not load the generated application snippet {snippet_path}"
+            )
         _systemctl("reload", "nginx", timeout=int(config["command_timeout_seconds"]))
     except Exception as exc:
-        _restore_nginx_snippet(snippet_path, previous_content)
-        return {
-            "active": False,
-            "route": app.get("route"),
-            "config_path": str(snippet_path),
-            "message": f"Nginx activation failed; the previous snippet was restored. {exc}",
-        }
+        rollback_errors: List[str] = []
+        if site_path is not None and previous_site_source is not None:
+            try:
+                _write_nginx_site_file(site_path, previous_site_source)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"site configuration restore failed: {rollback_exc}")
+        try:
+            _restore_nginx_snippet(snippet_path, previous_content)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"snippet restore failed: {rollback_exc}")
+        rollback_detail = f"; {'; '.join(rollback_errors)}" if rollback_errors else ""
+        raise RuntimeError(
+            f"Nginx route activation failed: {exc}{rollback_detail}"
+        ) from exc
     return {
         "active": True,
         "route": app.get("route"),
         "config_path": str(snippet_path),
-        "message": f"Nginx is serving {app.get('route')} from the managed application configuration.",
+        "message": (
+            f"Nginx is serving {app.get('route')} from the managed application configuration. "
+            f"Added the managed include to {site_path}."
+            if previous_site_source is not None
+            else f"Nginx is serving {app.get('route')} from the managed application configuration."
+        ),
     }
 
 
 def _remove_nginx_config(app_id: str, config: Dict[str, Any]) -> None:
+    with _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / "nginx.lock"):
+        _remove_nginx_config_locked(app_id, config)
+
+
+def _remove_nginx_config_locked(app_id: str, config: Dict[str, Any]) -> None:
     snippet_path = _nginx_snippet_path(app_id)
     if not snippet_path.exists() and not snippet_path.is_symlink():
         return

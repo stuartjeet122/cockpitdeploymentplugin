@@ -20,13 +20,13 @@ The UI requests Cockpit's required superuser mode when launching the backend. Th
 
 The backend stores its registry at `/var/lib/cockpit/app-manager/apps.json` and configuration at `/var/lib/cockpit/app-manager/config.json`. Registry/configuration JSON is atomically replaced and protected by file locks. App environment files are stored outside source and release trees at `/var/lib/cockpit/app-manager/environment/<app-id>.env`, owned by root and readable only by that application's service group. Values are applied by systemd when the application starts; restart or redeploy after editing.
 
-Each application has a configurable single-prefix route such as `/shop/`. On deployment, App Manager writes its own Nginx snippet to `/etc/nginx/snippets/cockpit-app-manager/<app-id>.conf`. It runs `nginx -t` and reloads Nginx only when `nginx -T` confirms the snippet is included in the active configuration. The public URL and Open action are withheld until that activation is confirmed. To preserve the existing site configuration, the installer does not edit any server block. Add this one-time include inside the intended site's existing `server {}` block:
+Each application has a configurable single-prefix route such as `/shop/`. When Deploy is clicked, App Manager writes its Nginx snippet to `/etc/nginx/snippets/cockpit-app-manager/<app-id>.conf` and adds a marked include to the unique HTTPS `server` block whose `server_name` exactly matches `stuserver.online`. It selects the block from `nginx -T`, saves a private pre-change backup under `/var/lib/cockpit/app-manager/nginx-backups`, runs `nginx -t`, verifies the generated snippet is loaded, and reloads Nginx. If the matching server block is missing or ambiguous, or validation/reload fails, deployment reports the error and restores the edited configuration and snippet. No other virtual host or root-site directives are changed. The public URL and Open action are withheld until route activation succeeds.
 
 ```nginx
 include /etc/nginx/snippets/cockpit-app-manager/*.conf;
 ```
 
-Then activate that site edit yourself with `sudo nginx -t && sudo systemctl reload nginx`. Until the include is present, deployment succeeds but App Manager reports that the route snippet is staged and not live. Removing an application removes only its verified App Manager snippet and reloads Nginx if that snippet was active.
+App Manager does not create a new virtual host or change Cloudflare Tunnel settings. Removing an application removes only its verified App Manager snippet and reloads Nginx if that snippet was active; the managed include remains harmlessly in the site's server block for future deployments.
 
 ## Uninstall
 
@@ -36,7 +36,7 @@ Use the uninstall helper to remove App Manager safely without disturbing the exi
 sudo bash ./scripts/uninstall.sh
 ```
 
-Default behavior removes only verified App Manager Cockpit plugin, backend, and template files. Unknown files and non-empty shared directories are preserved. It also preserves application source repositories, production deployments under `/opt/webapps`, and the existing server infrastructure.
+Default behavior removes only verified App Manager Cockpit plugin, backend, and template files. Unknown files and non-empty shared directories are preserved. It also preserves application source repositories, production deployments under `/opt/webapps`, and the existing server infrastructure. The managed include line and its private pre-change backup are retained; removing those shared site integration files is an explicit manual administrator action.
 
 For full destructive removal, use the explicit cleanup path. It removes only registry-identified app data, verified dedicated `app-<id>` accounts, positively marked App Manager service units, and positively marked snippets that are not referenced by active Nginx configuration. Unverified or active snippets block cleanup of that app and its account/service; Nginx configuration is never edited:
 
