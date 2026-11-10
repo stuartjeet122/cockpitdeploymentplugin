@@ -204,16 +204,17 @@
 
     const cards = state.apps.map((app) => {
       const safeUrl = getSafePublicUrl(app.public_url);
-      const openControl = safeUrl
+      const routeIsActive = Boolean(app.hosting_active && app.active_route);
+      const openControl = safeUrl && routeIsActive
         ? `<a class="am-button am-app-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Open application</a>`
-        : "";
+        : `<span class="am-field-hint">Application route is not active yet</span>`;
       const serviceControl = app.status === "running"
         ? `<button type="button" class="am-button" data-action="stop" data-id="${escapeHtml(app.id)}" title="Stop ${escapeHtml(app.name)}">Stop</button>`
         : `<button type="button" class="am-button" data-action="start" data-id="${escapeHtml(app.id)}" title="Start ${escapeHtml(app.name)}">Start</button>`;
-      const routeStatus = app.hosting_active && app.active_route === app.route
+      const routeStatus = routeIsActive && app.active_route === app.route
         ? "Active"
-        : app.active_route
-          ? "Pending deployment"
+        : routeIsActive
+          ? `Change pending (currently live: ${app.active_route})`
           : "Nginx include required";
       const appInitial = String(app.name || "A").trim().charAt(0).toUpperCase() || "A";
       return `
@@ -232,7 +233,7 @@
             <div><dt>Port</dt><dd>${escapeHtml(app.port || "—")}</dd></div>
             <div><dt>Last deployed</dt><dd>${escapeHtml(app.last_deploy || "Not yet deployed")}</dd></div>
             <div><dt>Latest commit</dt><dd title="${escapeHtml(app.latest_commit || "No commit yet")}">${escapeHtml(app.latest_commit || "—")}</dd></div>
-            <div><dt>Public URL</dt><dd>${safeUrl ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(app.public_url)}</a>` : escapeHtml(app.public_url || "Not available")}</dd></div>
+            <div><dt>Public URL</dt><dd>${safeUrl && routeIsActive ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(app.public_url)}</a>` : escapeHtml(app.public_url || "Not available")}</dd></div>
             <div><dt>Hosted route</dt><dd>${escapeHtml(app.route || `/${app.id}/`)} · ${escapeHtml(routeStatus)}</dd></div>
           </dl>
           <div class="am-app-actions" aria-label="Actions for ${escapeHtml(app.name)}">
@@ -247,6 +248,7 @@
             <button type="button" class="am-button" data-action="logs" data-id="${escapeHtml(app.id)}">Logs</button>
             <button type="button" class="am-button am-button--danger" data-action="remove" data-id="${escapeHtml(app.id)}">Remove</button>
           </div>
+          ${routeIsActive ? "" : `<p class="am-field-hint" role="note">To activate this route, add <code>include /etc/nginx/snippets/cockpit-app-manager/*.conf;</code> inside the intended site's Nginx server block, run <code>sudo nginx -t &amp;&amp; sudo systemctl reload nginx</code>, then deploy this application again.</p>`}
         </article>
       `;
     }).join("");
