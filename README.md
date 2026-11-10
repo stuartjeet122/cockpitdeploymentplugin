@@ -20,6 +20,14 @@ The UI requests Cockpit's required superuser mode when launching the backend. Th
 
 The backend stores its registry at `/var/lib/cockpit/app-manager/apps.json` and configuration at `/var/lib/cockpit/app-manager/config.json`. Registry/configuration JSON is atomically replaced and protected by file locks. App environment files are stored outside source and release trees at `/var/lib/cockpit/app-manager/environment/<app-id>.env`, owned by root and readable only by that application's service group. Values are applied by systemd when the application starts; restart or redeploy after editing.
 
+Each application has a configurable single-prefix route such as `/shop/`. On deployment, App Manager writes its own Nginx snippet to `/etc/nginx/snippets/cockpit-app-manager/<app-id>.conf`. It runs `nginx -t` and reloads Nginx only when `nginx -T` confirms the snippet is included in the active configuration. To preserve the existing site configuration, the installer does not edit any server block. Add this one-time include inside the intended site's existing `server {}` block:
+
+```nginx
+include /etc/nginx/snippets/cockpit-app-manager/*.conf;
+```
+
+Then activate that site edit yourself with `sudo nginx -t && sudo systemctl reload nginx`. Until the include is present, deployment succeeds but App Manager reports that the route snippet is staged and not live. Removing an application removes only its verified App Manager snippet and reloads Nginx if that snippet was active.
+
 ## Uninstall
 
 Use the uninstall helper to remove App Manager safely without disturbing the existing Nginx configuration, Cloudflare Tunnel, or the root website.
@@ -70,8 +78,8 @@ Project conventions and deployment requirements are documented in `AGENTS.md` an
 - Each app uses a dedicated system account named `app-<app-id>`. Git operations, dependency installation, and build commands run as that account, never as root. The generated systemd service also uses that account and binds framework defaults to loopback where the framework supports it.
 - Generated systemd services drop all capabilities and enable filesystem, device, kernel, namespace/personality, and privilege-escalation hardening. Release files are root-owned and read-only; static release content is readable by Nginx. Service writes are limited to that app's private home, config, and log paths. App ports are unprivileged, so `CAP_NET_BIND_SERVICE` is not granted.
 - Source trees, releases, application configuration, and logs use app-specific paths. Environment secrets are atomically saved outside source checkouts in root-owned files with app-group-only read access. Deployment history and retained releases support rollback.
-- The backend does not edit an existing Nginx server configuration or Cloudflare Tunnel configuration. The generated Nginx location redirects `/app` to `/app/`. Next.js receives the full path prefix and must be built with `basePath: "/<app-id>"`, including API routes and `/_next/` assets. Go, Node.js, and Python proxy routes strip the prefix upstream and send `X-Forwarded-Prefix` plus `APP_BASE_PATH` so application routers and generated URLs can honor it. Static routes serve assets from the release tree directly and fall back to `index.html` for nested pages. WebSocket requests receive `Connection: upgrade`; ordinary HTTP requests omit the `Connection` header. This per-location handling requires no global `map` and does not edit unrelated Nginx config. Operators must integrate and validate snippets in the intended Nginx `server` block themselves.
-- Removing an app unregisters it and stops/removes its App Manager service, but intentionally retains source and release data.
+- The backend never edits an existing Nginx server configuration or Cloudflare Tunnel configuration. It generates an exact route redirect (`/app` to `/app/`) and one owned location snippet per application. Next.js receives `APP_BASE_PATH` during build and at runtime; configure `next.config` to use the same path for `basePath`, including API routes and `/_next/` assets. Go, Node.js, and Python proxy routes strip the prefix upstream and send `X-Forwarded-Prefix` plus `APP_BASE_PATH` so application routers and generated URLs can honor it. Static routes serve assets from the release tree directly and fall back to `index.html` for nested pages. WebSocket requests receive `Connection: upgrade`; ordinary HTTP requests omit the `Connection` header. This per-location handling requires no global `map`.
+- Removing an app unregisters it, removes its verified App Manager route snippet, and stops/removes its App Manager service, but intentionally retains source and release data.
 
 Applications must provide an appropriate start entry point. Framework adapters install/build dependencies and use a conventional start command; applications with nonstandard startup behavior can supply `build_config.start_command` as an array of executable arguments (not a shell string). The app must listen on the assigned `PORT` and on `127.0.0.1`. Health checks use the configured local path and require a 2xx response.
 

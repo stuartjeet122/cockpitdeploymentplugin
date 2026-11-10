@@ -121,6 +121,11 @@
             <input id="appSlug" required name="slug" autocomplete="off" placeholder="my-application" />
             <small class="am-field-hint">Suggested from the name; you can edit it.</small>
           </div>
+          <div>
+            <label for="appRoute">Hosted route</label>
+            <input id="appRoute" required name="route" autocomplete="off" spellcheck="false" placeholder="/my-application/" />
+            <small class="am-field-hint">A single URL prefix on the existing site. Nginx activation needs a one-time managed include inside the site's server block.</small>
+          </div>
           <div class="am-form-grid__wide">
             <label for="appRepo">Git repository</label>
             <input id="appRepo" required name="repo_url" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://github.com/owner/project.git or git@github.com:owner/project.git" />

@@ -1,5 +1,5 @@
-location = /{{ app_slug }} {
-    return 308 /{{ app_slug }}/;
+location = {{ app_route }} {
+    return 308 {{ app_route_slash }};
 }
 
 {{ app_route_location }}

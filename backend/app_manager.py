@@ -55,6 +55,8 @@ DEFAULT_REGISTRY_PATH = f"{DEFAULT_STATE_ROOT}/apps.json"
 DEFAULT_PRODUCTION_ROOT = "/opt/webapps"
 DEFAULT_SOURCE_ROOT = f"{DEFAULT_STATE_ROOT}/sources"
 DEFAULT_LOG_ROOT = "/var/log/cockpit-app-manager"
+DEFAULT_NGINX_SNIPPET_DIR = "/etc/nginx/snippets/cockpit-app-manager"
+DEFAULT_PUBLIC_ORIGIN = "https://stuserver.online"
 DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
 PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
 PLUGIN_REPOSITORY_BRANCH = "main"
@@ -68,6 +70,7 @@ MAX_ENV_FILE_BYTES = 64 * 1024
 APP_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+APP_ROUTE_SEGMENT_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 FRAMEWORKS = {"auto", "nextjs", "go", "node", "python", "static"}
 
 
@@ -368,6 +371,35 @@ def _validate_app_directory_setting(value: Any) -> None:
         )
 
 
+def validate_app_route(value: Any, app_id: str) -> str:
+    if value is None:
+        value = f"/{app_id}/"
+    if (
+        not isinstance(value, str)
+        or len(value) > 256
+        or not value.startswith("/")
+        or "//" in value
+    ):
+        raise ValueError(
+            "Route must be a URL path prefix such as /my-application/ "
+            "using lowercase letters, numbers, and hyphens"
+        )
+    route_parts = value.strip("/").split("/")
+    if (
+        not route_parts
+        or any(not APP_ROUTE_SEGMENT_RE.fullmatch(part) for part in route_parts)
+    ):
+        raise ValueError(
+            "Route must be a URL path prefix such as /my-application/ "
+            "using lowercase letters, numbers, and hyphens"
+        )
+    return value.rstrip("/") + "/"
+
+
+def _public_url_for_route(route: str) -> str:
+    return f"{DEFAULT_PUBLIC_ORIGIN}{route}"
+
+
 def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Application payload must be a JSON object")
@@ -376,6 +408,7 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if app_id is None or app_id == "":
         app_id = sanitize_slug(name)
     app_id = validate_app_id(app_id)
+    route = validate_app_route(payload.get("route"), app_id)
     repo_url = payload.get("repo_url")
     if not validate_git_url(repo_url):
         raise ValueError("Repository URL must be a valid HTTPS or SSH Git remote")
@@ -407,6 +440,7 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "repo_url": repo_url,
         "branch": branch,
         "framework": framework,
+        "route": route,
         "build_config": build_config,
         "health_check_url": health_path,
     })
@@ -1021,7 +1055,12 @@ def app_metadata(app: Dict[str, Any]) -> Dict[str, Any]:
     source = Path(app.get("source_path", ""))
     if source.is_dir():
         metadata["latest_commit"] = git_output(source, "rev-parse", "HEAD", username=app.get("service_user")) or metadata.get("latest_commit")
-    metadata["public_url"] = app.get("public_url") or f"https://stuserver.online/{app['id']}/"
+    route = validate_app_route(app.get("route"), app["id"])
+    published_route = app.get("active_route") or route
+    metadata["route"] = route
+    metadata["hosting_active"] = bool(app.get("hosting_active", False))
+    metadata["active_route"] = app.get("active_route")
+    metadata["public_url"] = _public_url_for_route(published_route)
     return metadata
 
 
@@ -1237,6 +1276,7 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
     config = get_config()
     seen_ids: Set[str] = set()
     seen_ports: Set[int] = set()
+    seen_routes: Dict[str, str] = {}
     for app in registry["apps"]:
         if not isinstance(app, dict):
             raise ValueError("Each application registry entry must be an object")
@@ -1244,6 +1284,22 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         if app_id in seen_ids:
             raise ValueError(f"Duplicate application ID in registry: {app_id}")
         seen_ids.add(app_id)
+        route = validate_app_route(app.get("route"), app_id)
+        app["route"] = route
+        route_values = {route}
+        active_route = app.get("active_route")
+        if active_route is not None:
+            active_route = validate_app_route(active_route, app_id)
+            app["active_route"] = active_route
+            route_values.add(active_route)
+        app.setdefault("hosting_active", False)
+        if not isinstance(app["hosting_active"], bool):
+            raise ValueError(f"Application {app_id!r} has an invalid Nginx hosting status")
+        for route_value in route_values:
+            owner = seen_routes.get(route_value)
+            if owner is not None and owner != app_id:
+                raise ValueError(f"Duplicate application route in registry: {route_value}")
+            seen_routes[route_value] = app_id
         validate_name(app.get("name"))
         if not validate_git_url(app.get("repo_url")):
             raise ValueError(f"Application {app_id!r} has an invalid Git URL")
@@ -1304,6 +1360,17 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
     with _registry_transaction() as registry:
         if any(app.get("id") == normalized["id"] for app in registry["apps"]):
             raise ValueError(f"Application {normalized['id']!r} is already registered")
+        for app in registry["apps"]:
+            existing_routes = {
+                validate_app_route(app.get("route"), app["id"]),
+                *(
+                    [validate_app_route(app["active_route"], app["id"])]
+                    if app.get("active_route") is not None
+                    else []
+                ),
+            }
+            if normalized["route"] in existing_routes:
+                raise ValueError(f"Route {normalized['route']} is already assigned to another application")
         port = normalized.get("port")
         if port is None:
             port = _select_port(registry, config)
@@ -1325,11 +1392,14 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
             "repo_url": normalized["repo_url"],
             "branch": normalized["branch"],
             "framework": normalized["framework"],
+            "route": normalized["route"],
+            "active_route": None,
+            "hosting_active": False,
             "description": normalized.get("description", ""),
             "health_check_url": normalized["health_check_url"],
             "build_config": normalized["build_config"],
             "port": port,
-            "public_url": f"https://stuserver.online/{normalized['id']}/",
+            "public_url": _public_url_for_route(normalized["route"]),
             "source_path": str(paths["source"]),
             "production_path": str(paths["production"]),
             "config_path": str(paths["config"]),
@@ -1600,6 +1670,19 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         current["slug"] = app_id
         candidate = {**current, **payload}
         normalized = validate_app_payload(candidate)
+        for other in registry["apps"]:
+            if other.get("id") == app_id:
+                continue
+            other_routes = {
+                validate_app_route(other.get("route"), other["id"]),
+                *(
+                    [validate_app_route(other["active_route"], other["id"])]
+                    if other.get("active_route") is not None
+                    else []
+                ),
+            }
+            if normalized["route"] in other_routes:
+                raise ValueError(f"Route {normalized['route']} is already assigned to another application")
         port = normalized.get("port", app.get("port"))
         if port != app.get("port"):
             if any(other.get("id") != app_id and other.get("port") == port for other in registry["apps"]):
@@ -1608,10 +1691,11 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError(f"Port {port} is already in use")
         with _registry_transaction() as registry2:
             app = _find_app(registry2, app_id)
-            for key in ("name", "repo_url", "branch", "framework", "description", "health_check_url", "build_config", "port", "public_url"):
+            for key in ("name", "repo_url", "branch", "framework", "route", "description", "health_check_url", "build_config", "port", "public_url"):
                 if key in normalized:
                     app[key] = normalized[key]
             app["slug"] = app_id
+            app["public_url"] = _public_url_for_route(app.get("active_route") or app["route"])
             app["updated_at"] = now_iso()
             return {"ok": True, "app": app}
 
@@ -1698,7 +1782,7 @@ def _render_service(
         f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
         f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
         f"{node_environment}"
-        f"Environment={_systemd_quote('APP_BASE_PATH=/' + app['id'])}\n"
+        f"Environment={_systemd_quote('APP_BASE_PATH=' + validate_app_route(app.get('route'), app['id']).rstrip('/'))}\n"
         f"Environment={_systemd_quote('APP_CONFIG_DIR=' + str(paths['config']))}\n"
         f"Environment={_systemd_quote('HOME=' + str(paths['home']))}\n"
         "Restart=on-failure\n"
@@ -1732,8 +1816,11 @@ def _render_nginx_config(
     template_path: Optional[Path] = None,
     framework: str = "nextjs",
     config: Optional[Dict[str, Any]] = None,
+    route: Optional[str] = None,
 ) -> str:
     app_id = validate_app_id(app_id)
+    route = validate_app_route(route, app_id)
+    route_prefix = route.rstrip("/")
     if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
         raise ValueError("Nginx upstream port must be an available managed application port")
     if framework not in FRAMEWORKS - {"auto"}:
@@ -1751,28 +1838,28 @@ def _render_nginx_config(
         app_root = _app_paths(app_id, config)["current"] / "app"
         route_location = (
             f"# Managed by Cockpit App Manager: {app_id}\n"
-            f"location ^~ /{app_id}/ {{\n"
+            f"location ^~ {route} {{\n"
             f"    alias {_nginx_quote(str(app_root) + os.sep)};\n"
             "    index index.html;\n"
-            f"    try_files $uri $uri/ /{app_id}/index.html;\n"
+            f"    try_files $uri $uri/ {route}index.html;\n"
             "}\n"
         )
     else:
         proxy_redirect = (
             "    proxy_redirect off;\n"
             if framework == "nextjs"
-            else f"    proxy_redirect / /{app_id}/;\n"
+            else f"    proxy_redirect / {route};\n"
         )
         route_location = (
             f"# Managed by Cockpit App Manager: {app_id}\n"
-            f"location ^~ /{app_id}/ {{\n"
+            f"location ^~ {route} {{\n"
             f"    proxy_pass http://127.0.0.1:{port}{proxy_uri};\n"
             "    proxy_http_version 1.1;\n"
             "    proxy_set_header Host $host;\n"
             "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
             "    proxy_set_header X-Forwarded-Proto $scheme;\n"
             "    proxy_set_header X-Real-IP $remote_addr;\n"
-            f"    proxy_set_header X-Forwarded-Prefix /{app_id};\n"
+            f"    proxy_set_header X-Forwarded-Prefix {route_prefix};\n"
             "    proxy_set_header Upgrade $http_upgrade;\n"
             "    proxy_read_timeout 3600s;\n"
             "    proxy_send_timeout 3600s;\n"
@@ -1786,6 +1873,8 @@ def _render_nginx_config(
         )
     rendered = (
         template.replace("{{ app_slug }}", app_id)
+        .replace("{{ app_route }}", route_prefix)
+        .replace("{{ app_route_slash }}", route)
         .replace("{{ app_port }}", str(port))
         .replace("{{ app_proxy_uri }}", proxy_uri)
         .replace("{{ app_route_location }}", route_location.rstrip())
@@ -1799,6 +1888,164 @@ def _nginx_quote(path: str) -> str:
     if any(char in path for char in ('"', "\r", "\n", ";", "{", "}")):
         raise ValueError("Path cannot be safely represented in an Nginx configuration")
     return '"' + path.replace("\\", "\\\\") + '"'
+
+
+def _nginx_snippet_path(app_id: str) -> Path:
+    return Path(DEFAULT_NGINX_SNIPPET_DIR) / f"{validate_app_id(app_id)}.conf"
+
+
+def _assert_no_symlink_components(path: Path) -> None:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current = current / component
+        if current.is_symlink():
+            raise RuntimeError(f"Refusing to manage an Nginx path through a symlink: {current}")
+
+
+def _write_nginx_snippet(path: Path, content: str) -> Optional[bytes]:
+    _assert_no_symlink_components(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    _assert_no_symlink_components(path.parent)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError(f"Refusing to replace a non-regular Nginx snippet: {path}")
+    previous_content = path.read_bytes() if path.exists() else None
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    temporary_path = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o644)
+        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            os.fchown(descriptor, 0, 0)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary_path), str(path))
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+        raise
+    return previous_content
+
+
+def _restore_nginx_snippet(path: Path, previous_content: Optional[bytes]) -> None:
+    if previous_content is None:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        return
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    temporary_path = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o644)
+        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            os.fchown(descriptor, 0, 0)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(previous_content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary_path), str(path))
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+        raise
+
+
+def _activate_nginx_config(
+    app: Dict[str, Any],
+    framework: str,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    app_id = validate_app_id(app["id"])
+    snippet_path = _nginx_snippet_path(app_id)
+    rendered = _render_nginx_config(
+        app_id,
+        app["port"],
+        framework=framework,
+        config=config,
+        route=app.get("route"),
+    )
+    previous_content = _write_nginx_snippet(snippet_path, rendered)
+    try:
+        config_listing = run_command(["nginx", "-T"], timeout=int(config["command_timeout_seconds"]))
+    except Exception as exc:
+        _restore_nginx_snippet(snippet_path, previous_content)
+        return {
+            "active": False,
+            "route": app.get("route"),
+            "config_path": str(snippet_path),
+            "message": f"Nginx could not inspect its active configuration; the previous snippet was restored. {exc}",
+        }
+    config_output = (config_listing.stdout or "") + "\n" + (config_listing.stderr or "")
+    snippet_marker = f"# configuration file {snippet_path.resolve(strict=False)}:"
+    if config_listing.returncode != 0:
+        _restore_nginx_snippet(snippet_path, previous_content)
+        detail = (config_listing.stderr or config_listing.stdout or "").strip()[-2000:]
+        return {
+            "active": False,
+            "route": app.get("route"),
+            "config_path": str(snippet_path),
+            "message": f"Nginx could not inspect its active configuration; the previous snippet was restored. {detail}".strip(),
+        }
+    if snippet_marker not in config_output:
+        return {
+            "active": False,
+            "route": app.get("route"),
+            "config_path": str(snippet_path),
+            "message": (
+                f"The Nginx snippet is staged at {snippet_path} but is not included in the site configuration. "
+                f"Add `include {DEFAULT_NGINX_SNIPPET_DIR}/*.conf;` inside the intended site's server block, "
+                "then validate and reload Nginx."
+            ),
+        }
+
+    try:
+        test_result = run_command(["nginx", "-t"], timeout=int(config["command_timeout_seconds"]))
+        _command_error(test_result, "nginx -t")
+        _systemctl("reload", "nginx", timeout=int(config["command_timeout_seconds"]))
+    except Exception as exc:
+        _restore_nginx_snippet(snippet_path, previous_content)
+        return {
+            "active": False,
+            "route": app.get("route"),
+            "config_path": str(snippet_path),
+            "message": f"Nginx activation failed; the previous snippet was restored. {exc}",
+        }
+    return {
+        "active": True,
+        "route": app.get("route"),
+        "config_path": str(snippet_path),
+        "message": f"Nginx is serving {app.get('route')} from the managed application configuration.",
+    }
+
+
+def _remove_nginx_config(app_id: str, config: Dict[str, Any]) -> None:
+    snippet_path = _nginx_snippet_path(app_id)
+    if not snippet_path.exists() and not snippet_path.is_symlink():
+        return
+    _assert_no_symlink_components(snippet_path.parent)
+    if snippet_path.is_symlink() or not snippet_path.is_file():
+        raise RuntimeError(f"Refusing to remove a non-regular Nginx snippet: {snippet_path}")
+    previous_content = snippet_path.read_bytes()
+    if f"# Managed by Cockpit App Manager: {app_id}".encode("utf-8") not in previous_content:
+        raise RuntimeError(f"Refusing to remove an unverified Nginx snippet: {snippet_path}")
+    config_listing = run_command(["nginx", "-T"], timeout=int(config["command_timeout_seconds"]))
+    if config_listing.returncode != 0:
+        detail = (config_listing.stderr or config_listing.stdout or "").strip()[-2000:]
+        raise RuntimeError(f"Could not verify whether the Nginx snippet is active: {detail}")
+    marker = f"# configuration file {snippet_path.resolve(strict=False)}:"
+    snippet_is_active = marker in ((config_listing.stdout or "") + "\n" + (config_listing.stderr or ""))
+    snippet_path.unlink()
+    if not snippet_is_active:
+        return
+    try:
+        test_result = run_command(["nginx", "-t"], timeout=int(config["command_timeout_seconds"]))
+        _command_error(test_result, "nginx -t")
+        _systemctl("reload", "nginx", timeout=int(config["command_timeout_seconds"]))
+    except Exception as exc:
+        _restore_nginx_snippet(snippet_path, previous_content)
+        raise RuntimeError(f"Could not deactivate the App Manager Nginx route; the snippet was restored: {exc}") from exc
 
 
 def _write_service(
@@ -2075,6 +2322,10 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             service_path = _service_path(app_snapshot)
             previous_service_content = service_path.read_bytes() if service_path.exists() else None
             build_environment = _environment_values_app(app_id)
+            build_environment["APP_BASE_PATH"] = validate_app_route(
+                app_snapshot.get("route"),
+                app_id,
+            ).rstrip("/")
             _, release_group = _account_ids(username)
             build_result = adapter.build(
                 app_snapshot,
@@ -2118,6 +2369,10 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             _append_deployment_log(deployment_log, "Waiting for the application health check")
             if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
                 raise RuntimeError("Application did not pass its health check before the timeout")
+            _append_deployment_log(deployment_log, "Generating and activating the application Nginx route")
+            hosting_result = _activate_nginx_config(app_snapshot, framework, config)
+            record["hosting"] = hosting_result
+            _append_deployment_log(deployment_log, hosting_result["message"])
             _append_deployment_log(deployment_log, "Deployment completed successfully")
         except Exception as exc:
             if deployment_log is not None:
@@ -2177,6 +2432,14 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             app = _find_app(registry, app_id)
             app["framework"] = framework
             app["status"] = "running"
+            app["hosting_active"] = (
+                True if hosting_result["active"] else bool(app_snapshot.get("hosting_active", False))
+            )
+            if hosting_result["active"]:
+                app["active_route"] = app_snapshot["route"]
+            app["public_url"] = _public_url_for_route(
+                app.get("active_route") or app["route"]
+            )
             app["last_deploy"] = record["date"]
             app["latest_commit"] = commit or app.get("latest_commit")
             stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
@@ -2184,7 +2447,13 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             app["updated_at"] = now_iso()
             _prune_releases(app, int(config["release_retention"]))
         app_snapshot.update({"status": "running", "framework": framework, "latest_commit": commit or app_snapshot.get("latest_commit")})
-        return {"ok": True, "app": app_snapshot, "build": build_result, "deployment": record}
+        return {
+            "ok": True,
+            "app": app_snapshot,
+            "build": build_result,
+            "deployment": record,
+            "hosting": hosting_result,
+        }
 
 
 def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2385,6 +2654,7 @@ def remove_app(app_id: str) -> Dict[str, Any]:
     _require_root()
     with _app_lock(app_id):
         app = _find_app(get_registry(), app_id)
+        _remove_nginx_config(app_id, get_config())
         service_path = _service_path(app)
         _retire_legacy_root_service(app)
         if service_path.exists():
@@ -2399,7 +2669,8 @@ def remove_app(app_id: str) -> Dict[str, Any]:
 
 def open_app(app_id: str) -> Dict[str, Any]:
     app = _find_app(get_registry(), app_id)
-    return {"ok": True, "app_id": app_id, "url": app.get("public_url", f"https://stuserver.online/{app_id}/")}
+    route = app.get("active_route") or validate_app_route(app.get("route"), app_id)
+    return {"ok": True, "app_id": app_id, "url": _public_url_for_route(route)}
 
 
 def action(app_id: str, action_name: str) -> Dict[str, Any]:
