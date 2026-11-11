@@ -1749,6 +1749,104 @@ class AppManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "symlink"):
                 manager._remove_deployed_source(app["id"], config)
 
+    def test_remove_app_deletes_only_its_managed_resources(self):
+        app = self.add_app("Remove Example")["app"]
+        config = manager.get_config()
+        paths = manager._app_paths(app["id"], config)
+        other_app = self.add_app("Keep Example")["app"]
+        other_paths = manager._app_paths(other_app["id"], config)
+        for key in ("source", "production", "logs", "home"):
+            paths[key].mkdir(parents=True)
+            (paths[key] / "managed-file").write_text("managed", encoding="utf-8")
+        paths["environment"].parent.mkdir(parents=True)
+        paths["environment"].write_text("SECRET=value\n", encoding="utf-8")
+        other_paths["production"].mkdir(parents=True)
+        (other_paths["production"] / "keep").write_text("keep", encoding="utf-8")
+        deployment_id = "20261111235959-abcdef12"
+        deployment_log = manager._deployment_log_path(app["id"], deployment_id, create=True)
+        deployment_log.write_text("deployment", encoding="utf-8")
+        other_log = manager._deployment_log_path(other_app["id"], deployment_id, create=True)
+        other_log.write_text("other deployment", encoding="utf-8")
+        units = {
+            "primary": Path(self.temp_dir.name) / "primary.service",
+            "secondary": Path(self.temp_dir.name) / "secondary.service",
+        }
+        for unit in units.values():
+            unit.write_text("managed unit", encoding="utf-8")
+
+        with patch.object(manager, "_validate_app_account_for_removal", return_value=1234), patch.object(
+            manager, "_remove_app_account"
+        ) as remove_account, patch.object(
+            manager, "_remove_nginx_config"
+        ) as remove_nginx, patch.object(
+            manager, "_retire_legacy_root_service"
+        ), patch.object(
+            manager, "_service_path", side_effect=lambda record: units[record.get("service_slot", "primary")]
+        ), patch.object(
+            manager, "_verified_service_bytes", return_value=b"managed"
+        ), patch.object(manager, "_systemctl"):
+            result = manager.remove_app(app["id"])
+
+        self.assertEqual(result, {"ok": True, "removed": app["id"], "data_retained": False})
+        remove_nginx.assert_called_once_with(app["id"], config)
+        remove_account.assert_called_once()
+        self.assertEqual(remove_account.call_args.args[0]["id"], app["id"])
+        self.assertEqual(remove_account.call_args.args[1], 1234)
+        for key in ("source", "production", "logs", "home", "environment"):
+            self.assertFalse(paths[key].exists(), key)
+        self.assertFalse(deployment_log.exists())
+        self.assertTrue(other_paths["production"].exists())
+        self.assertTrue(other_log.exists())
+        self.assertTrue(all(not unit.exists() for unit in units.values()))
+        self.assertEqual([item["id"] for item in manager.get_registry()["apps"]], [other_app["id"]])
+
+    def test_remove_app_refuses_paths_or_accounts_before_modifying_resources(self):
+        app = self.add_app()["app"]
+        with patch.object(manager, "_assert_no_symlink_components", side_effect=RuntimeError("symlink")), patch.object(
+            manager, "_remove_nginx_config"
+        ) as remove_nginx:
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                manager.remove_app(app["id"])
+        remove_nginx.assert_not_called()
+        self.assertEqual(len(manager.get_registry()["apps"]), 1)
+
+    def test_remove_app_refuses_active_deployment(self):
+        app = self.add_app()["app"]
+        with manager._registry_transaction() as registry:
+            manager._find_app(registry, app["id"])["deployments"] = [{"status": "deploying"}]
+        with patch.object(manager, "_remove_nginx_config") as remove_nginx:
+            with self.assertRaisesRegex(RuntimeError, "deployment is in progress"):
+                manager.remove_app(app["id"])
+        remove_nginx.assert_not_called()
+        self.assertEqual(len(manager.get_registry()["apps"]), 1)
+
+    def test_application_account_removal_requires_its_private_group(self):
+        app = {"id": "demo", "service_user": "app-demo"}
+        account = Mock(
+            pw_uid=1001,
+            pw_gid=1001,
+            pw_dir=str(manager._home_path(app["id"])),
+            pw_shell="/usr/sbin/nologin",
+            pw_name="app-demo",
+        )
+        private_group = Mock(gr_name="app-demo", gr_gid=1001, gr_mem=[])
+        password_database = Mock()
+        password_database.getpwnam.return_value = account
+        password_database.getpwall.return_value = [account]
+        group_database = Mock()
+        group_database.getgrnam.return_value = private_group
+        group_database.getgrall.return_value = [private_group]
+        with patch.object(manager, "pwd", password_database), patch.object(
+            manager, "grp", group_database
+        ):
+            self.assertEqual(manager._validate_app_account_for_removal(app), 1001)
+            group_database.getgrall.return_value = [
+                private_group,
+                Mock(gr_name="sudo", gr_gid=27, gr_mem=["app-demo"]),
+            ]
+            with self.assertRaisesRegex(RuntimeError, "additional group"):
+                manager._validate_app_account_for_removal(app)
+
     def test_runtime_start_checks_health_and_socket_isolation(self):
         app = self.add_app("Runtime checks")["app"]
         manager.edit_app(app["id"], {"framework": "node"})

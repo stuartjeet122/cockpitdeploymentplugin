@@ -2885,6 +2885,145 @@ def _prune_deployment_logs(app_id: str, keep_deployment_id: str) -> None:
         path.unlink()
 
 
+def _validate_app_account_for_removal(app: Dict[str, Any]) -> Optional[int]:
+    username = _account_name(app["id"])
+    if app.get("service_user") != username:
+        raise RuntimeError("Refusing to remove an application with an unexpected service account")
+    if pwd is None or grp is None:
+        raise RuntimeError("Application service accounts can only be removed on POSIX systems")
+    try:
+        account = pwd.getpwnam(username)
+    except KeyError:
+        account = None
+    try:
+        private_group = grp.getgrnam(username)
+    except KeyError:
+        if account is None:
+            return None
+        raise RuntimeError(f"Refusing to remove {username}: its private group is missing")
+    if account is None:
+        if private_group.gr_mem or any(
+            other.pw_gid == private_group.gr_gid for other in pwd.getpwall()
+        ):
+            raise RuntimeError(f"Refusing to remove {username}: its orphaned private group is in use")
+        return private_group.gr_gid
+    expected_home = _home_path(app["id"]).resolve(strict=False)
+    if (
+        account.pw_uid <= 0
+        or account.pw_gid <= 0
+        or Path(account.pw_dir).resolve(strict=False) != expected_home
+        or account.pw_shell != "/usr/sbin/nologin"
+    ):
+        raise RuntimeError(f"Refusing to remove unverified application account {username}")
+    if private_group.gr_gid != account.pw_gid:
+        raise RuntimeError(f"Refusing to remove {username}: its primary group is not its private group")
+    if any(group.gr_name != username and username in group.gr_mem for group in grp.getgrall()):
+        raise RuntimeError(f"Refusing to remove {username}: it belongs to an additional group")
+    if any(
+        other.pw_name != username and other.pw_gid == account.pw_gid
+        for other in pwd.getpwall()
+    ):
+        raise RuntimeError(f"Refusing to remove {username}: its private group is used by another account")
+    return account.pw_gid
+
+
+def _remove_app_account(app: Dict[str, Any], private_gid: Optional[int]) -> None:
+    if private_gid is None:
+        return
+    username = _account_name(app["id"])
+    if grp is None or pwd is None:
+        raise RuntimeError("Could not verify removal of the application account")
+    try:
+        pwd.getpwnam(username)
+    except KeyError:
+        pass
+    else:
+        result = run_command(["userdel", "--remove", username], timeout=COMMAND_TIMEOUT_SECONDS)
+        _command_error(result, f"Removing application account {username}")
+    try:
+        private_group = grp.getgrnam(username)
+    except KeyError:
+        return
+    if private_group.gr_gid != private_gid or private_group.gr_mem or any(
+        account.pw_gid == private_gid for account in pwd.getpwall()
+    ):
+        raise RuntimeError(f"Refusing to remove {username}: its private group is still in use")
+    result = run_command(["groupdel", username], timeout=COMMAND_TIMEOUT_SECONDS)
+    _command_error(result, f"Removing application group {username}")
+
+
+def _validate_app_removal_paths(
+    app: Dict[str, Any],
+    config: Dict[str, Any],
+) -> Tuple[Dict[str, Path], Optional[int]]:
+    app_id = validate_app_id(app["id"])
+    for root in (
+        Path(config["source_root"]),
+        Path(config["production_root"]),
+        Path(config["log_root"]),
+        Path(DEFAULT_STATE_ROOT),
+    ):
+        _assert_no_symlink_components(root)
+    paths = _app_paths(app_id, config)
+    expected_roots = {
+        "source": _resolved_path(Path(config["source_root"])),
+        "production": _resolved_path(Path(config["production_root"])),
+        "logs": _resolved_path(Path(config["log_root"])),
+        "home": _resolved_path(Path(DEFAULT_STATE_ROOT)) / "homes",
+        "environment": _resolved_path(Path(DEFAULT_STATE_ROOT)) / "environment",
+    }
+    for name, root in expected_roots.items():
+        target = paths[name]
+        if not _path_is_within(target, root) or _resolved_path(target) == _resolved_path(root):
+            raise RuntimeError(f"Refusing to remove {name} outside its managed application directory")
+        _assert_no_symlink_components(target)
+        if target.exists():
+            expected_directory = name != "environment"
+            if expected_directory and not target.is_dir():
+                raise RuntimeError(f"Managed application {name} path is not a directory")
+            if not expected_directory and not target.is_file():
+                raise RuntimeError("Managed application environment path is not a regular file")
+    log_root = Path(DEFAULT_STATE_ROOT) / "deployment-logs"
+    _assert_no_symlink_components(log_root)
+    if log_root.exists() and not log_root.is_dir():
+        raise RuntimeError("Managed deployment log path is not a directory")
+    if log_root.exists():
+        pattern = re.compile(
+            rf"^{re.escape(app_id)}-\d{{14}}-[a-f0-9]{{8}}(?:\.log|\.cancel)$"
+        )
+        for path in log_root.iterdir():
+            if pattern.fullmatch(path.name) and (path.is_symlink() or not path.is_file()):
+                raise RuntimeError(f"Refusing to remove non-regular deployment artifact: {path.name}")
+    private_gid = _validate_app_account_for_removal(app)
+    return paths, private_gid
+
+
+def _remove_app_deployment_logs(app_id: str) -> None:
+    log_root = Path(DEFAULT_STATE_ROOT) / "deployment-logs"
+    if not log_root.exists():
+        return
+    pattern = re.compile(
+        rf"^{re.escape(app_id)}-\d{{14}}-[a-f0-9]{{8}}(?:\.log|\.cancel)$"
+    )
+    for path in log_root.iterdir():
+        if not pattern.fullmatch(path.name):
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Refusing to remove non-regular deployment artifact: {path.name}")
+        path.unlink()
+
+
+def _remove_app_managed_files(paths: Dict[str, Path], app_id: str) -> None:
+    for name in ("source", "production", "logs", "home"):
+        path = paths[name]
+        if path.exists():
+            shutil.rmtree(path)
+    environment = paths["environment"]
+    if environment.exists():
+        environment.unlink()
+    _remove_app_deployment_logs(app_id)
+
+
 def _raise_if_deployment_cancelled(cancel_file: Path) -> None:
     if cancel_file.exists():
         raise DeploymentAborted("Deployment aborted by request")
@@ -4089,8 +4228,11 @@ def remove_app(app_id: str) -> Dict[str, Any]:
     _require_root()
     with _app_lock(app_id):
         app = _find_app(get_registry(), app_id)
-        _remove_nginx_config(app_id, get_config())
-        service_path = _service_path(app)
+        if any(item.get("status") == "deploying" for item in app.get("deployments", [])):
+            raise RuntimeError("Cannot remove an application while a deployment is in progress")
+        config = get_config()
+        paths, private_gid = _validate_app_removal_paths(app, config)
+        _remove_nginx_config(app_id, config)
         _retire_legacy_root_service(app)
         for slot in ("primary", "secondary"):
             service_path = _service_path(dict(app, service_slot=slot))
@@ -4099,10 +4241,12 @@ def remove_app(app_id: str) -> Dict[str, Any]:
                 _systemctl("disable", "--now", service_path.name)
                 service_path.unlink()
                 _systemctl("daemon-reload")
+        _remove_app_managed_files(paths, app_id)
+        _remove_app_account(app, private_gid)
         with _registry_transaction() as registry:
             _find_app(registry, app_id)
             registry["apps"] = [item for item in registry["apps"] if item.get("id") != app_id]
-        return {"ok": True, "removed": app_id, "data_retained": True}
+        return {"ok": True, "removed": app_id, "data_retained": False}
 
 
 def open_app(app_id: str) -> Dict[str, Any]:

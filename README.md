@@ -32,7 +32,7 @@ Each application has a configurable single-prefix route such as `/shop/`. When a
 include /etc/nginx/snippets/cockpit-app-manager/*.conf;
 ```
 
-App Manager does not create a new virtual host or change Cloudflare Tunnel settings. Removing an application removes only its verified App Manager snippet and reloads Nginx if that snippet was active; the managed include remains harmlessly in the site's server block for future deployments.
+App Manager does not create a new virtual host or change Cloudflare Tunnel settings. Removing an application removes only its verified App Manager snippet and reloads Nginx if that snippet was active; the managed include remains harmlessly in the site's server block for future deployments. Removal also permanently deletes that application's managed source, releases, storage, logs, environment secrets, dedicated account, and service files. Export any data you need before confirming removal.
 
 ## First deployment
 
@@ -63,7 +63,7 @@ In **Edit configuration**, set required environment names such as `DATABASE_URL,
 
 Every app has a `data` directory under `/opt/webapps/<app-id>/shared/`. Add named directories such as `uploads` in **Edit configuration**; only isolated lowercase slug names are accepted, never host mount paths. The directory name `dir` is reserved to avoid an environment-name collision. Dynamic services receive `APP_DATA_DIR`, `APP_STORAGE_DIR`, and `APP_STORAGE_<NAME>` (for example `APP_STORAGE_UPLOADS`). These names are reserved and cannot be replaced through the environment editor. Declared directories are writable by that app's service account while release files remain read-only. Environment paths are runtime values, not build-time substitutions.
 
-Persistent files survive redeployments, source checkout cleanup, release pruning, app removal, and ordinary uninstall. Removing a directory name from configuration does not delete its files. Explicit destructive uninstall removes managed app data, including storage. This feature is not a backup system. Storage is not automatically exposed through a public Nginx route; applications must deliberately serve uploaded content. Old and candidate instances share these directories during a deployment, so file formats and database/schema changes must tolerate overlapping versions. Configure storage before deploying or redeploy to apply changes.
+Persistent files survive redeployments, source checkout cleanup, release pruning, and ordinary uninstall. Removing a directory name from configuration does not delete its files. Removing an application or using explicit destructive uninstall permanently removes managed app data, including storage. This feature is not a backup system. Storage is not automatically exposed through a public Nginx route; applications must deliberately serve uploaded content. Old and candidate instances share these directories during a deployment, so file formats and database/schema changes must tolerate overlapping versions. Configure storage before deploying or redeploy to apply changes.
 
 ## Deployment Approval
 

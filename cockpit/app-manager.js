@@ -1124,10 +1124,12 @@
       return;
     }
     if (action === "remove") {
-      if (!window.confirm(`Remove "${app.name}" from App Manager? Its source and deployed files will be retained.`)) return;
+      if (!window.confirm(
+        `Permanently remove "${app.name}"? This deletes its source, releases, storage, logs, environment secrets, service account, and managed configuration. This cannot be undone.`
+      )) return;
       await runOperation(
         () => callBackend("remove", [appId]),
-        "Application removed from the registry. Source and deployed files were retained.",
+        "Application and its managed data were permanently removed.",
       );
       return;
     }
