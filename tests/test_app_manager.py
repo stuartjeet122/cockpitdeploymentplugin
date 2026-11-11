@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import Mock, call as mock_call, patch
 
 import backend.app_manager as manager
-from backend.adapters import NextJSAdapter, detect_framework
+from backend.adapters import NextJSAdapter, detect_framework, get_adapter
 
 
 class AppManagerTests(unittest.TestCase):
@@ -67,6 +67,38 @@ class AppManagerTests(unittest.TestCase):
                 for filename, contents in files.items():
                     (repo / filename).write_text(contents, encoding="utf-8")
                 self.assertEqual(detect_framework(repo), expected)
+
+    def test_invalid_settings_never_replace_the_working_configuration(self):
+        original = manager.get_config()
+        path = Path(manager.DEFAULT_CONFIG_PATH)
+        contents = path.read_bytes()
+        invalid = [
+            {key: value}
+            for key in ("build_timeout_seconds", "health_timeout_seconds", "command_timeout_seconds")
+            for value in (0, -1, True, "30", None)
+        ] + [
+            {"default_branch": "../unsafe"},
+            {"port_range": {"start": 8100, "end": 8999, "reserved": [True]}},
+            {"port_range": {"start": 8100, "end": 8999, "reserved": "8080"}},
+        ]
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                manager.update_settings(payload)
+            self.assertEqual(path.read_bytes(), contents)
+            self.assertEqual(manager.get_config(), original)
+
+    def test_application_commands_use_an_isolated_environment_and_accept_mixed_case_keys(self):
+        with patch.object(manager, "_require_root"), patch.object(manager.os, "name", "posix"), patch.object(
+            manager, "_account_exists", return_value=True
+        ), patch.object(manager, "_home_path", return_value="/managed/home"), patch.object(
+            manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        ) as run:
+            manager._run_as_user("app-demo", ["node", "build.js"], environment={"Database_URL": "private"})
+        command = run.call_args.args[0]
+        self.assertIn("-i", command)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", command)
+        self.assertIn("Database_URL=private", command)
+        self.assertEqual(command[-2:], ["node", "build.js"])
 
     def test_unsupported_framework_detection_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -642,7 +674,7 @@ class AppManagerTests(unittest.TestCase):
 
     def test_deployment_start_detaches_worker_and_returns_identifier(self):
         app = self.add_app()["app"]
-        with patch.object(manager, "_require_root"), patch.object(
+        with patch.object(manager, "_require_root"), patch.object(manager, "ensure_app_user") as ensure_user, patch.object(
             manager,
             "run_command",
             return_value=subprocess.CompletedProcess(args=["systemd-run"], returncode=0, stdout="", stderr=""),
@@ -653,6 +685,8 @@ class AppManagerTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], "systemd-run")
         self.assertIn("--property=ProtectSystem=strict", command)
+        ensure_user.assert_called_once_with(app["id"])
+        self.assertFalse(any("/etc/passwd" in argument for argument in command))
         self.assertEqual(command[-4:], ["deploy", app["id"], "--deployment-id", result["deployment_id"]])
         stored = manager.get_registry()["apps"][0]["deployments"]
         self.assertEqual(len(stored), 1)
@@ -678,6 +712,28 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["status"], "deployed")
         pull.assert_called_once_with(app["id"])
         deploy.assert_called_once_with(app["id"])
+
+    def test_detached_deployment_failure_preserves_previous_running_status(self):
+        app = self.add_app()["app"]
+        paths = manager._app_paths(app["id"], manager.get_config())
+        paths["current"].mkdir(parents=True)
+        with manager._registry_transaction() as registry:
+            manager._find_app(registry, app["id"])["status"] = "running"
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        ):
+            queued = manager.deployment_start_app(app["id"])
+        self.assertEqual(manager.get_registry()["apps"][0]["deployments"][0]["previous_status"], "running")
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "ensure_app_user", return_value=app["service_user"]
+        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
+            manager, "clone_or_update_repo", side_effect=RuntimeError("repository unavailable")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "repository unavailable"):
+                manager.deploy_app(app["id"], queued["deployment_id"])
+        stored = manager.get_registry()["apps"][0]
+        self.assertEqual(stored["status"], "running")
+        self.assertEqual(stored["deployments"][0]["status"], "failed")
 
     def test_plugin_update_check_compares_installed_and_remote_revisions(self):
         version_path = Path(manager.DEFAULT_PLUGIN_VERSION_PATH)
@@ -717,9 +773,54 @@ class AppManagerTests(unittest.TestCase):
         clone_command = plugin_git.call_args_list[0].args[0]
         self.assertIn(manager.PLUGIN_REPOSITORY_URL, clone_command)
         self.assertIn("--branch", clone_command)
-        self.assertEqual(install.call_args.args[0][0], "bash")
-        installer_path = install.call_args.args[0][1].replace("\\", "/")
+        self.assertEqual(install.call_args_list[0].args[0][0], "bash")
+        installer_path = install.call_args_list[0].args[0][1].replace("\\", "/")
         self.assertTrue(installer_path.endswith("scripts/install.sh"))
+        self.assertTrue(result["restart_scheduled"])
+        restart_command = install.call_args_list[1].args[0]
+        self.assertEqual(restart_command[0], "systemd-run")
+        self.assertIn("--on-active=5s", restart_command)
+        self.assertEqual(restart_command[-3:], ["systemctl", "restart", "cockpit.service"])
+
+    def test_plugin_update_does_not_restart_when_already_current(self):
+        with patch.object(manager, "plugin_update_check", return_value={
+            "available": False, "current_commit": "a" * 40,
+        }), patch.object(manager, "run_command") as run:
+            result = manager.plugin_update()
+        self.assertFalse(result["updated"])
+        run.assert_not_called()
+
+    def test_plugin_update_reports_install_and_restart_failures_separately(self):
+        def fake_git(args, timeout=120):
+            if "clone" in args:
+                checkout = Path(args[-1])
+                (checkout / "scripts").mkdir(parents=True)
+                (checkout / "scripts" / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="b" * 40 + "\n", stderr="")
+
+        for install_succeeds in (False, True):
+            commands = [
+                subprocess.CompletedProcess([], 0 if install_succeeds else 1, stdout="", stderr="installer failure"),
+                subprocess.CompletedProcess([], 1, stdout="", stderr="restart scheduler unavailable"),
+            ]
+            with self.subTest(install_succeeds=install_succeeds), patch.object(
+                manager, "plugin_update_check", return_value={"available": True}
+            ), patch.object(manager, "_account_ids", return_value=(65534, 65534)), patch.object(
+                manager, "_plugin_git", side_effect=fake_git
+            ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(
+                manager.os, "chown", create=True
+            ), patch.object(manager.os, "chmod"), patch.object(manager, "run_command", side_effect=commands) as run:
+                if install_succeeds:
+                    result = manager.plugin_update()
+                    self.assertTrue(result["updated"])
+                    self.assertFalse(result["restart_scheduled"])
+                    self.assertIn("restart scheduler unavailable", result["restart_error"])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "installer failure"):
+                        manager.plugin_update()
+                self.assertEqual(run.call_count, 2 if install_succeeds else 1)
+                self.assertFalse(list((Path(manager.DEFAULT_STATE_ROOT) / "plugin-updates").iterdir()))
 
     def test_git_clone_failure_is_reported_and_partial_directory_removed(self):
         source = Path(manager.DEFAULT_SOURCE_ROOT) / "example-site"
@@ -827,6 +928,8 @@ class AppManagerTests(unittest.TestCase):
         ), patch.object(manager, "_retire_legacy_root_service"), patch.object(
             manager, "_atomic_symlink"
         ), patch.object(manager, "_wait_for_health", return_value=True), patch.object(
+            manager, "_assert_loopback_binding"
+        ) as binding, patch.object(
             manager, "_activate_nginx_config", return_value=activation
         ) as activate, patch.object(
             manager, "_run_as_user", return_value=subprocess.CompletedProcess(
@@ -836,6 +939,7 @@ class AppManagerTests(unittest.TestCase):
             result = manager.deploy_app(app["id"])
 
         self.assertEqual(adapter.route, "/custom-route/")
+        binding.assert_called_once()
         self.assertEqual(run_as_user.call_args.kwargs["environment"]["APP_BASE_PATH"], "/custom-route")
         activate.assert_called_once()
         self.assertEqual(activate.call_args.args[0]["route"], "/custom-route/")
@@ -914,6 +1018,163 @@ class AppManagerTests(unittest.TestCase):
         ):
             self.assertFalse(manager.check_app_health(app))
 
+    def test_runtime_listener_must_be_loopback_only(self):
+        app = {"port": 8123}
+        for address, valid in (("127.0.0.1:8123", True), ("[::1]:8123", True), ("0.0.0.0:8123", False), ("*:8123", False), ("[::]:8123", False)):
+            with self.subTest(address=address), patch.object(manager, "run_command", return_value=subprocess.CompletedProcess(
+                [], 0, stdout=f"LISTEN 0 128 {address} 0.0.0.0:*\n", stderr="",
+            )):
+                if valid:
+                    manager._assert_loopback_binding(app, 10)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "exposed"):
+                        manager._assert_loopback_binding(app, 10)
+        with patch.object(manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")):
+            with self.assertRaisesRegex(RuntimeError, "not listening"):
+                manager._assert_loopback_binding(app, 10)
+
+    def test_static_deployment_uses_nginx_without_creating_a_runtime_service(self):
+        app = self.add_app("Static deployment")["app"]
+        paths = manager._app_paths(app["id"], manager.get_config())
+        paths["source"].mkdir(parents=True)
+        paths["releases"].mkdir(parents=True)
+        (paths["source"] / "index.html").write_text("<h1>Ready</h1>", encoding="utf-8")
+        activation = {"active": True, "route": app["route"], "message": "Static route active"}
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "ensure_app_user", return_value=app["service_user"]
+        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
+            manager, "clone_or_update_repo"
+        ), patch.object(manager, "git_output", return_value="a" * 40), patch.object(
+            manager, "_prepare_release_directory", side_effect=lambda path, user: path.mkdir()
+        ), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
+            manager, "_service_path", return_value=Path(self.temp_dir.name) / "static.service"
+        ), patch.object(manager, "_environment_values_app", return_value={}), patch.object(
+            manager, "_seal_release"
+        ), patch.object(manager, "_write_service") as write_service, patch.object(
+            manager, "_retire_legacy_root_service"
+        ), patch.object(manager, "_atomic_symlink"), patch.object(
+            manager, "_systemctl"
+        ) as systemctl, patch.object(manager, "_wait_for_health") as runtime_health, patch.object(
+            manager, "_activate_nginx_config", return_value=activation
+        ), patch.object(manager, "_prune_releases"), patch("backend.adapters._prepare_build_copy_permissions"):
+            result = manager.deploy_app(app["id"])
+        write_service.assert_not_called()
+        systemctl.assert_not_called()
+        runtime_health.assert_not_called()
+        self.assertTrue(result["app"]["hosting_active"])
+        self.assertEqual(result["app"]["public_url"], manager.DEFAULT_PUBLIC_ORIGIN + app["route"])
+
+    def test_runtime_start_checks_health_and_socket_isolation(self):
+        app = self.add_app("Runtime checks")["app"]
+        manager.edit_app(app["id"], {"framework": "node"})
+        service_path = Path(self.temp_dir.name) / "runtime.service"
+        service_path.touch()
+        for healthy, isolated in ((True, True), (False, True), (True, False)):
+            with self.subTest(healthy=healthy, isolated=isolated), patch.object(
+                manager, "_require_root"
+            ), patch.object(manager, "_service_path", return_value=service_path), patch.object(
+                manager, "_systemctl"
+            ) as systemctl, patch.object(manager, "_wait_for_health", return_value=healthy), patch.object(
+                manager, "_assert_loopback_binding", side_effect=None if isolated else RuntimeError("Public listener")
+            ) as binding:
+                if healthy and isolated:
+                    manager.start_app(app["id"])
+                else:
+                    with self.assertRaises(RuntimeError):
+                        manager.start_app(app["id"])
+                expected_calls = [("start", service_path.name)]
+                if not (healthy and isolated):
+                    expected_calls.append(("stop", service_path.name))
+                self.assertEqual([item.args for item in systemctl.call_args_list], expected_calls)
+                self.assertEqual(binding.call_count, int(healthy))
+                stored = manager._find_app(manager.get_registry(), app["id"])
+                self.assertEqual(stored["status"], "running" if healthy and isolated else "failed")
+
+    def test_failed_static_conversion_restores_and_reenables_the_previous_runtime(self):
+        app = self.add_app("Converted static")["app"]
+        paths = manager._app_paths(app["id"], manager.get_config())
+        paths["source"].mkdir(parents=True)
+        paths["releases"].mkdir(parents=True)
+        paths["current"].mkdir()
+        (paths["source"] / "index.html").write_text("Ready", encoding="utf-8")
+        service_path = Path(self.temp_dir.name) / "previous.service"
+        service_path.write_text("previous runtime service", encoding="utf-8")
+        with manager._registry_transaction() as registry:
+            manager._find_app(registry, app["id"])["status"] = "running"
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "ensure_app_user", return_value=app["service_user"]
+        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
+            manager, "clone_or_update_repo"
+        ), patch.object(manager, "git_output", return_value="a" * 40), patch.object(
+            manager, "_prepare_release_directory", side_effect=lambda path, user: path.mkdir()
+        ), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
+            manager, "_service_path", return_value=service_path
+        ), patch.object(manager, "_environment_values_app", return_value={}), patch.object(
+            manager, "_seal_release"
+        ), patch.object(manager, "_retire_legacy_root_service"), patch.object(
+            manager, "_atomic_symlink"
+        ), patch.object(manager, "_restore_service_file") as restore, patch.object(
+            manager, "_systemctl"
+        ) as systemctl, patch.object(manager, "_wait_for_health", return_value=True), patch.object(
+            manager, "_activate_nginx_config", side_effect=RuntimeError("Nginx refused activation")
+        ), patch("backend.adapters._prepare_build_copy_permissions"):
+            with self.assertRaisesRegex(RuntimeError, "Nginx refused activation"):
+                manager.deploy_app(app["id"])
+        self.assertEqual([item.args for item in restore.call_args_list], [
+            (service_path, None), (service_path, b"previous runtime service"),
+        ])
+        actions = [item.args for item in systemctl.call_args_list]
+        self.assertIn(("disable", "--now", service_path.name), actions)
+        self.assertIn(("enable", service_path.name), actions)
+        self.assertIn(("restart", service_path.name), actions)
+        stored = manager._find_app(manager.get_registry(), app["id"])
+        self.assertEqual(stored["status"], "running")
+        self.assertEqual(stored["deployments"][0]["status"], "failed")
+        self.assertNotIn("rollback_error", stored["deployments"][0])
+
+    def test_static_health_checks_the_active_release_without_a_runtime(self):
+        app = self.add_app()["app"]
+        index = manager._app_paths(app["id"], manager.get_config())["current"] / "app" / "index.html"
+        index.parent.mkdir(parents=True)
+        index.write_text("<h1>Live</h1>", encoding="utf-8")
+        app.update(status="running", hosting_active=True, active_route=app["route"])
+        with patch.object(manager.urllib.request, "build_opener") as opener:
+            self.assertTrue(manager.check_app_health(app))
+            opener.assert_not_called()
+        self.assertEqual(manager.app_health_url(app), manager.DEFAULT_PUBLIC_ORIGIN + app["route"])
+        app["status"] = "stopped"
+        self.assertFalse(manager.check_app_health(app))
+
+    def test_nextjs_health_path_matches_the_public_base_path(self):
+        app = {"id": "demo", "framework": "nextjs", "port": 8123, "route": "/apps/demo/"}
+        for health, expected in (
+            ("/", "/apps/demo/"), ("/health", "/apps/demo/health"),
+            ("/apps/demo/health", "/apps/demo/health"),
+        ):
+            with self.subTest(health=health):
+                self.assertEqual(
+                    manager.app_health_url(dict(app, health_check_url=health)),
+                    "http://127.0.0.1:8123" + expected,
+                )
+
+    def test_static_start_and_stop_manage_only_the_application_route(self):
+        app = self.add_app()["app"]
+        index = manager._app_paths(app["id"], manager.get_config())["current"] / "app" / "index.html"
+        index.parent.mkdir(parents=True)
+        index.write_text("<h1>Live</h1>", encoding="utf-8")
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "_activate_nginx_config", return_value={"active": True}
+        ) as activate, patch.object(manager, "_remove_nginx_config") as remove, patch.object(
+            manager, "_systemctl"
+        ) as systemctl:
+            self.assertEqual(manager.start_app(app["id"])["status"], "running")
+            self.assertTrue(manager.get_registry()["apps"][0]["hosting_active"])
+            self.assertEqual(manager.stop_app(app["id"])["status"], "stopped")
+            self.assertFalse(manager.get_registry()["apps"][0]["hosting_active"])
+        activate.assert_called_once()
+        remove.assert_called_once()
+        systemctl.assert_not_called()
+
     def test_logs_returns_recent_app_specific_output(self):
         app = self.add_app()["app"]
         log_dir = Path(app["log_path"])
@@ -955,6 +1216,8 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         group_id=None,
         log=None,
         restrictive_permissions=False,
+        app_route=None,
+        next_config=None,
     ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -971,6 +1234,8 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
             "scripts": {"build": "next build"},
         }
         (package_dir / "package.json").write_text(json.dumps(package_data), encoding="utf-8")
+        if next_config is not None:
+            (package_dir / "next.config.mjs").write_text(next_config, encoding="utf-8")
         (repo / "app").mkdir(exist_ok=True)
         (repo / "app" / "page.tsx").write_text("export default function Page() { return null; }\n", encoding="utf-8")
         if root_package is not None:
@@ -989,7 +1254,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
                 for filename in filenames:
                     (Path(current) / filename).chmod(0o600)
         result = NextJSAdapter().build(
-            {"port": 8123, "build_config": app_build_config or {}},
+            {"port": 8123, "build_config": app_build_config or {}, "route": app_route},
             repo,
             release,
             runner=runner,
@@ -1022,6 +1287,25 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         )
         self.assertEqual((repo / "package-lock.json").read_text(encoding="utf-8"), package_lock)
         self.assertTrue((release / "app" / "package-lock.json").is_file())
+
+    def test_nextjs_generates_route_defaults_only_in_the_release_copy(self):
+        runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+        repo, release, _, _ = self.build_project({}, runner, app_route="/demo/")
+        self.assertFalse((repo / "next.config.mjs").exists())
+        config = (release / "app" / "next.config.mjs").read_text(encoding="utf-8")
+        self.assertIn("process.env.APP_BASE_PATH", config)
+        self.assertIn("trailingSlash: true", config)
+        check = runner.call_args_list[1].args[0]
+        self.assertEqual(check[:2], ["node", "--eval"])
+        self.assertEqual(check[-1], "/demo")
+
+    def test_nextjs_preserves_existing_config_and_validates_its_route(self):
+        config = "export default { basePath: '/custom', trailingSlash: true };\n"
+        runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+        repo, release, _, _ = self.build_project({}, runner, app_route="/custom/", next_config=config)
+        self.assertEqual((repo / "next.config.mjs").read_text(encoding="utf-8"), config)
+        self.assertEqual((release / "app" / "next.config.mjs").read_text(encoding="utf-8"), config)
+        self.assertEqual(runner.call_args_list[1].args[0][-1], "/custom")
 
     def test_npm_shrinkwrap_is_used_as_npm_lockfile(self):
         shrinkwrap = json.dumps({"lockfileVersion": 3, "packages": {}})
@@ -1361,6 +1645,71 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         self.assertEqual(runner.call_count, 1)
 
 
+class FrameworkAdapterTests(unittest.TestCase):
+    def test_static_build_requires_no_runtime_by_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "index.html").write_text("<h1>Ready</h1>", encoding="utf-8")
+            runner = Mock()
+            result = get_adapter("static").build({"port": 8123}, source, root / "release", runner=runner)
+            self.assertFalse(result["runtime_required"])
+            self.assertEqual(result["start_command"], [])
+            runner.assert_not_called()
+
+    def test_node_uses_lockfile_package_manager_without_injecting_start_flags(self):
+        for package_manager, lockfile in (
+            ("npm", None), ("pnpm", "pnpm-lock.yaml"),
+            ("yarn", "yarn.lock"), ("bun", "bun.lock"),
+        ):
+            with self.subTest(package_manager=package_manager), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source"
+                source.mkdir()
+                (source / "package.json").write_text(json.dumps({
+                    "scripts": {"build": "compile", "start": "node server.js"},
+                }), encoding="utf-8")
+                if lockfile:
+                    (source / lockfile).write_text("lockfile", encoding="utf-8")
+                runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+                result = get_adapter("node").build(
+                    {"port": 8123}, source, root / "release", runner=runner,
+                )
+                self.assertEqual(result["start_command"], [package_manager, "run", "start"])
+                self.assertEqual(runner.call_args_list[0].args[0][0], package_manager)
+                self.assertIn(mock_call([package_manager, "run", "build"], root / "release" / "app", 900), runner.call_args_list)
+
+    def test_node_requires_a_start_script_or_explicit_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text('{"scripts":{"build":"compile"}}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "start script"):
+                get_adapter("node").build({"port": 8123}, root, root / "release")
+
+    def test_node_accepts_an_explicit_start_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "package.json").write_text("{}", encoding="utf-8")
+            command = ["node", "dist/server.js"]
+            result = get_adapter("node").build(
+                {"port": 8123, "build_config": {"start_command": command}},
+                source, root / "release",
+                runner=Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")),
+            )
+            self.assertEqual(result["start_command"], command)
+
+    def test_node_rejects_malformed_package_manifest(self):
+        for contents in ("[]", '{"scripts":[]}', "not json"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "package.json").write_text(contents, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "package.json"):
+                    get_adapter("node").build({"port": 8123}, root, root / "release")
+
+
 class InfrastructureConfigurationTests(unittest.TestCase):
     def _nginx_site_fixture(self, root: Path, contents: str) -> tuple[Path, Path, str]:
         config_root = root / "etc" / "nginx"
@@ -1413,7 +1762,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         for action in ("deploy", "pull", "edit", "health", "environment", "restart", "stop", "start", "logs", "remove"):
             self.assertIn(f'data-action="{action}"', frontend)
         for endpoint in (
-            'callBackend("add", [JSON.stringify(payload)])',
+            'callBackend("add", [JSON.stringify(setup.payload)])',
             'callBackend("edit", [app.id, JSON.stringify(payload)])',
             'callBackend("logs", [appId, "--lines", "200"])',
             'callBackend("health", [appId])',
@@ -1684,7 +2033,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             "/website1/_next/static/chunks/app.js",
             "/website1/socket.io/?EIO=4&transport=websocket",
         )
-        self.assertIn("return 308 /website1/;", nextjs)
+        self.assertIn("return 308 /website1/$is_args$args;", nextjs)
         self.assertIn("location ^~ /website1/ {", nextjs)
         next_proxy_pass = next(line for line in nextjs.splitlines() if "proxy_pass " in line)
         self.assertTrue(next_proxy_pass.endswith("8123;"))
@@ -1717,6 +2066,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             self.assertIn("proxy_pass http://127.0.0.1:8123/;", stripped_prefix)
             self.assertIn("proxy_set_header X-Forwarded-Prefix /website1;", stripped_prefix)
             self.assertIn("proxy_redirect / /website1/;", stripped_prefix)
+            self.assertIn("proxy_redirect http://127.0.0.1:8123/ /website1/;", stripped_prefix)
+            self.assertIn("proxy_cookie_path / /website1/;", stripped_prefix)
             self.assertIn("proxy_set_header Connection $app_manager_connection_upgrade;", stripped_prefix)
             self.assertNotIn("$http_connection", stripped_prefix)
             for request_path, expected_upstream_path in (
@@ -1768,7 +2119,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             route="/customer-portal/",
         )
         self.assertIn("location = /customer-portal {", config)
-        self.assertIn("return 308 /customer-portal/;", config)
+        self.assertIn("return 308 /customer-portal/$is_args$args;", config)
         self.assertIn("location ^~ /customer-portal/ {", config)
         self.assertIn("proxy_set_header X-Forwarded-Prefix /customer-portal;", config)
         self.assertIn("proxy_redirect / /customer-portal/;", config)
@@ -2090,7 +2441,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('if [[ "$BACKEND_DEST" == "/usr/libexec/cockpit" ]]', uninstaller)
         self.assertIn("dpkg --compare-versions", installer)
         self.assertIn("Python 3.9 or newer is required", installer)
-        self.assertIn('systemd-run; do', installer)
+        for required in ("systemd-run", "ss", "nginx", "git", "runuser"):
+            self.assertRegex(installer, rf"for required_command in [^;\n]*\b{required}\b[^;\n]*; do")
         self.assertIn('cockpit-app-manager-auto-deploy.timer', installer)
         self.assertIn("systemctl enable --now cockpit-app-manager-auto-deploy.timer", installer)
         self.assertIn("remove_auto_deploy_units", uninstaller)
@@ -2118,13 +2470,19 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotIn("/cockpit/static/desktop.css", cockpit_page)
         self.assertNotIn("<style", cockpit_page)
         self.assertIn('name="route"', cockpit_page)
-        self.assertIn("A single URL prefix on the existing site", cockpit_page)
+        for step in range(3):
+            self.assertIn(f'data-setup-step="{step}"', cockpit_page)
+        self.assertIn('id="setupReview"', cockpit_page)
+        self.assertIn('<script src="icons.js" defer></script>', cockpit_page)
+        self.assertTrue((cockpit_dir / "icons.js").is_file())
         self.assertTrue((cockpit_dir / "app-manager.js").is_file())
         frontend = (cockpit_dir / "app-manager.js").read_text(encoding="utf-8")
         self.assertIn("Deploy to activate", frontend)
         self.assertIn("const routeIsActive = Boolean(app.hosting_active && app.active_route);", frontend)
         self.assertIn("safeUrl && routeIsActive", frontend)
-        self.assertIn("Deploy will add the managed route include", frontend)
+        self.assertIn("function renderAppList()", frontend)
+        self.assertIn('data-action="deployment-log"', frontend)
+        self.assertNotIn("process.close()", frontend)
         self.assertNotIn("@import", stylesheet)
         self.assertNotRegex(stylesheet, r"url\(\s*['\"]?https?://")
         self.assertIn(".am-app-manager", stylesheet)
@@ -2141,8 +2499,13 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             'install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.js" "$PLUGIN_DEST/app-manager.js"',
             installer,
         )
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/icons.js" "$PLUGIN_DEST/icons.js"',
+            installer,
+        )
 
 
+@unittest.skipIf(os.name == "nt", "Uninstall integration tests require POSIX Bash and file permissions")
 class UninstallScriptTests(unittest.TestCase):
     def _write_registry(self, temp_root: Path, app_id: str, production_path=None) -> Path:
         state_root = temp_root / "var" / "lib" / "cockpit" / "app-manager"

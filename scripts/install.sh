@@ -45,7 +45,7 @@ preflight() {
   [[ "${ID:-}" == "ubuntu" ]] || fail "Ubuntu Server is required; found ${ID:-unknown}."
 
   local required_command
-  for required_command in install python3 dpkg-query dpkg cockpit-bridge systemctl systemd-run; do
+  for required_command in install python3 dpkg-query dpkg cockpit-bridge systemctl systemd-run ss nginx git runuser; do
     command -v "$required_command" >/dev/null 2>&1 || fail "Required command is missing: $required_command"
   done
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' ||
@@ -61,6 +61,7 @@ preflight() {
   [[ -f "$APP_DIR/cockpit/index.html" ]] || fail "Cockpit plugin entry point is missing."
   [[ -f "$APP_DIR/cockpit/app-manager.css" ]] || fail "Cockpit plugin stylesheet is missing."
   [[ -f "$APP_DIR/cockpit/app-manager.js" ]] || fail "Cockpit plugin JavaScript is missing."
+  [[ -f "$APP_DIR/cockpit/icons.js" ]] || fail "Offline icons are missing; run npm ci and npm run build:icons in the project."
   [[ -f "$APP_DIR/backend/app_manager.py" && -f "$APP_DIR/backend/adapters.py" ]] ||
     fail "Required backend modules are missing."
   [[ -f "$APP_DIR/config/defaults.json" ]] || fail "Default configuration is missing."
@@ -99,6 +100,7 @@ install_files() {
   install -o root -g root -m 0644 "$APP_DIR/cockpit/manifest.json" "$PLUGIN_DEST/manifest.json"
   install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.css" "$PLUGIN_DEST/app-manager.css"
   install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.js" "$PLUGIN_DEST/app-manager.js"
+  install -o root -g root -m 0644 "$APP_DIR/cockpit/icons.js" "$PLUGIN_DEST/icons.js"
 
   install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"
   install -o root -g root -m 0644 "$APP_DIR/backend/adapters.py" "$BACKEND_DEST/adapters.py"

@@ -5,6 +5,7 @@ import argparse
 import codecs
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -989,11 +990,13 @@ def _run_as_user(
     home = str(_home_path(username.removeprefix("app-")))
     env_args = [
         "env",
+        "-i",
         f"HOME={home}",
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_TERMINAL_PROMPT=0",
     ]
     for key, value in (environment or {}).items():
-        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) or "\0" in value:
+        if not ENV_KEY_RE.fullmatch(key) or not isinstance(value, str) or "\0" in value:
             raise ValueError("Invalid application environment variable")
         env_args.append(f"{key}={value}")
     return run_command(
@@ -1125,6 +1128,13 @@ def app_health_url(app: Dict[str, Any]) -> str:
     health = app.get("health_check_url") or "/"
     if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
         raise ValueError("Health-check URL must be a local path")
+    if app.get("framework") == "static" and not app.get("build_config", {}).get("start_command"):
+        route = validate_app_route(app.get("active_route") or app.get("route"), app["id"])
+        return _public_url_for_route(route) + health.lstrip("/")
+    if app.get("framework") == "nextjs":
+        route = validate_app_route(app.get("route"), app["id"])
+        if health != route.rstrip("/") and not health.startswith(route):
+            health = route + health.lstrip("/")
     port = app.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
         raise ValueError("Application has an invalid port")
@@ -1132,6 +1142,9 @@ def app_health_url(app: Dict[str, Any]) -> str:
 
 
 def check_app_health(app: Dict[str, Any], timeout_seconds: int = 30) -> bool:
+    if app.get("framework") == "static" and not app.get("build_config", {}).get("start_command"):
+        index = _app_paths(app["id"], get_config())["current"] / "app" / "index.html"
+        return bool(app.get("hosting_active") and app.get("status") == "running" and index.is_file())
     request = urllib.request.Request(app_health_url(app), method="GET")
     opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
@@ -1156,6 +1169,29 @@ def _wait_for_health(app: Dict[str, Any], timeout_seconds: int) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+
+def _assert_loopback_binding(app: Dict[str, Any], timeout: int) -> None:
+    port = app["port"]
+    result = run_command(["ss", "-H", "-ltn", f"sport = :{port}"], timeout=timeout)
+    _command_error(result, "Checking application listener isolation")
+    listeners = []
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            raise RuntimeError("Could not verify the application TCP listener")
+        address, _, listed_port = fields[3].rpartition(":")
+        if listed_port != str(port):
+            raise RuntimeError("Listener inspection returned an unexpected port")
+        try:
+            is_loopback = ipaddress.ip_address(address.strip("[]")).is_loopback
+        except ValueError:
+            is_loopback = False
+        if not is_loopback:
+            raise RuntimeError(f"Application port {port} is exposed on {address}; configure the app to bind to 127.0.0.1")
+        listeners.append(address)
+    if not listeners:
+        raise RuntimeError(f"Application is not listening on its assigned port {port}")
 
 
 def app_metadata(app: Dict[str, Any]) -> Dict[str, Any]:
@@ -1708,7 +1744,30 @@ def plugin_update() -> Dict[str, Any]:
             env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"]},
         )
         _command_error(install_result, "Reinstalling the App Manager plugin")
-        return {"ok": True, "updated": True, "commit": match.group(0)}
+        result = {"ok": True, "updated": True, "commit": match.group(0)}
+        try:
+            restart = run_command(
+                [
+                    "systemd-run",
+                    "--quiet",
+                    "--collect",
+                    f"--unit=cockpit-app-manager-restart-{os.getpid()}",
+                    "--on-active=5s",
+                    "--timer-property=AccuracySec=1s",
+                    "systemctl",
+                    "restart",
+                    "cockpit.service",
+                ],
+                timeout=30,
+                env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"]},
+            )
+            _command_error(restart, "Scheduling the Cockpit restart")
+            result["restart_scheduled"] = True
+            result["restart_delay_seconds"] = 5
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            result["restart_scheduled"] = False
+            result["restart_error"] = str(exc)
+        return result
     finally:
         shutil.rmtree(update_root)
 
@@ -1733,6 +1792,13 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     for key in update:
         if key not in allowed_keys:
             raise ValueError(f"Unsupported configuration key: {key!r}")
+    for key in ("build_timeout_seconds", "health_timeout_seconds", "command_timeout_seconds"):
+        if key in update:
+            value = update[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{key} must be a positive integer")
+    if "default_branch" in update:
+        update["default_branch"] = validate_branch(update["default_branch"])
     if "source_root" in update:
         update["source_root"] = str(validate_allowed_path(update["source_root"], [DEFAULT_SOURCE_ROOT]))
     if "production_root" in update:
@@ -1759,7 +1825,13 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
             or start < PORT_START or end > PORT_END or start > end
         ):
             raise ValueError("Configured port range must stay within 8100-8999")
-        update["port_range"] = {"start": start, "end": end, "reserved": sorted(set(RESERVED_PORTS) | set(port_range.get("reserved", [])))}
+        reserved = port_range.get("reserved", [])
+        if not isinstance(reserved, list) or any(
+            isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
+            for port in reserved
+        ):
+            raise ValueError("Reserved ports must be an array of integer port numbers")
+        update["port_range"] = {"start": start, "end": end, "reserved": sorted(set(RESERVED_PORTS) | set(reserved))}
     if "release_retention" in update:
         retention = update["release_retention"]
         if isinstance(retention, bool) or not isinstance(retention, int) or retention != 1:
@@ -1881,7 +1953,7 @@ def _render_service(
     exec_start = " ".join(_systemd_quote(part) for part in start_command)
     node_environment = (
         f"Environment={_systemd_quote('NODE_ENV=production')}\n"
-        if app.get("framework") == "nextjs"
+        if app.get("framework") in {"nextjs", "node"}
         else ""
     )
     return (
@@ -1965,7 +2037,11 @@ def _render_nginx_config(
         proxy_redirect = (
             "    proxy_redirect off;\n"
             if framework == "nextjs"
-            else f"    proxy_redirect / {route};\n"
+            else (
+                f"    proxy_redirect http://127.0.0.1:{port}/ {route};\n"
+                f"    proxy_redirect / {route};\n"
+                f"    proxy_cookie_path / {route};\n"
+            )
         )
         route_location = (
             f"# Managed by Cockpit App Manager: {app_id}\n"
@@ -2166,6 +2242,14 @@ def _nginx_config_sections(output: str) -> List[Tuple[Path, str]]:
     return sections
 
 
+def _nginx_includes_path(output: str, path: Path) -> bool:
+    expected = path.resolve(strict=False)
+    return any(
+        listed_path.resolve(strict=False) == expected
+        for listed_path, _ in _nginx_config_sections(output)
+    )
+
+
 def _select_nginx_site_server(output: str, hostname: str) -> Tuple[Path, str, Dict[str, Any]]:
     matches: List[Tuple[Path, str, Dict[str, Any], bool]] = []
     config_root = Path(DEFAULT_NGINX_CONFIG_ROOT).resolve(strict=False)
@@ -2334,8 +2418,9 @@ def _activate_nginx_config_locked(
         _command_error(test_result, "nginx -t")
         verification = run_command(["nginx", "-T"], timeout=int(config["command_timeout_seconds"]))
         _command_error(verification, "nginx -T after managed include")
-        snippet_marker = f"# configuration file {snippet_path.resolve(strict=False)}:"
-        if snippet_marker not in ((verification.stdout or "") + "\n" + (verification.stderr or "")):
+        if not _nginx_includes_path(
+            (verification.stdout or "") + "\n" + (verification.stderr or ""), snippet_path
+        ):
             raise RuntimeError(
                 f"Nginx did not load the generated application snippet {snippet_path}"
             )
@@ -2387,8 +2472,9 @@ def _remove_nginx_config_locked(app_id: str, config: Dict[str, Any]) -> None:
     if config_listing.returncode != 0:
         detail = (config_listing.stderr or config_listing.stdout or "").strip()[-2000:]
         raise RuntimeError(f"Could not verify whether the Nginx snippet is active: {detail}")
-    marker = f"# configuration file {snippet_path.resolve(strict=False)}:"
-    snippet_is_active = marker in ((config_listing.stdout or "") + "\n" + (config_listing.stderr or ""))
+    snippet_is_active = _nginx_includes_path(
+        (config_listing.stdout or "") + "\n" + (config_listing.stderr or ""), snippet_path
+    )
     snippet_path.unlink()
     if not snippet_is_active:
         return
@@ -2670,6 +2756,8 @@ def auto_deploy_apps() -> Dict[str, Any]:
 def deployment_start_app(app_id: str) -> Dict[str, Any]:
     _require_root()
     app_id = validate_app_id(app_id)
+    _find_app(get_registry(), app_id)
+    ensure_app_user(app_id)
     release_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
     started_at = now_iso()
     with _registry_transaction() as registry:
@@ -2686,6 +2774,7 @@ def deployment_start_app(app_id: str) -> Dict[str, Any]:
             "id": release_id,
             "name": app["name"],
             "date": started_at,
+            "previous_status": app.get("status", "stopped"),
             "commit": None,
             "release": None,
             "release_available": False,
@@ -2725,7 +2814,7 @@ def deployment_start_app(app_id: str) -> Dict[str, Any]:
             "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
             "--property=CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_KILL",
             "--property=UMask=0027",
-            f"--property=ReadWritePaths={DEFAULT_STATE_ROOT} {DEFAULT_PRODUCTION_ROOT} {DEFAULT_LOG_ROOT} /etc/systemd/system /etc/nginx /etc/passwd /etc/shadow /etc/group /etc/gshadow",
+            f"--property=ReadWritePaths={DEFAULT_STATE_ROOT} {DEFAULT_PRODUCTION_ROOT} {DEFAULT_LOG_ROOT} /etc/systemd/system /etc/nginx",
             "--property=StandardOutput=null",
             "--property=StandardError=journal",
             "--",
@@ -2804,10 +2893,13 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 (item for item in app.get("deployments", []) if item.get("id") == release_id),
                 None,
             )
+            if existing is not None:
+                app_snapshot["status"] = existing.get("previous_status", app_snapshot["status"])
         record = dict(existing) if existing else {
             "id": release_id,
             "name": app_snapshot["name"],
             "date": now_iso(),
+            "previous_status": app_snapshot.get("status", "stopped"),
             "commit": None,
             "release": None,
             "release_available": False,
@@ -2831,6 +2923,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
         deployment_log: Optional[Path] = None
         unit_written = False
         activation_attempted = False
+        runtime_required = True
         try:
             deployment_log = _deployment_log_path(app_id, release_id, create=True)
             _prune_deployment_logs(app_id, release_id)
@@ -2894,6 +2987,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
             _append_deployment_log(deployment_log, "Build completed; activating the release")
             _raise_if_deployment_cancelled(cancel_file)
             _seal_release(release_dir, release_group, public=framework == "static")
+            runtime_required = build_result.get("runtime_required", True)
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
             working_directory = None
             build_working_directory = build_result.get("working_directory")
@@ -2907,18 +3001,29 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 if not actual_build_directory.is_dir():
                     raise RuntimeError("Framework adapter returned a non-directory working directory")
                 working_directory = paths["current"] / "app" / relative_build_directory
-            _write_service(app_snapshot, release_dir, command, config, working_directory)
-            unit_written = True
-            _systemctl("daemon-reload")
+            if runtime_required:
+                _write_service(app_snapshot, release_dir, command, config, working_directory)
+                unit_written = True
+                _systemctl("daemon-reload")
+            elif previous_service_content is not None:
+                activation_attempted = True
+                unit_written = True
+                _systemctl("disable", "--now", service_path.name)
+                _restore_service_file(service_path, None)
+                _systemctl("daemon-reload")
             _retire_legacy_root_service(app_snapshot)
             _atomic_symlink(release_dir, paths["current"])
             activation_attempted = True
-            _systemctl("enable", service_path.name)
-            _systemctl("restart", service_path.name)
-            _raise_if_deployment_cancelled(cancel_file)
-            _append_deployment_log(deployment_log, "Waiting for the application health check")
-            if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
-                raise RuntimeError("Application did not pass its health check before the timeout")
+            if runtime_required:
+                _systemctl("enable", service_path.name)
+                _systemctl("restart", service_path.name)
+                _raise_if_deployment_cancelled(cancel_file)
+                _append_deployment_log(deployment_log, "Waiting for the application health check")
+                if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
+                    raise RuntimeError("Application did not pass its health check before the timeout")
+                _assert_loopback_binding(app_snapshot, int(config["command_timeout_seconds"]))
+            elif not (release_dir / "app" / "index.html").is_file():
+                raise RuntimeError("Static release is missing index.html")
             _raise_if_deployment_cancelled(cancel_file)
             _append_deployment_log(deployment_log, "Generating and activating the application Nginx route")
             with _registry_transaction() as registry:
@@ -2958,23 +3063,29 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 if unit_written and service_path is not None:
                     _restore_service_file(service_path, previous_service_content)
                     _systemctl("daemon-reload")
+                    if not runtime_required and previous_service_content is not None:
+                        _systemctl("enable", service_path.name)
                 if activation_attempted and paths is not None and current_release is not None and current_release.is_dir():
                     _atomic_symlink(current_release, paths["current"])
                     if previous_service_content is not None and service_path is not None:
                         if app_snapshot.get("status") == "running":
                             _systemctl("restart", service_path.name)
-                            if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
+                            previous_app = dict(app_snapshot, route=app_snapshot.get("active_route") or app_snapshot["route"])
+                            if not _wait_for_health(previous_app, int(config["health_timeout_seconds"])):
                                 raise RuntimeError("The previous release did not recover its health check")
                         else:
                             _systemctl("stop", service_path.name)
                     else:
-                        if service_path is not None:
+                        if runtime_required and service_path is not None:
                             _systemctl("stop", service_path.name)
-                elif activation_attempted and previous_service_content is None and service_path is not None:
-                    _systemctl("stop", service_path.name)
+                elif activation_attempted and previous_service_content is None:
+                    if paths is not None and paths["current"].is_symlink():
+                        paths["current"].unlink()
+                    if runtime_required and service_path is not None:
+                        _systemctl("stop", service_path.name)
             except Exception as rollback_exc:
                 rollback_error = str(rollback_exc)
-            if activation_attempted and current_release is None and service_path is not None:
+            if activation_attempted and current_release is None and runtime_required and service_path is not None:
                 with contextlib.suppress(Exception):
                     _systemctl("disable", "--now", service_path.name)
             record.update({
@@ -3020,7 +3131,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
         app_snapshot.update({"status": "running", "framework": framework, "latest_commit": commit or app_snapshot.get("latest_commit")})
         return {
             "ok": True,
-            "app": app_snapshot,
+            "app": app_metadata(app),
             "build": build_result,
             "deployment": record,
             "hosting": hosting_result,
@@ -3107,12 +3218,42 @@ def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
             app_snapshot = dict(app)
+        if app_snapshot.get("framework") == "static" and not app_snapshot.get("build_config", {}).get("start_command"):
+            route = app_snapshot.get("active_route") or app_snapshot["route"]
+            if action_name == "stop":
+                _remove_nginx_config(app_id, config)
+            else:
+                index = _app_paths(app_id, config)["current"] / "app" / "index.html"
+                if not index.is_file():
+                    raise RuntimeError("Static application has no deployed index.html; deploy it first")
+                _activate_nginx_config(dict(app_snapshot, route=route), "static", config)
+            status = "stopped" if action_name == "stop" else "running"
+            with _registry_transaction() as registry:
+                app = _find_app(registry, app_id)
+                app["status"] = status
+                app["hosting_active"] = status == "running"
+                app["active_route"] = route
+                app["updated_at"] = now_iso()
+            return {"ok": True, "app_id": app_id, "status": status}
         service_path = _service_path(app_snapshot)
         if not service_path.exists():
             raise RuntimeError(f"Application service {service_path.name} is not installed; deploy it first")
         _systemctl(action_name, service_path.name)
-        if action_name in {"start", "restart"} and not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
-            raise RuntimeError(f"Application did not pass its health check after {action_name}")
+        active_app = dict(app_snapshot, route=app_snapshot.get("active_route") or app_snapshot["route"])
+        if action_name in {"start", "restart"}:
+            try:
+                if not _wait_for_health(active_app, int(config["health_timeout_seconds"])):
+                    raise RuntimeError(f"Application did not pass its health check after {action_name}")
+                _assert_loopback_binding(active_app, int(config["command_timeout_seconds"]))
+            except RuntimeError:
+                try:
+                    _systemctl("stop", service_path.name)
+                finally:
+                    with _registry_transaction() as registry:
+                        stored = _find_app(registry, app_id)
+                        stored["status"] = "failed"
+                        stored["updated_at"] = now_iso()
+                raise
         status = "stopped" if action_name == "stop" else "running"
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
@@ -3219,6 +3360,7 @@ def _tail_log(path: Path, lines: int, max_bytes: int = 1024 * 1024) -> str:
 
 def health_check_app(app_id: str) -> Dict[str, Any]:
     app = _find_app(get_registry(), app_id)
+    app = dict(app, route=app.get("active_route") or app["route"])
     url = app_health_url(app)
     healthy = check_app_health(app, int(get_config()["health_timeout_seconds"]))
     return {"ok": True, "app_id": app_id, "healthy": healthy, "url": url}

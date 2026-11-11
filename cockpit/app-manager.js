@@ -8,6 +8,11 @@
     deployments: [],
     busy: false,
     deploymentMonitor: null,
+    filter: "all",
+    query: "",
+    sort: "recent",
+    settings: {},
+    logTarget: null,
   };
   const byId = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -18,44 +23,47 @@
     "'": "&#39;",
   })[character]);
 
-  async function callBackend(command, args = []) {
-    const cockpitApi = globalThis.cockpit;
-    if (!cockpitApi || typeof cockpitApi.spawn !== "function") {
-      throw new Error("Cockpit API is unavailable. Ensure ../base1/cockpit.js loads before app-manager.js.");
-    }
-    const output = await cockpitApi.spawn([BACKEND, command, ...args], { superuser: "require" });
-    let result;
-    try {
-      result = JSON.parse(output);
-    } catch (error) {
-      throw new Error(`Backend returned invalid JSON: ${error.message}`);
-    }
-    if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(result?.error || "The backend returned an invalid response.");
-    }
-    return result;
+  const icon = (name) => `<i data-lucide="${name}" aria-hidden="true"></i>`;
+  const renderIcons = () => globalThis.renderAppManagerIcons?.();
+  const frameworkName = (value) => ({ auto: "Auto detect", nextjs: "Next.js", node: "Node.js", go: "Go", python: "Python", static: "Static HTML" })[value] || value;
+  function formatDate(value) {
+    const date = new Date(value);
+    return value && !Number.isNaN(date.valueOf())
+      ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date)
+      : "Not deployed";
   }
 
-  async function callBackendInput(command, args, input) {
+  async function executeBackend(command, args, input) {
     const cockpitApi = globalThis.cockpit;
     if (!cockpitApi || typeof cockpitApi.spawn !== "function") {
       throw new Error("Cockpit API is unavailable. Ensure ../base1/cockpit.js loads before app-manager.js.");
     }
     const process = cockpitApi.spawn([BACKEND, command, ...args], { superuser: "require" });
-    process.input(input);
-    process.close();
-    const output = await process;
+    let output = "";
+    if (typeof process.stream === "function") process.stream((chunk) => { output += chunk; });
+    if (input !== undefined) process.input(input);
+    try {
+      const completed = await process;
+      if (!output) output = completed;
+    } catch (error) {
+      let failure;
+      try { failure = JSON.parse(output); } catch (_parseError) { failure = null; }
+      throw new Error(failure?.error || error.message || "The backend command failed.");
+    }
     let result;
     try {
       result = JSON.parse(output);
     } catch (error) {
       throw new Error(`Backend returned invalid JSON: ${error.message}`);
     }
-    if (!result || typeof result !== "object" || result.ok === false) {
+    if (!result || typeof result !== "object" || Array.isArray(result) || result.ok === false) {
       throw new Error(result?.error || "The backend returned an invalid response.");
     }
     return result;
   }
+
+  const callBackend = (command, args = []) => executeBackend(command, args);
+  const callBackendInput = (command, args, input) => executeBackend(command, args, input);
 
   async function waitForCockpitApi(timeoutMs = 5000) {
     const deadline = Date.now() + timeoutMs;
@@ -110,7 +118,7 @@
     state.busy = busy;
     document.querySelectorAll(".am-app-manager button, .am-app-manager input, .am-app-manager select, .am-app-manager textarea, .am-dialog button, .am-dialog input, .am-dialog select, .am-dialog textarea")
       .forEach((control) => {
-        control.disabled = busy;
+        control.disabled = busy || control.hasAttribute("data-unavailable");
       });
     const refreshButton = byId("refreshButton");
     refreshButton.querySelector("span").textContent = busy ? "Working…" : "Refresh";
@@ -143,16 +151,16 @@
 
   function renderStatus(status) {
     const value = status || "unknown";
-    return `<span class="am-status-pill" data-status="${escapeHtml(value)}">${escapeHtml(value)}</span>`;
+    const label = { running: "Live", stopped: "Stopped", deploying: "Deploying", failed: "Failed", deployed: "Deployed", aborted: "Aborted" }[value] || value;
+    return `<span class="am-status-pill" data-status="${escapeHtml(value)}">${escapeHtml(label)}</span>`;
   }
 
   function renderOverview(data) {
     const cards = [
-      ["Total applications", data.total_apps],
-      ["Running", data.running_apps],
+      ["Applications", data.total_apps],
+      ["Live", data.running_apps],
       ["Stopped", data.stopped_apps],
-      ["Failed deployments", data.failed_deployments],
-      ["Available ports", Array.isArray(data.available_ports) ? data.available_ports.length : 0],
+      ["Needs attention", data.failed_deployments],
     ];
     byId("overviewCards").innerHTML = cards.map(([label, value]) => `
       <div class="am-metric">
@@ -163,19 +171,18 @@
 
     const activity = (data.recent_activity || []).map((item) => `
       <div class="am-activity-item">
-        <span class="am-activity-icon" aria-hidden="true">↗</span>
+        <span class="am-activity-icon" aria-hidden="true">${icon("git-branch")}</span>
         <div>
           <strong class="am-activity-title">${escapeHtml(item.name || "Application")}</strong>
           <span class="am-activity-description">${escapeHtml(item.action || "Updated")}</span>
         </div>
-        <time class="am-activity-time">${escapeHtml(item.when || "Recently")}</time>
+        <time class="am-activity-time">${escapeHtml(formatDate(item.when))}</time>
       </div>
     `).join("");
     byId("recentActivity").innerHTML = activity || `
       <div class="am-empty-state">
-        <span class="am-empty-state__icon" aria-hidden="true">↗</span>
-        <h3>Nothing to report yet</h3>
-        <p>Your recent application activity will appear here.</p>
+        <span class="am-empty-state__icon" aria-hidden="true">${icon("activity")}</span>
+        <h3>No activity yet</h3>
       </div>
     `;
   }
@@ -191,73 +198,101 @@
 
   function renderApps(data) {
     state.apps = data.apps || [];
+    renderAppList();
+  }
+
+  function renderAppList() {
+    byId("appCount").textContent = String(state.apps.length);
+    const filtered = state.apps.filter((app) => {
+      const matchesStatus = state.filter === "all" || (state.filter === "failed"
+        ? app.status === "failed" || app.deployments?.[0]?.status === "failed"
+        : app.status === state.filter);
+      return matchesStatus && [app.name, app.repo_url, app.route, frameworkName(app.framework)]
+        .join(" ").toLowerCase().includes(state.query.toLowerCase());
+    }).sort((first, second) => state.sort === "name"
+      ? first.name.localeCompare(second.name)
+      : String(second.updated_at || "").localeCompare(String(first.updated_at || "")));
+    byId("appsResultCount").textContent = `${filtered.length} of ${state.apps.length} ${state.apps.length === 1 ? "application" : "applications"}`;
     if (!state.apps.length) {
       byId("appsTableContainer").innerHTML = `
         <div class="am-empty-state">
-          <span class="am-empty-state__icon" aria-hidden="true">+</span>
-          <h3>No applications yet</h3>
-          <p>Connect a Git repository to create your first managed application.</p>
-          <button type="button" class="am-button am-button--primary" data-open-add>Add your first application</button>
+          <span class="am-empty-state__icon" aria-hidden="true">${icon("boxes")}</span>
+          <h3>Your next application starts here</h3>
+          <p>No repositories connected.</p>
+          <button type="button" class="am-button am-button--primary" data-open-add>${icon("plus")} New application</button>
         </div>
       `;
+      renderIcons();
+      return;
+    }
+    if (!filtered.length) {
+      byId("appsTableContainer").innerHTML = `<div class="am-empty-state">${icon("search")}<h3>No matching applications</h3><button type="button" class="am-button" data-clear-filters>Clear filters</button></div>`;
+      renderIcons();
       return;
     }
 
-    const cards = state.apps.map((app) => {
+    const cards = filtered.map((app) => {
       const safeUrl = getSafePublicUrl(app.public_url);
       const routeIsActive = Boolean(app.hosting_active && app.active_route);
-      const openControl = safeUrl && routeIsActive
-        ? `<a class="am-button am-app-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Open application</a>`
-        : `<span class="am-field-hint">Application route is not active yet</span>`;
+      const deploying = app.status === "deploying";
+      const unavailable = deploying ? " disabled data-unavailable" : "";
+      const runtimeUnavailable = deploying || !app.last_deploy ? " disabled data-unavailable" : "";
+      const appId = escapeHtml(app.id);
       const serviceControl = app.status === "running"
-        ? `<button type="button" class="am-button" data-action="stop" data-id="${escapeHtml(app.id)}" title="Stop ${escapeHtml(app.name)}">Stop</button>`
-        : `<button type="button" class="am-button" data-action="start" data-id="${escapeHtml(app.id)}" title="Start ${escapeHtml(app.name)}">Start</button>`;
+        ? `<button type="button" data-action="stop" data-id="${appId}"${runtimeUnavailable}>${icon("pause")} Stop application</button>`
+        : `<button type="button" data-action="start" data-id="${appId}"${runtimeUnavailable}>${icon("play")} Start application</button>`;
       const routeStatus = routeIsActive && app.active_route === app.route
         ? "Active"
         : routeIsActive
-          ? `Change pending (currently live: ${app.active_route})`
+          ? "Route change pending"
           : "Deploy to activate";
       const appInitial = String(app.name || "A").trim().charAt(0).toUpperCase() || "A";
       const deployControl = app.status === "deploying"
-        ? `<button type="button" class="am-button am-button--primary" data-action="deployment-log" data-id="${escapeHtml(app.id)}">View deployment</button>`
-        : `<button type="button" class="am-button am-button--primary" data-action="deploy" data-id="${escapeHtml(app.id)}">Deploy</button>`;
+        ? `<button type="button" class="am-button am-button--primary" data-action="deployment-log" data-id="${appId}">${icon("loader-circle")} View deployment</button>`
+        : `<button type="button" class="am-button am-button--primary" data-action="deploy" data-id="${appId}">${icon("arrow-up-right")} ${app.last_deploy ? "Redeploy" : "Deploy"}</button>`;
+      const lastFailure = app.deployments?.[0]?.status === "failed";
       return `
         <article class="am-app-card">
           <header class="am-app-card__heading">
             <span class="am-app-avatar" aria-hidden="true">${escapeHtml(appInitial)}</span>
             <div class="am-app-title-wrap">
               <h3>${escapeHtml(app.name)}</h3>
-              <span class="am-app-framework">${escapeHtml(app.framework || "Framework not detected")}</span>
+              <span class="am-app-framework">${escapeHtml(frameworkName(app.framework || "auto"))}</span>
             </div>
             ${renderStatus(app.status)}
           </header>
+          <div class="am-app-route">${icon("globe")}${safeUrl && routeIsActive
+            ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(app.active_route)}${icon("external-link")}</a>`
+            : `<code>${escapeHtml(app.route)}</code>`}<span class="am-route-state" data-active="${routeIsActive}">${escapeHtml(routeStatus)}</span></div>
+          <p class="am-repository" title="${escapeHtml(app.repo_url)}">${icon("git-branch")}<span>${escapeHtml(app.repo_url)}</span></p>
           <dl class="am-app-meta">
-            <div><dt>Repository</dt><dd title="${escapeHtml(app.repo_url)}">${escapeHtml(app.repo_url || "Not provided")}</dd></div>
             <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
-            <div><dt>Port</dt><dd>${escapeHtml(app.port || "—")}</dd></div>
-            <div><dt>Last deployed</dt><dd>${escapeHtml(app.last_deploy || "Not yet deployed")}</dd></div>
-            <div><dt>Latest commit</dt><dd title="${escapeHtml(app.latest_commit || "No commit yet")}">${escapeHtml(app.latest_commit || "—")}</dd></div>
-            <div><dt>Public URL</dt><dd>${safeUrl && routeIsActive ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(app.public_url)}</a>` : escapeHtml(app.public_url || "Not available")}</dd></div>
-            <div><dt>Hosted route</dt><dd>${escapeHtml(app.route || `/${app.id}/`)} · ${escapeHtml(routeStatus)}</dd></div>
+            <div><dt>${app.framework === "static" && !app.build_config?.start_command ? "Hosting" : "Runtime"}</dt><dd>${app.framework === "static" && !app.build_config?.start_command ? "Nginx" : `127.0.0.1:${escapeHtml(app.port)}`}</dd></div>
+            <div class="am-meta-wide"><dt>Last deployed</dt><dd>${escapeHtml(formatDate(app.last_deploy))}${app.latest_commit ? ` <code>${escapeHtml(app.latest_commit.slice(0, 7))}</code>` : ""}</dd></div>
           </dl>
+          ${lastFailure ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${app.status === "running" ? "Latest deployment failed. Previous release is still live." : "Latest deployment failed."} <button type="button" data-action="deployment-log" data-id="${appId}">View log</button></span></p>` : ""}
           <div class="am-app-actions" aria-label="Actions for ${escapeHtml(app.name)}">
-            ${openControl}
             ${deployControl}
-            <button type="button" class="am-button" data-action="pull" data-id="${escapeHtml(app.id)}">Pull</button>
-            <button type="button" class="am-button" data-action="edit" data-id="${escapeHtml(app.id)}">Edit</button>
-            <button type="button" class="am-button" data-action="health" data-id="${escapeHtml(app.id)}">Health</button>
-            <button type="button" class="am-button" data-action="environment" data-id="${escapeHtml(app.id)}">Environment</button>
-            ${serviceControl}
-            <button type="button" class="am-button" data-action="restart" data-id="${escapeHtml(app.id)}">Restart</button>
-            <button type="button" class="am-button" data-action="logs" data-id="${escapeHtml(app.id)}">Logs</button>
-            <button type="button" class="am-button am-button--danger" data-action="remove" data-id="${escapeHtml(app.id)}">Remove</button>
+            <span class="am-action-spacer"></span>
+            <button type="button" class="am-button am-icon-button" data-action="environment" data-id="${appId}" title="Environment variables" aria-label="Environment variables for ${escapeHtml(app.name)}"${unavailable}>${icon("key-round")}</button>
+            <button type="button" class="am-button am-icon-button" data-action="logs" data-id="${appId}" title="Application logs" aria-label="Logs for ${escapeHtml(app.name)}">${icon("square-terminal")}</button>
+            <details class="am-app-menu"><summary class="am-button am-icon-button" title="More actions" aria-label="More actions for ${escapeHtml(app.name)}">${icon("ellipsis")}</summary>
+              <div class="am-menu-panel">
+                ${serviceControl}
+                <button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>
+                <button type="button" data-action="health" data-id="${appId}"${runtimeUnavailable}>${icon("activity")} Check health</button>
+                <button type="button" data-action="edit" data-id="${appId}"${unavailable}>${icon("settings-2")} Edit configuration</button>
+                <button type="button" data-action="pull" data-id="${appId}"${unavailable}>${icon("download")} Pull repository</button>
+                <button type="button" class="am-menu-danger" data-action="remove" data-id="${appId}"${unavailable}>${icon("trash-2")} Remove application</button>
+              </div>
+            </details>
           </div>
-          ${routeIsActive ? "" : `<p class="am-field-hint" role="note">Deploy will add the managed route include to the matching HTTPS site, validate Nginx, and reload it. If the site is ambiguous or invalid, the deployment reports the error and restores its configuration.</p>`}
         </article>
       `;
     }).join("");
 
     byId("appsTableContainer").innerHTML = cards;
+    renderIcons();
   }
 
   function renderDeployments(data) {
@@ -303,6 +338,7 @@
 
   function renderSettings(data) {
     const config = data.config || {};
+    state.settings = config;
     byId("settingsPanel").innerHTML = `
       <section class="am-surface am-settings">
         <div class="am-surface-heading">
@@ -360,6 +396,8 @@
       renderApps(apps);
       renderDeployments(deployments);
       renderSettings(settings);
+      byId("lastRefreshed").textContent = `Updated ${new Intl.DateTimeFormat(undefined, { timeStyle: "short" }).format(new Date())}`;
+      renderIcons();
       updateConnection("connected", `${state.apps.length} ${state.apps.length === 1 ? "application" : "applications"}`);
       resumeActiveDeployment();
     } catch (error) {
@@ -370,19 +408,20 @@
 
   function openDialog(title, body, submitLabel, onSubmit, onSuccess) {
     const dialog = byId("appManagerDialog");
+    state.logTarget = null;
     byId("appManagerError").classList.add("hidden");
     const submit = submitLabel
-      ? `<button type="submit" class="pf-m-primary">${escapeHtml(submitLabel)}</button>`
+      ? `<button type="submit" class="am-button pf-m-primary">${escapeHtml(submitLabel)}</button>`
       : "";
     dialog.innerHTML = `
       <form class="am-dialog-form">
         <header class="am-dialog-header">
           <h2 id="appManagerDialogTitle">${escapeHtml(title)}</h2>
-          <button type="button" class="am-dialog-close" aria-label="Close" data-dialog-close>×</button>
+          <button type="button" class="am-dialog-close am-icon-button" aria-label="Close" title="Close dialog" data-dialog-close>${icon("x")}</button>
         </header>
         <div class="am-dialog-body">${body}</div>
         <footer class="am-dialog-footer">
-          <button type="button" data-dialog-close>Cancel</button>${submit}
+          <button type="button" class="am-button am-button--quiet" data-dialog-close>${submitLabel ? "Cancel" : "Close"}</button>${submit}
         </footer>
       </form>
     `;
@@ -406,10 +445,11 @@
       }
     });
     dialog.querySelectorAll("[data-dialog-close]").forEach((button) => {
-      button.addEventListener("click", () => dialog.close());
+      button.addEventListener("click", () => { if (!state.busy) dialog.close(); });
     });
-    dialog.showModal();
-    const firstInput = dialog.querySelector("input, select, textarea");
+    if (!dialog.open) dialog.showModal();
+    renderIcons();
+    const firstInput = dialog.querySelector("input:not([type=hidden]), select, textarea");
     if (firstInput) firstInput.focus();
   }
 
@@ -438,18 +478,105 @@
 
   function openAddApplicationDialog() {
     const body = byId("addAppFormTemplate").innerHTML;
-    openDialog("Add an application", body, "Add application", async (form) => {
-      const payload = Object.fromEntries(new FormData(form).entries());
-      payload.build_config = parseBuildConfig(payload.build_config || "");
-      return runOperation(async () => {
-        await callBackend("add", [JSON.stringify(payload)]);
-      }, "Application added. Select Deploy on its card to build and start it.");
-    }, () => byId("tab-websites").click());
+    let step = 0;
+    let created = null;
+    let deployAfterSetup = true;
+    const collect = (form) => {
+      const values = Object.fromEntries(new FormData(form).entries());
+      const { app_directory, start_command, environment, deploy_now, ...payload } = values;
+      payload.build_config = {};
+      if (app_directory.trim()) payload.build_config.app_directory = app_directory.trim();
+      if (start_command.trim()) {
+        let command;
+        try { command = JSON.parse(start_command); } catch (_error) { throw new Error('Start command must be a JSON array, such as ["node", "server.js"].'); }
+        if (!Array.isArray(command) || !command.length || !command.every((part) => typeof part === "string" && part && !/[\x00-\x1f\x7f]/.test(part))) {
+          throw new Error("Start command must contain non-empty executable arguments, not a shell command.");
+        }
+        payload.build_config.start_command = command;
+      }
+      const environmentRows = parseEnvironmentContent(environment);
+      const reserved = new Set(["HOME", "PATH", "PORT", "HOST", "NODE_ENV", "APP_BASE_PATH", "APP_CONFIG_DIR"]);
+      const blocked = environmentRows.find((row) => reserved.has(row.key));
+      if (blocked) throw new Error(`${blocked.key} is managed automatically and cannot be overridden.`);
+      const content = serializeEnvironmentRows(environmentRows);
+      if (new TextEncoder().encode(content).length > 64 * 1024) throw new Error("Environment variables exceed 64 KiB.");
+      return { payload, environmentRows, content, deploy: deploy_now === "on" };
+    };
+    openDialog("New application", body, "Create and deploy", async (form) => {
+      if (step !== 2) { nextButton.click(); return false; }
+      const setup = collect(form);
+      deployAfterSetup = setup.deploy;
+      const successful = await runOperation(async () => {
+        if (!created) {
+          created = (await callBackend("add", [JSON.stringify(setup.payload)])).app;
+          if (!created?.id) throw new Error("The backend did not return the registered application.");
+          backButton.setAttribute("data-unavailable", "");
+        }
+        if (setup.content) await callBackendInput("env-save", [created.id], setup.content);
+      }, deployAfterSetup ? "" : "Application created.");
+      if (!successful && created) submitButton.textContent = "Retry setup";
+      return successful;
+    }, () => {
+      byId("tab-websites").click();
+      if (deployAfterSetup) void runOperation(() => deployWithLiveLog(created.id), "", false);
+    });
 
     const form = byId("appManagerDialog").querySelector("form");
+    form.noValidate = true;
+    const footer = form.querySelector(".am-dialog-footer");
+    footer.insertAdjacentHTML("afterbegin", `<button type="button" id="setupBack" class="am-button am-button--quiet" hidden>${icon("arrow-left")} Back</button>`);
+    footer.insertAdjacentHTML("beforeend", `<button type="button" id="setupNext" class="am-button pf-m-primary">Continue ${icon("arrow-right")}</button>`);
+    const backButton = byId("setupBack");
+    const nextButton = byId("setupNext");
+    const submitButton = form.querySelector('[type="submit"]');
+    submitButton.hidden = true;
     const nameInput = form.elements.namedItem("name");
     const slugInput = form.elements.namedItem("slug");
     const routeInput = form.elements.namedItem("route");
+    form.elements.namedItem("branch").value = state.settings.default_branch || "main";
+    const updatePreview = () => { byId("setupUrlPreview").textContent = `https://stuserver.online${routeInput.value || "/"}`; };
+    const showStep = () => {
+      form.querySelectorAll("[data-setup-step]").forEach((section) => { section.hidden = Number(section.dataset.setupStep) !== step; });
+      form.querySelectorAll("[data-setup-marker]").forEach((marker) => {
+        if (Number(marker.dataset.setupMarker) === step) marker.setAttribute("aria-current", "step");
+        else marker.removeAttribute("aria-current");
+      });
+      backButton.hidden = step === 0;
+      nextButton.hidden = step === 2;
+      submitButton.hidden = step !== 2;
+      form.querySelector(`[data-setup-step="${step}"] input`)?.focus();
+      form.querySelector(".am-dialog-body").scrollTop = 0;
+      renderIcons();
+    };
+    nextButton.addEventListener("click", () => {
+      try {
+        const current = form.querySelector(`[data-setup-step="${step}"]`);
+        const invalid = Array.from(current.querySelectorAll("input, select, textarea")).find((input) => !input.checkValidity());
+        if (invalid) { invalid.reportValidity(); return; }
+        const repo = form.elements.namedItem("repo_url").value;
+        if (!/^(https:\/\/[^\s@]+\/|ssh:\/\/[^\s]+\/|git@[^\s:]+:)[^\s]+$/.test(repo)) {
+          throw new Error("Enter an HTTPS or SSH Git repository URL without embedded credentials.");
+        }
+        if (step === 1) {
+          const setup = collect(form);
+          if (state.apps.some((app) => app.id === setup.payload.slug)) throw new Error("That application ID is already registered.");
+          if (state.apps.some((app) => [app.route, app.active_route].includes(setup.payload.route))) throw new Error("That hosted route is already assigned.");
+          const review = [
+            ["Application", setup.payload.name], ["Repository", setup.payload.repo_url], ["Branch", setup.payload.branch],
+            ["Framework", frameworkName(setup.payload.framework)], ["Public URL", `https://stuserver.online${setup.payload.route}`],
+            ["Environment", setup.environmentRows.length ? setup.environmentRows.map((row) => row.key).join(", ") : "No variables"],
+          ];
+          byId("setupReview").innerHTML = review.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
+        }
+        form.querySelector(".am-dialog-error")?.remove();
+        step += 1;
+        showStep();
+      } catch (error) { showError(error); }
+    });
+    backButton.addEventListener("click", () => { if (step > 0) { step -= 1; showStep(); } });
+    form.elements.namedItem("deploy_now").addEventListener("change", (event) => {
+      submitButton.textContent = event.target.checked ? "Create and deploy" : "Create application";
+    });
     slugInput.dataset.autogenerated = "true";
     routeInput.dataset.autogenerated = "true";
     nameInput.addEventListener("input", () => {
@@ -459,16 +586,27 @@
       if (routeInput.dataset.autogenerated === "true") {
         routeInput.value = `/${slugInput.value}/`;
       }
+      updatePreview();
     });
     slugInput.addEventListener("input", () => {
       slugInput.dataset.autogenerated = "false";
       if (routeInput.dataset.autogenerated === "true") {
         routeInput.value = `/${slugInput.value}/`;
       }
+      updatePreview();
     });
     routeInput.addEventListener("input", () => {
       routeInput.dataset.autogenerated = "false";
+      updatePreview();
     });
+    form.elements.namedItem("repo_url").addEventListener("change", (event) => {
+      if (!nameInput.value) {
+        nameInput.value = event.target.value.split(/[/:]/).pop().replace(/\.git$/, "").replace(/[-_]/g, " ");
+        nameInput.dispatchEvent(new Event("input"));
+      }
+    });
+    updatePreview();
+    renderIcons();
   }
 
   function editApplication(app) {
@@ -549,8 +687,8 @@
     return rows.map(({ key, value }) => `
       <div class="am-env-row">
         <label>Key<input type="text" data-env-key value="${escapeHtml(key)}" autocomplete="off" spellcheck="false" placeholder="VARIABLE_NAME"></label>
-        <label>Value<input type="text" data-env-value value="${escapeHtml(value)}" autocomplete="off" spellcheck="false" placeholder="Value"></label>
-        <button type="button" class="am-button am-button--danger" data-env-remove aria-label="Remove environment variable ${escapeHtml(key || "row")}">Remove</button>
+        <label>Value<span class="am-secret-input"><input type="password" data-env-value value="${escapeHtml(value)}" autocomplete="new-password" spellcheck="false" placeholder="Value"><button type="button" class="am-icon-button" data-env-toggle aria-label="Reveal value" title="Reveal value">${icon("eye")}</button></span></label>
+        <button type="button" class="am-button am-button--danger am-icon-button" data-env-remove aria-label="Remove environment variable ${escapeHtml(key || "row")}" title="Remove variable">${icon("trash-2")}</button>
       </div>
     `).join("");
   }
@@ -620,11 +758,22 @@
     const addRow = (key = "", value = "") => {
       container.insertAdjacentHTML("beforeend", environmentMarkup([{ key, value }]));
       container.lastElementChild.querySelector("[data-env-key]").focus();
+      renderIcons();
     };
     dialog.querySelector("[data-env-add]").addEventListener("click", () => addRow());
     container.addEventListener("click", (event) => {
       const removeButton = event.target instanceof Element ? event.target.closest("[data-env-remove]") : null;
       if (removeButton) removeButton.closest(".am-env-row").remove();
+      const toggle = event.target instanceof Element ? event.target.closest("[data-env-toggle]") : null;
+      if (toggle) {
+        const input = toggle.closest(".am-secret-input").querySelector("input");
+        const reveal = input.type === "password";
+        input.type = reveal ? "text" : "password";
+        toggle.setAttribute("aria-label", reveal ? "Hide value" : "Reveal value");
+        toggle.title = reveal ? "Hide value" : "Reveal value";
+        toggle.innerHTML = icon(reveal ? "eye-off" : "eye");
+        renderIcons();
+      }
     });
     importInput.addEventListener("change", async () => {
       const file = importInput.files && importInput.files[0];
@@ -636,6 +785,7 @@
       }
       try {
         container.innerHTML = environmentMarkup(parseEnvironmentContent(await file.text()));
+        renderIcons();
       } catch (error) {
         showError(new Error(`Could not import the selected file: ${error.message}`));
       }
@@ -666,7 +816,9 @@
   function renderDeploymentLog(result) {
     const output = byId("deploymentLiveLog");
     const status = byId("deploymentLiveStatus");
-    if (!output || !status) return;
+    if (!output || !status || state.logTarget?.appId !== result.app_id
+      || (state.logTarget.deploymentId && state.logTarget.deploymentId !== result.deployment_id)) return;
+    state.logTarget.deploymentId = result.deployment_id;
     const text = result.logs || "Waiting for deployment output…";
     output.innerHTML = text.split("\n").map((line) => {
       const level = /^\[stderr\]/i.test(line) || /\b(error|failed|failure|aborted)\b/i.test(line)
@@ -702,12 +854,14 @@
   }
 
   function openDeploymentLogDialog(appId) {
+    const app = state.apps.find((item) => item.id === appId);
     openDialog(
-      "Live deployment log",
+      `Deployment: ${app?.name || appId}`,
       `<p id="deploymentLiveStatus" class="am-dialog-intro" role="status" aria-live="polite">Starting deployment…</p>
        <div class="am-deployment-log-actions"><button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort deployment</button></div>
        <pre id="deploymentLiveLog" class="am-log-output" aria-live="polite">Waiting for deployment output…</pre>`,
     );
+     state.logTarget = { appId, deploymentId: null };
   }
 
   async function monitorDeployment(appId, deploymentId) {
@@ -722,7 +876,7 @@
           if (!result.active) break;
         } catch (error) {
           const output = byId("deploymentLiveLog");
-          if (output) {
+          if (output && state.logTarget?.appId === appId && state.logTarget?.deploymentId === deploymentId) {
             output.textContent += `\nLive log polling failed: ${error.message}`;
             output.scrollTop = output.scrollHeight;
           }
@@ -746,6 +900,7 @@
       status: "deploying",
       logs: "Deployment queued",
     });
+    await refreshData();
     void monitorDeployment(appId, started.deployment_id);
   }
 
@@ -761,34 +916,43 @@
   }
 
   function resumeActiveDeployment() {
-    if (state.deploymentMonitor || byId("appManagerDialog").open) return;
+    if (state.deploymentMonitor) return;
     const active = state.deployments.find((deployment) => deployment.status === "deploying");
     if (!active) return;
-    openDeploymentLogDialog(active.app_id);
     void monitorDeployment(active.app_id, active.id);
   }
 
   function showPluginUpdate(result) {
+    let installed = null;
     const latest = String(result.latest_commit || "");
     const body = `
-      <p class="am-dialog-intro">A newer App Manager revision is available. The update will be downloaded from the project's fixed HTTPS GitHub repository and reinstalled.</p>
+      <p class="am-dialog-intro">A new App Manager update is available.</p>
       <dl class="am-settings-paths">
         <div><dt>Installed</dt><dd>${escapeHtml(result.current_commit || "Unknown")}</dd></div>
         <div><dt>Available</dt><dd>${escapeHtml(latest || "Unknown")}</dd></div>
       </dl>
-      <p class="am-field-hint">The plugin files will be replaced. Application source, releases, and host configuration are not changed.</p>
+      <p class="am-update-warning">${icon("circle-alert")} Cockpit will restart after installation. Running applications are not restarted.</p>
     `;
-    openDialog("App Manager update available", body, "Pull and reinstall", async () => {
+    openDialog("Update App Manager", body, "Install update and restart Cockpit", async () => {
       setBusy(true);
       try {
         const update = await callBackend("plugin-update");
-        showNotice(update.updated
-          ? `App Manager updated to ${String(update.commit || "").slice(0, 12)}. Reload Cockpit to use the new plugin files.`
-          : "App Manager is already up to date.");
+        installed = update;
         return true;
       } finally {
         setBusy(false);
       }
+    }, () => {
+      if (!installed.updated) { showNotice("App Manager is already up to date."); return; }
+      if (!installed.restart_scheduled) {
+        showError(new Error(`Update installed, but Cockpit could not restart: ${installed.restart_error || "Restart Cockpit manually to apply the update."}`));
+        return;
+      }
+      showNotice("Update installed. Cockpit is restarting; reconnecting automatically...");
+      updateConnection("busy", "Restarting Cockpit...");
+      window.setTimeout(() => {
+        try { window.top.location.reload(); } catch (_error) { window.location.reload(); }
+      }, Math.max(12, Number(installed.restart_delay_seconds || 5) + 7) * 1000);
     });
   }
 
@@ -840,7 +1004,10 @@
     if (action === "health") {
       await runOperation(async () => {
         const result = await callBackend("health", [appId]);
-        showNotice(result.healthy ? `Health check passed (${result.url}).` : `Health check failed (${result.url}).`);
+        if (!result.healthy) throw new Error(`Health check failed (${result.url}).`);
+        showNotice(app.framework === "static" && !app.build_config?.start_command
+          ? "Static release is available."
+          : `Runtime health check passed (${result.url}).`);
       }, "", false);
       return;
     }
@@ -851,13 +1018,9 @@
       stop: `Stop "${app.name}"?`,
       start: `Start "${app.name}"?`,
     };
-    if (confirmations[action] && !window.confirm(confirmations[action])) return;
+    if (["stop", "restart"].includes(action) && !window.confirm(confirmations[action])) return;
     if (action === "deploy") {
-      try {
-        await deployWithLiveLog(appId);
-      } catch (error) {
-        showError(error);
-      }
+      await runOperation(() => deployWithLiveLog(appId), "", false);
       return;
     }
     const labels = {
@@ -913,9 +1076,41 @@
     void runOperation(refreshData, "Application data refreshed.", false);
   });
   byId("checkUpdateButton").addEventListener("click", checkPluginUpdates);
+  byId("appSearch").addEventListener("input", (event) => {
+    state.query = event.target.value;
+    renderAppList();
+  });
+  byId("appSort").addEventListener("change", (event) => {
+    state.sort = event.target.value;
+    renderAppList();
+  });
+  document.querySelectorAll("[data-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.filter = button.dataset.filter;
+      document.querySelectorAll("[data-filter]").forEach((filter) => filter.setAttribute("aria-pressed", String(filter === button)));
+      renderAppList();
+    });
+  });
   byId("appsTableContainer").addEventListener("click", (event) => {
+    if (event.target instanceof Element && event.target.closest("[data-clear-filters]")) {
+      state.query = "";
+      byId("appSearch").value = "";
+      document.querySelector('[data-filter="all"]').click();
+      return;
+    }
     const button = event.target instanceof Element ? event.target.closest("button[data-action]") : null;
-    if (button) void handleAppAction(button.dataset.action, button.dataset.id, button.dataset.deploymentId).catch(showError);
+    if (button && !button.disabled && !state.busy) {
+      button.closest("details")?.removeAttribute("open");
+      void handleAppAction(button.dataset.action, button.dataset.id, button.dataset.deploymentId).catch(showError);
+    }
+  });
+  document.addEventListener("click", (event) => {
+    document.querySelectorAll(".am-app-menu[open]").forEach((menu) => {
+      if (!menu.contains(event.target)) menu.removeAttribute("open");
+    });
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") document.querySelectorAll(".am-app-menu[open]").forEach((menu) => menu.removeAttribute("open"));
   });
   byId("deploymentHistory").addEventListener("click", (event) => {
     const button = event.target instanceof Element ? event.target.closest('button[data-action="deployment-log"]') : null;
@@ -935,9 +1130,11 @@
         showError(error);
       });
     }
-    if (event.target === event.currentTarget) event.currentTarget.close();
+    if (event.target === event.currentTarget && !state.busy) event.currentTarget.close();
   });
+  byId("appManagerDialog").addEventListener("cancel", (event) => { if (state.busy) event.preventDefault(); });
   bindTabs();
+  renderIcons();
   async function initialize() {
     setBusy(true);
     try {

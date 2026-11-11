@@ -346,6 +346,7 @@ remove_default_plugin_files() {
   remove_owned_file "${PLUGIN_DEST}/manifest.json" '"name": "app-manager"'
   remove_owned_file "${PLUGIN_DEST}/app-manager.css" "Cockpit App Manager standalone stylesheet"
   remove_owned_file "${PLUGIN_DEST}/app-manager.js" "App Manager Cockpit UI loaded"
+  remove_owned_file "${PLUGIN_DEST}/icons.js" "Cockpit App Manager offline icons"
   remove_owned_file "${CONFIG_DEST}/defaults.json" '"nginx_template"'
   remove_owned_file "${CONFIG_DEST}/templates/nginx.conf.tpl" "{{ app_route_location }}"
   remove_owned_file "${CONFIG_DEST}/templates/app.service.tpl" "# Managed by Cockpit App Manager"

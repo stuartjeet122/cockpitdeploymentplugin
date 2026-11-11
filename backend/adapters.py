@@ -613,6 +613,12 @@ class NextJSAdapter(FrameworkAdapter):
         scripts = package.get("scripts", {})
         if not isinstance(scripts, dict) or not scripts.get("build"):
             raise ValueError(f"Next.js package.json must define a build script: {project_dir / 'package.json'}")
+        route = app.get("route")
+        if route and not _next_config_present(project_dir):
+            (project_dir / "next.config.mjs").write_text(
+                'export default { basePath: process.env.APP_BASE_PATH || "", trailingSlash: true };\n',
+                encoding="utf-8",
+            )
         manager, lockfile = _detect_js_package_manager(package_dir)
         if manager == "npm":
             source_lockfile = source_package_dir / lockfile.name if lockfile is not None else None
@@ -634,6 +640,24 @@ class NextJSAdapter(FrameworkAdapter):
             package_dir,
             log,
         )
+        if route:
+            config_check = (
+                "const load = require('next/dist/server/config').default;"
+                "const { PHASE_PRODUCTION_BUILD } = require('next/constants');"
+                "load(PHASE_PRODUCTION_BUILD, process.cwd()).then(config => {"
+                "if (config.basePath !== process.argv[1] || config.trailingSlash !== true) {"
+                "throw new Error('Set basePath: process.env.APP_BASE_PATH and trailingSlash: true in next.config. "
+                "The public route must match the built Next.js asset and API paths.');"
+                "}"
+                "if (config.output === 'export') {"
+                "throw new Error('Next.js output: export needs static hosting, not next start.');"
+                "}"
+                "}).catch(error => { console.error(error.message); process.exit(1); });"
+            )
+            _run_build(
+                runner, ["node", "--eval", config_check, route.rstrip("/")],
+                project_dir, timeout, "Checking Next.js public route configuration",
+            )
         _run_build(
             runner,
             _js_build_command(manager),
@@ -698,20 +722,23 @@ class NodeAdapter(FrameworkAdapter):
         group_id: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        del log
         package_path = repo_path / "package.json"
-        if not package_path.is_file():
-            raise FileNotFoundError("package.json not found for Node.js application")
-        package = json.loads(package_path.read_text(encoding="utf-8"))
+        try:
+            package = json.loads(_readable_regular_file(package_path, "Node.js package.json").decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid Node.js package.json: {exc}") from exc
+        if not isinstance(package, dict) or not isinstance(package.get("scripts", {}), dict):
+            raise ValueError("Node.js package.json must be an object with a scripts object")
+        scripts = package.get("scripts", {})
+        if not scripts.get("start") and not app.get("build_config", {}).get("start_command"):
+            raise ValueError("Node.js applications need a start script or build_config.start_command")
         app_dir = _copy_source(repo_path, release_dir, group_id)
-        installer = "ci" if (app_dir / "package-lock.json").exists() or (app_dir / "npm-shrinkwrap.json").exists() else "install"
-        _run_build(runner, ["npm", installer, "--no-fund", "--no-audit"], app_dir, timeout, "Installing Node.js dependencies")
-        if package.get("scripts", {}).get("build"):
-            _run_build(runner, ["npm", "run", "build"], app_dir, timeout, "Building Node.js application")
-        start = _configured_start(
-            app,
-            ["npm", "run", "start", "--", "--host", "127.0.0.1", "--port", str(app["port"])],
-        )
+        manager, lockfile = _detect_js_package_manager(app_dir)
+        _install_js_dependencies(manager, lockfile, app_dir, runner, timeout, "Node.js", log=log)
+        if scripts.get("build"):
+            _run_build(runner, _js_build_command(manager), app_dir, timeout, "Building Node.js application")
+        _install_js_production_dependencies(manager, app_dir, runner, timeout, "Node.js", log=log)
+        start = _configured_start(app, [manager, "run", "start"])
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
@@ -789,11 +816,13 @@ class StaticAdapter(FrameworkAdapter):
         if not (repo_path / "index.html").is_file():
             raise FileNotFoundError("index.html not found for static application")
         app_dir = _copy_source(repo_path, release_dir, group_id)
-        start = _configured_start(
-            app,
-            ["python3", "-m", "http.server", str(app["port"]), "--bind", "127.0.0.1", "--directory", str(app_dir)],
-        )
-        return {"status": "success", "release_dir": str(release_dir), "start_command": start}
+        start = _configured_start(app, [])
+        return {
+            "status": "success",
+            "release_dir": str(release_dir),
+            "start_command": start,
+            "runtime_required": bool(start),
+        }
 
 
 def detect_framework(repo_path: Path, build_config: Optional[Dict[str, Any]] = None) -> str:
