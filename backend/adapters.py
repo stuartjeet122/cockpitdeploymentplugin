@@ -394,7 +394,14 @@ def _install_js_production_dependencies(
     )
 
 
-_NEXT_CONFIG_NAMES = ("next.config.js", "next.config.mjs", "next.config.ts")
+_NEXT_CONFIG_NAMES = (
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.cjs",
+    "next.config.ts",
+    "next.config.mts",
+    "next.config.cts",
+)
 _IGNORED_PACKAGE_DIRS = {".git", "node_modules", ".next", ".venv", "__pycache__"}
 
 
@@ -438,7 +445,7 @@ def _configure_next_public_route(project_dir: Path) -> None:
     config_path.rename(original_path)
 
     import_path = "./" + original_path.name
-    if config_path.suffix == ".ts":
+    if config_path.suffix in {".ts", ".mts", ".cts"}:
         wrapper = (
             "import { createRequire } from 'node:module';\n"
             "import { dirname } from 'node:path';\n"
@@ -477,7 +484,7 @@ def _configure_next_public_route(project_dir: Path) -> None:
         package = json.loads(package_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Could not read Next.js package manifest {package_path}: {exc}") from exc
-    uses_esm = config_path.suffix in {".mjs", ".ts"} or (
+    uses_esm = config_path.suffix in {".mjs", ".mts"} or (
         config_path.suffix == ".js" and package.get("type") == "module"
     )
     if uses_esm:

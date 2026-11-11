@@ -20,4 +20,4 @@ ProtectControlGroups=true
 LockPersonality=true
 RestrictRealtime=true
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_KILL
-ReadWritePaths=/var/lib/cockpit/app-manager /opt/webapps /var/log/cockpit-app-manager /etc/systemd/system /etc/nginx /etc/passwd /etc/shadow /etc/group /etc/gshadow
+ReadWritePaths=/var/lib/cockpit/app-manager /opt/webapps /var/log/cockpit-app-manager /etc/systemd/system /etc/nginx /var/log/nginx /etc/passwd /etc/shadow /etc/group /etc/gshadow

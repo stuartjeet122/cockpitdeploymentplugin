@@ -92,7 +92,7 @@ install_files() {
   install -d -o root -g root -m 0755 "$PLUGIN_DEST"
   # /usr/libexec/cockpit is shared with Cockpit; create only this plugin's
   # dedicated subdirectory and never change shared directory ownership.
-  mkdir -p -- "$BACKEND_DEST"
+  install -d -o root -g root -m 0755 "$BACKEND_DEST"
   install -d -o root -g root -m 0755 "$CONFIG_DEST" "$CONFIG_DEST/templates"
   install -d -o root -g root -m 0755 "$SYSTEMD_DEST"
 

@@ -3194,7 +3194,7 @@ def deployment_start_app(app_id: str, approved_commit: Optional[str] = None) -> 
             "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
             "--property=CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_KILL",
             "--property=UMask=0027",
-            f"--property=ReadWritePaths={DEFAULT_STATE_ROOT} {DEFAULT_PRODUCTION_ROOT} {DEFAULT_LOG_ROOT} /etc/systemd/system /etc/nginx",
+            f"--property=ReadWritePaths={DEFAULT_STATE_ROOT} {DEFAULT_PRODUCTION_ROOT} {DEFAULT_LOG_ROOT} /etc/systemd/system /etc/nginx /var/log/nginx",
             "--property=StandardOutput=null",
             "--property=StandardError=journal",
             "--",

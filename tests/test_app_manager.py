@@ -54,7 +54,12 @@ class AppManagerTests(unittest.TestCase):
     def test_detect_frameworks(self):
         cases = (
             ("nextjs-package", {"package.json": '{"dependencies":{"next":"^15"}}'}, "nextjs"),
-            ("nextjs-config", {"next.config.mjs": "export default {}"}, "nextjs"),
+            ("nextjs-config-js", {"next.config.js": "module.exports = {}"}, "nextjs"),
+            ("nextjs-config-mjs", {"next.config.mjs": "export default {}"}, "nextjs"),
+            ("nextjs-config-cjs", {"next.config.cjs": "module.exports = {}"}, "nextjs"),
+            ("nextjs-config-ts", {"next.config.ts": "export default {}"}, "nextjs"),
+            ("nextjs-config-mts", {"next.config.mts": "export default {}"}, "nextjs"),
+            ("nextjs-config-cts", {"next.config.cts": "export = {}"}, "nextjs"),
             ("go", {"go.mod": "module example.com/demo\n"}, "go"),
             ("python-requirements", {"requirements.txt": "flask\n"}, "python"),
             ("python-pyproject", {"pyproject.toml": "[project]\nname = 'demo'\n"}, "python"),
@@ -732,6 +737,12 @@ class AppManagerTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], "systemd-run")
         self.assertIn("--property=ProtectSystem=strict", command)
+        read_write_paths = next(
+            argument for argument in command if argument.startswith("--property=ReadWritePaths=")
+        )
+        self.assertIn(manager.DEFAULT_STATE_ROOT, read_write_paths)
+        self.assertIn("/etc/nginx", read_write_paths)
+        self.assertIn("/var/log/nginx", read_write_paths)
         ensure_user.assert_called_once_with(app["id"])
         self.assertFalse(any("/etc/passwd" in argument for argument in command))
         self.assertEqual(command[-4:], ["deploy", app["id"], "--deployment-id", result["deployment_id"]])
@@ -1994,6 +2005,28 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
             config,
         )
 
+    def test_nextjs_cjs_and_extended_typescript_configs_are_wrapped(self):
+        cases = (
+            ("next.config.cjs", "module.exports = {};\n", "next.config.cjs", "module.exports"),
+            ("next.config.mts", "export default {};\n", "next.config.mjs", "nextRequire('@swc/core')"),
+            ("next.config.cts", "export = {};\n", "next.config.mjs", "nextRequire('@swc/core')"),
+        )
+        for config_name, contents, wrapper_name, expected in cases:
+            with self.subTest(config=config_name):
+                runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+                _, release, _, _ = self.build_project(
+                    {},
+                    runner,
+                    app_route="/demo/",
+                    next_config=contents,
+                    next_config_name=config_name,
+                )
+                release_app = release / "app"
+                wrapper = (release_app / wrapper_name).read_text(encoding="utf-8")
+                backup = release_app / f"next.config.app-manager-original{Path(config_name).suffix}"
+                self.assertTrue(backup.is_file())
+                self.assertIn(expected, wrapper)
+
     def test_nextjs_static_export_uses_exported_files_without_a_runtime_service(self):
         commands = []
 
@@ -2617,6 +2650,17 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotIn(manager._systemd_quote(str(paths["current"] / "app")), read_write_paths)
         self.assertNotIn(manager._systemd_quote(str(paths["releases"])), read_write_paths)
 
+    def test_auto_deploy_service_can_write_nginx_log_directory(self):
+        template = (Path(__file__).resolve().parent.parent / "templates" / "auto-deploy.service").read_text(
+            encoding="utf-8"
+        )
+        read_write_paths = next(
+            line for line in template.splitlines() if line.startswith("ReadWritePaths=")
+        )
+        self.assertIn("/var/lib/cockpit/app-manager", read_write_paths)
+        self.assertIn("/etc/nginx", read_write_paths)
+        self.assertIn("/var/log/nginx", read_write_paths)
+
     def test_resource_limits_reject_unsafe_values_and_persist(self):
         for value in ({"memory_mb": True}, {"tasks_max": 0}, {"unknown": 1}, "unlimited"):
             with self.subTest(value=value), self.assertRaises(ValueError):
@@ -3180,7 +3224,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotIn('chown root:root "$BACKEND_DEST"', installer)
         self.assertNotIn('chown root:root "$PRODUCTION_ROOT"', installer)
         self.assertIn('BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"', installer)
-        self.assertIn('mkdir -p -- "$BACKEND_DEST"', installer)
+        self.assertIn('install -d -o root -g root -m 0755 "$BACKEND_DEST"', installer)
         self.assertIn(
             'install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"',
             installer,
