@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=oneshot
 User=root
 Group=root
+ExecStartPre=/usr/sbin/logrotate --state /var/lib/cockpit/app-manager/logrotate.status /etc/logrotate.d/cockpit-app-manager
 ExecStart=/usr/libexec/cockpit/app-manager/app-manager auto-deploy
 NoNewPrivileges=true
 PrivateTmp=true

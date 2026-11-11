@@ -12,7 +12,7 @@ const fixtureApps = [
   { id: "docs", name: "Documentation", framework: "static", branch: "main", route: "/docs/", hosting_active: false, repo_url: "https://github.com/example/docs.git", port: 8101, status: "stopped", deployments: [] },
 ];
 
-async function loadUi(overrides = {}) {
+async function loadUi(overrides = {}, configureWindow) {
   const dom = new JSDOM(html, { runScripts: "outside-only", url: "https://localhost/cockpit/app-manager/index.html" });
   const { window } = dom;
   const calls = [];
@@ -44,6 +44,7 @@ async function loadUi(overrides = {}) {
       return promise;
     },
   };
+  configureWindow?.(window);
   window.eval(script);
   await settle(window);
   return { dom, window, document: window.document, calls };
@@ -62,6 +63,237 @@ test("applications are the initial view and only active routes have public links
     assert.match(ui.document.querySelector("#appsTableContainer").textContent, /Deploy to activate/);
     assert.equal(ui.document.querySelector('[data-action="start"][data-id="docs"]').disabled, true);
   } finally { ui.dom.window.close(); }
+});
+
+test("application editing submits automatic deployment policy and numeric resource limits", async () => {
+  const ui = await loadUi();
+  try {
+    ui.document.querySelector('[data-action="edit"][data-id="portal"]').click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    assert.equal(form.querySelectorAll("details:not([open])").length, 3);
+    assert.equal(form.elements.auto_deploy.closest("label").className, "am-checkbox");
+    form.elements.port.value = "8080";
+    form.checkValidity();
+    assert.equal(form.elements.port.closest("details").open, true);
+    form.elements.port.value = "8100";
+    form.elements.auto_deploy.checked = false;
+    form.elements.window_start.value = "23:00";
+    form.elements.window_end.value = "02:00";
+    form.elements.limit_memory_mb.value = "512";
+    form.elements.storage_directories.value = "data, uploads";
+    form.elements.required_environment.value = "DATABASE_URL, API_KEY";
+    form.elements.runtime_requirements.value = '{"node":"20.9"}';
+    form.elements.deployment_mode.value = "approval";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const payload = JSON.parse(ui.calls.find((record) => record.command === "edit").values[1]);
+    assert.equal(payload.auto_deploy, false);
+    assert.equal(payload.resource_limits.memory_mb, 512);
+    assert.deepEqual(payload.deployment_window, { start: "23:00", end: "02:00" });
+    assert.equal(payload.window_start, undefined);
+    assert.deepEqual(payload.storage_directories, ["data", "uploads"]);
+    assert.deepEqual(payload.required_environment, ["DATABASE_URL", "API_KEY"]);
+    assert.deepEqual(payload.runtime_requirements, { node: "20.9" });
+    assert.equal(payload.deployment_mode, "approval");
+  } finally { ui.dom.window.close(); }
+});
+
+test("health observations distinguish service readiness and public failures", async () => {
+  const ui = await loadUi({ list: { apps: [{ ...fixtureApps[0], health: {
+    checked_at: "2026-11-11T09:00:00Z", service_state: "active", local_healthy: true,
+    public_healthy: false, public_error: "Public DNS unavailable",
+  }, auto_deploy: false }] } });
+  try {
+    const card = ui.document.querySelector(".am-app-card");
+    assert.match(card.textContent, /ReadinessHealthy/);
+    assert.match(card.textContent, /Public routeFailed/);
+    assert.match(card.textContent, /Auto-deployPaused/);
+    assert.ok(card.querySelector('[title="Public DNS unavailable"]'));
+  } finally { ui.dom.window.close(); }
+});
+
+test("successful service transitions override older health observations", async () => {
+  const app = { ...fixtureApps[0], health: { checked_at: new Date(Date.now() - 1000).toISOString(), service_state: "active", local_healthy: true } };
+  const ui = await loadUi({ list: () => ({ apps: [app] }), stop: () => { app.status = "stopped"; app.updated_at = new Date().toISOString(); return { status: "stopped" }; } });
+  try {
+    ui.document.querySelector('[data-action="stop"]').click();
+    await settle(ui.window);
+    assert.ok(ui.calls.some((record) => record.command === "stop"));
+    assert.equal(ui.document.querySelector('[data-action="stop"]'), null);
+    assert.ok(ui.document.querySelector('[data-action="start"]'));
+    ui.document.querySelector('[data-filter="running"]').click();
+    assert.equal(ui.document.querySelectorAll(".am-app-card").length, 0);
+  } finally { ui.dom.window.close(); }
+});
+
+test("preflight and metrics render structured backend observations", async () => {
+  const ui = await loadUi({ preflight: { passed: false, checks: [{ name: "node", passed: false, message: "minimum 20.9" }], errors: ["Missing API_KEY"] }, metrics: { metrics: { memory_bytes: 1048576, cpu_percent: 5, restarts: 2, checked_at: "2026-11-11T09:00:00Z" } } });
+  try {
+    ui.document.querySelector('[data-action="preflight"][data-id="portal"]').click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /Missing API_KEY/);
+    ui.document.querySelector('[data-action="metrics"][data-id="portal"]').click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /1.0 MiB/);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /5%/);
+  } finally { ui.dom.window.close(); }
+});
+
+test("metrics refresh reloads samples, prevents duplicate clicks, and permits retry after errors", async () => {
+  let samples = 0;
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const ui = await loadUi({ metrics: async () => {
+    samples += 1;
+    if (samples === 2) await pending;
+    if (samples === 3) throw new Error("Sample unavailable");
+    return { metrics: { cpu_percent: samples } };
+  } });
+  try {
+    ui.document.querySelector('[data-action="metrics"]').click();
+    await settle(ui.window);
+    const refresh = ui.document.querySelector('#appManagerDialog [data-action="metrics"]');
+    refresh.click();
+    refresh.click();
+    await settle(ui.window);
+    assert.equal(samples, 2);
+    assert.equal(refresh.disabled, true);
+    release();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /2%/);
+    ui.document.querySelector('#appManagerDialog [data-action="metrics"]').click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector(".am-dialog-error").textContent, /Sample unavailable/);
+    ui.document.querySelector('#appManagerDialog [data-action="metrics"]').click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /4%/);
+  } finally { release(); ui.dom.window.close(); }
+});
+
+test("approval reviews changes before submitting the exact candidate revision", async () => {
+  const commit = "b".repeat(40);
+  const ui = await loadUi({ list: { apps: [{ ...fixtureApps[0], deployment_mode: "approval" }] }, "review-update": { pending_update: { commit, base_commit: "a".repeat(40), commits: "bbbbbbb Update", diffstat: "server.js | 2" } }, approve: { deployment_id: "release-approved" }, "deployment-logs": { app_id: "portal", deployment_id: "release-approved", active: false, status: "deployed" } });
+  try {
+    assert.equal(ui.document.querySelector('[data-action="deploy"]'), null);
+    ui.document.querySelector('[data-action="review-update"]').click();
+    await settle(ui.window);
+    assert.equal(ui.calls.filter((record) => record.command === "approve").length, 0);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /server.js/);
+    ui.document.querySelector(".am-dialog-form").dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.deepEqual(ui.calls.find((record) => record.command === "approve").values, ["portal", commit]);
+    assert.equal(ui.calls.filter((record) => record.command === "deployment-start").length, 0);
+  } finally { ui.dom.window.close(); }
+});
+
+test("live logs preserve scroll, skip unchanged redraws, and poll only status when closed", async () => {
+  const ticks = [];
+  let logs = "Build output";
+  let pollingFails = false;
+  const deployment = { app_id: "portal", id: "live-build", status: "deploying" };
+  const ui = await loadUi({
+    deployments: { deployments: [deployment] },
+    "deployment-logs": (record) => {
+      if (pollingFails) throw new Error("Temporary connection failure");
+      return {
+        app_id: "portal", deployment_id: deployment.id, active: true, status: "deploying",
+        ...(record.values.includes("--status-only") ? {} : { logs }),
+      };
+    },
+  }, (window) => {
+    const schedule = window.setTimeout.bind(window);
+    window.setTimeout = (callback, delay) => {
+      if (delay >= 1500) { ticks.push(callback); return 0; }
+      return schedule(callback, delay);
+    };
+  });
+  try {
+    assert.ok(ui.calls.find((record) => record.command === "deployment-logs").values.includes("--status-only"));
+    ui.document.querySelector('[data-action="deployment-log"]').click();
+    await settle(ui.window);
+    const output = ui.document.querySelector("#deploymentLiveLog");
+    Object.defineProperties(output, { scrollHeight: { value: 1000 }, clientHeight: { value: 200 } });
+    output.scrollTop = 300;
+    const firstLine = output.firstChild;
+    pollingFails = true;
+    ticks.shift()();
+    await settle(ui.window);
+    assert.equal(output.firstChild, firstLine);
+    assert.equal(output.scrollTop, 300);
+    assert.match(ui.document.querySelector("#deploymentLiveStatus").textContent, /retrying: Temporary connection failure/);
+    pollingFails = false;
+    ticks.shift()();
+    await settle(ui.window);
+    assert.equal(output.firstChild, firstLine);
+    assert.equal(output.scrollTop, 300);
+    assert.equal(ui.document.querySelector("#deploymentLiveStatus").textContent, "Deployment in progress");
+    logs += "\nNew output";
+    ticks.shift()();
+    await settle(ui.window);
+    assert.notEqual(output.firstChild, firstLine);
+    assert.equal(output.scrollTop, 300);
+    output.scrollTop = 800;
+    logs += "\nLatest output";
+    ticks.shift()();
+    await settle(ui.window);
+    assert.equal(output.scrollTop, 1000);
+    ui.document.querySelector("#appManagerDialog").close();
+    ticks.shift()();
+    await settle(ui.window);
+    assert.ok(ui.calls.filter((record) => record.command === "deployment-logs").at(-1).values.includes("--status-only"));
+  } finally { ui.dom.window.close(); }
+});
+
+test("delayed dialog loads prevent competing edits and duplicate requests", async () => {
+  for (const command of ["env-get", "deployment-logs"]) {
+    let release;
+    const pending = new Promise((resolve) => { release = resolve; });
+    const ui = await loadUi({
+      [command]: () => pending,
+      deployments: { deployments: [{ app_id: "portal", id: "last-build", status: "deployed" }] },
+    });
+    try {
+      const selector = command === "env-get" ? '[data-action="environment"]' : '#deploymentHistory [data-action="deployment-log"]';
+      const trigger = ui.document.querySelector(selector);
+      trigger.click();
+      trigger.click();
+      ui.document.querySelector('[data-action="edit"]').click();
+      await settle(ui.window);
+      assert.equal(ui.calls.filter((record) => record.command === command).length, 1);
+      assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+      release({ content: "", app_id: "portal", deployment_id: "last-build", active: false, logs: "Build complete" });
+      await settle(ui.window);
+      assert.equal(ui.document.querySelector("#appManagerDialog").open, true);
+      assert.equal(ui.document.querySelector(".am-app-manager").getAttribute("aria-busy"), "false");
+    } finally { release({}); ui.dom.window.close(); }
+  }
+});
+
+test("pending approval cannot be dismissed or submitted twice", async () => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const ui = await loadUi({
+    list: { apps: [{ ...fixtureApps[0], deployment_mode: "approval" }] },
+    "review-update": { pending_update: { commit: "b".repeat(40) } },
+    approve: () => pending,
+    "deployment-logs": { app_id: "portal", deployment_id: "approved", active: false },
+  });
+  try {
+    ui.document.querySelector('[data-action="review-update"]').click();
+    await settle(ui.window);
+    const dialog = ui.document.querySelector("#appManagerDialog");
+    const form = dialog.querySelector("form");
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    dialog.querySelector("[data-dialog-close]").click();
+    assert.equal(dialog.dispatchEvent(new ui.window.Event("cancel", { cancelable: true })), false);
+    assert.equal(dialog.open, true);
+    assert.equal(ui.calls.filter((record) => record.command === "approve").length, 1);
+    release({ deployment_id: "approved" });
+    await settle(ui.window);
+    assert.match(dialog.textContent, /Deployment:/);
+  } finally { release({ deployment_id: "approved" }); ui.dom.window.close(); }
 });
 
 test("search, filters, and clear preserve the full application list", async () => {
@@ -152,6 +384,55 @@ test("setup reviews repository, route, and environment before registering once",
   } finally { ui.dom.window.close(); }
 });
 
+test("attention includes public failures and matches the summary", async () => {
+  const cases = [
+    { health: { public_healthy: false } }, { health: { local_healthy: false } },
+    { auto_deploy_state: { error: "Fetch failed" } },
+    { deployments: [{ status: "deployed", cleanup_error: "Cleanup failed" }] },
+    { pending_update: { commit: "new" }, deployed_commit: "old" },
+    { pending_update: { commit: "same" }, deployed_commit: "same" },
+  ];
+  const ui = await loadUi({ list: { apps: cases.map((extra, index) => ({ ...fixtureApps[0], id: `app-${index}`, ...extra })) } });
+  try {
+    assert.match(ui.document.querySelector("#overviewCards").textContent, /Needs attention\s+5/);
+    ui.document.querySelector('[data-filter="failed"]').click();
+    assert.equal(ui.document.querySelectorAll(".am-app-card").length, 5);
+  } finally { ui.dom.window.close(); }
+});
+
+test("refresh preserves settings drafts and successful saves accept server values", async () => {
+  let saved = false;
+  const ui = await loadUi({ settings: (record) => {
+    if (record.values.length) saved = true;
+    return { config: { max_concurrent_builds: saved ? 4 : 1 } };
+  } });
+  try {
+    ui.document.querySelector('[name="max_concurrent_builds"]').value = "4";
+    ui.document.querySelector("#refreshButton").click();
+    await settle(ui.window);
+    assert.equal(ui.document.querySelector('[name="max_concurrent_builds"]').value, "4");
+    ui.document.querySelector("#settingsForm").dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.equal(saved, true);
+    assert.equal(ui.document.querySelector('[name="max_concurrent_builds"]').defaultValue, "4");
+  } finally { ui.dom.window.close(); }
+});
+
+test("manual health checks reload observations and report public failures", async () => {
+  let checked = false;
+  const ui = await loadUi({
+    list: () => ({ apps: [{ ...fixtureApps[0], health: { public_healthy: checked ? false : null } }] }),
+    health: () => { checked = true; return { healthy: true, public_healthy: false, public_error: "DNS failed" }; },
+  });
+  try {
+    ui.document.querySelector('[data-action="health"]').click();
+    await settle(ui.window);
+    assert.equal(ui.calls.filter((record) => record.command === "list").length, 2);
+    assert.match(ui.document.querySelector("#appManagerError").textContent, /public route failed: DNS failed/);
+    assert.match(ui.document.querySelector(".am-app-card").textContent, /Failed/);
+  } finally { ui.dom.window.close(); }
+});
+
 test("plugin updates announce automatic Cockpit restart", async () => {
   const ui = await loadUi({
     "plugin-update-check": { available: true, current_commit: "a".repeat(40), latest_commit: "b".repeat(40) },
@@ -208,10 +489,34 @@ test("retrying a failed environment save never registers the application twice",
     await settle(ui.window);
     assert.equal(ui.document.querySelector("#appManagerDialog").open, true);
     assert.match(ui.document.querySelector(".am-dialog-error").textContent, /Temporary save error/);
+    ui.document.querySelector("#setupBack").click();
+    assert.equal(form.querySelector('[data-setup-step="1"]').hidden, false);
+    form.elements.environment.value = "API_URL=corrected";
+    ui.document.querySelector("#setupNext").click();
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     assert.equal(saves, 2);
+    assert.equal(ui.calls.filter((record) => record.command === "env-save")[1].input, 'API_URL="corrected"\n');
     assert.equal(ui.calls.filter((record) => record.command === "add").length, 1);
     assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("setup rejects managed storage variables before registration", async () => {
+  const ui = await loadUi();
+  try {
+    ui.document.querySelector("[data-open-add]").click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    form.elements.repo_url.value = "https://github.com/example/shop.git";
+    form.elements.name.value = "Shop";
+    form.elements.name.dispatchEvent(new ui.window.Event("input"));
+    ui.document.querySelector("#setupNext").click();
+    for (const key of ["APP_DATA_DIR", "APP_STORAGE_DIR", "APP_STORAGE_UPLOADS"]) {
+      form.elements.environment.value = `${key}=/tmp/unmanaged`;
+      ui.document.querySelector("#setupNext").click();
+      assert.equal(form.querySelector('[data-setup-step="1"]').hidden, false);
+      assert.match(ui.document.querySelector(".am-dialog-error").textContent, /managed automatically/);
+    }
+    assert.equal(ui.calls.some((record) => record.command === "add"), false);
   } finally { ui.dom.window.close(); }
 });

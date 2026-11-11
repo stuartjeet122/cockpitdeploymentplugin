@@ -19,6 +19,8 @@
   "build_timeout_seconds": 900,
   "health_timeout_seconds": 30,
   "command_timeout_seconds": 30,
+  "min_free_disk_mb": 512,
+  "max_concurrent_builds": 1,
   "nginx_template": "/etc/cockpit/app-manager/templates/nginx.conf.tpl",
   "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl"
 }

@@ -45,7 +45,7 @@ preflight() {
   [[ "${ID:-}" == "ubuntu" ]] || fail "Ubuntu Server is required; found ${ID:-unknown}."
 
   local required_command
-  for required_command in install python3 dpkg-query dpkg cockpit-bridge systemctl systemd-run ss nginx git runuser; do
+  for required_command in install python3 dpkg-query dpkg cockpit-bridge systemctl systemd-run ss nginx git runuser logrotate ssh-keygen; do
     command -v "$required_command" >/dev/null 2>&1 || fail "Required command is missing: $required_command"
   done
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' ||
@@ -66,7 +66,8 @@ preflight() {
     fail "Required backend modules are missing."
   [[ -f "$APP_DIR/config/defaults.json" ]] || fail "Default configuration is missing."
   [[ -f "$APP_DIR/templates/nginx.conf.tpl" && -f "$APP_DIR/templates/app.service.tpl" &&
-    -f "$APP_DIR/templates/auto-deploy.service" && -f "$APP_DIR/templates/auto-deploy.timer" ]] ||
+    -f "$APP_DIR/templates/auto-deploy.service" && -f "$APP_DIR/templates/auto-deploy.timer" &&
+    -f "$APP_DIR/templates/app-manager.logrotate" ]] ||
     fail "Deployment templates are missing."
   python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import app_manager, adapters' "$APP_DIR/backend" ||
     fail "Backend modules cannot be imported from the project."
@@ -79,6 +80,12 @@ preflight() {
   require_directory_path "$PRODUCTION_ROOT"
   require_directory_path "$LOG_ROOT"
   require_directory_path "$SYSTEMD_DEST"
+  require_directory_path /etc/logrotate.d
+  [[ ! -L /etc/logrotate.d/cockpit-app-manager ]] || fail "Log rotation configuration must not be a symlink."
+  if [[ -e /etc/logrotate.d/cockpit-app-manager ]]; then
+    grep -q '^# Managed by Cockpit App Manager$' /etc/logrotate.d/cockpit-app-manager ||
+      fail "Refusing to overwrite an unmanaged log rotation configuration."
+  fi
 }
 
 install_files() {
@@ -107,6 +114,7 @@ install_files() {
   install -o root -g root -m 0644 "$APP_DIR/config/defaults.json" "$CONFIG_DEST/defaults.json"
   install -o root -g root -m 0644 "$APP_DIR/templates/nginx.conf.tpl" "$CONFIG_DEST/templates/nginx.conf.tpl"
   install -o root -g root -m 0644 "$APP_DIR/templates/app.service.tpl" "$CONFIG_DEST/templates/app.service.tpl"
+  install -o root -g root -m 0644 "$APP_DIR/templates/app-manager.logrotate" /etc/logrotate.d/cockpit-app-manager
   install -o root -g root -m 0644 "$APP_DIR/templates/auto-deploy.service" "$SYSTEMD_DEST/cockpit-app-manager-auto-deploy.service"
   install -o root -g root -m 0644 "$APP_DIR/templates/auto-deploy.timer" "$SYSTEMD_DEST/cockpit-app-manager-auto-deploy.timer"
 
@@ -146,9 +154,17 @@ install_files() {
     fail "Plugin version metadata must be a regular file."
   fi
   local version_tmp="$STATE_ROOT/.plugin-version.json.$$"
+  local plugin_version="${APP_MANAGER_RELEASE_VERSION:-}"
+  if [[ -n "$plugin_version" && ! "$plugin_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    fail "Invalid plugin release version."
+  fi
   install -o root -g root -m 0600 /dev/null "$version_tmp"
   if [[ -n "$plugin_commit" ]]; then
-    printf '{"commit":"%s"}\n' "$plugin_commit" >"$version_tmp"
+    if [[ -n "$plugin_version" ]]; then
+      printf '{"commit":"%s","version":"%s"}\n' "$plugin_commit" "$plugin_version" >"$version_tmp"
+    else
+      printf '{"commit":"%s"}\n' "$plugin_commit" >"$version_tmp"
+    fi
   else
     printf '{"commit":null}\n' >"$version_tmp"
   fi

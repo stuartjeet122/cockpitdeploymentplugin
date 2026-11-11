@@ -139,7 +139,8 @@ PY
 
 remove_managed_unit() {
   local app_id="$1"
-  local service_name="cockpit-app-${app_id}.service"
+  local slot="${2:-}"
+  local service_name="cockpit-app-${app_id}${slot}.service"
   local service_path="${SYSTEMD_DIR}/${service_name}"
   [[ -e "$service_path" || -L "$service_path" ]] || return 0
   if has_symlink_ancestor "$service_path"; then
@@ -253,6 +254,7 @@ remove_managed_app_data() {
       continue
     fi
     remove_managed_unit "$app_id"
+    remove_managed_unit "$app_id" "@secondary"
     if [[ "$APP_CLEANUP_BLOCKED" -eq 1 ]]; then
       log "Preserving application data and account because its systemd unit is not verifiably managed: $app_id" >&2
       apps_preserved=1

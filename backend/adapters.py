@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 import shlex
 import stat
 import shutil
@@ -832,6 +834,88 @@ def detect_framework(repo_path: Path, build_config: Optional[Dict[str, Any]] = N
         if adapter_cls.detect(repo_path):
             return adapter_cls.name
     raise ValueError("Could not detect a supported framework in the Git repository")
+
+
+def inspect_project(repo_path: Path, framework: str, build_config: Dict[str, Any]) -> Dict[str, Any]:
+    errors = []
+    warnings = []
+    tools = {}
+    project = repo_path
+    explicit_start = bool(build_config.get("start_command"))
+    try:
+        _validate_copy_symlinks(repo_path)
+        if framework in {"node", "nextjs"}:
+            package_root = repo_path
+            if framework == "nextjs":
+                project, package_root = _next_project_directories(repo_path, build_config)
+            package = json.loads(_readable_regular_file(project / "package.json", "package.json").decode("utf-8"))
+            if not isinstance(package, dict) or not isinstance(package.get("scripts", {}), dict):
+                raise ValueError("package.json must contain a scripts object")
+            scripts = package.get("scripts", {})
+            if any(not isinstance(value, str) or not value.strip() for value in scripts.values()):
+                errors.append("Package scripts must be non-empty strings")
+            if framework == "nextjs" and not scripts.get("build"):
+                errors.append("Next.js requires a build script")
+            if framework == "node" and not scripts.get("start") and not explicit_start:
+                errors.append("Node.js requires a start script or an explicit start command")
+            manager, _ = _detect_js_package_manager(package_root)
+            tools.update({"node": "18.18.0", manager: None})
+            dependencies = {}
+            for field in ("devDependencies", "dependencies"):
+                if not isinstance(package.get(field, {}), dict):
+                    errors.append(f"package.json {field} must be an object")
+                else:
+                    dependencies.update(package.get(field, {}))
+            if framework == "nextjs":
+                next_version = re.search(r"[0-9]+", str(dependencies.get("next", "")))
+                if next_version and int(next_version.group(0)) >= 16:
+                    tools["node"] = "20.9.0"
+                warnings.append("Existing Next.js basePath, trailingSlash and output settings are verified by Next.js before the build")
+            if not isinstance(package.get("engines", {}), dict):
+                errors.append("package.json engines must be an object")
+            elif package.get("engines", {}).get("node"):
+                warnings.append("Declared Node engine: " + str(package["engines"]["node"]) + "; configure a minimum runtime version when needed")
+        elif framework == "go":
+            if not (project / "go.mod").is_file():
+                errors.append("Go requires go.mod")
+            tools["go"] = None
+            if (project / "go.mod").is_file():
+                directive = re.search(r"(?m)^go\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)\s*$", _readable_regular_file(project / "go.mod", "go.mod").decode("utf-8"))
+                if directive:
+                    tools["go"] = directive.group(1)
+            warnings.append("The Go compiler verifies the main package and module toolchain during build")
+        elif framework == "python":
+            if not any((project / filename).is_file() for filename in ("requirements.txt", "pyproject.toml")):
+                errors.append("Python requires requirements.txt or pyproject.toml")
+            if not explicit_start and not ((project / "app.py").is_file() or (project / "app" / "__init__.py").is_file()):
+                errors.append("Default Python startup requires app:app; configure an explicit WSGI/ASGI/Django start command")
+            if not explicit_start and (project / "manage.py").is_file():
+                errors.append("Django requires an explicit compatible start command")
+            entrypoint = project / "app.py" if (project / "app.py").is_file() else project / "app" / "__init__.py"
+            if not explicit_start and entrypoint.is_file():
+                syntax = ast.parse(_readable_regular_file(entrypoint, "Python entry point").decode("utf-8"))
+                declared = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "app"
+                               or isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "app" for target in node.targets)
+                               or isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "app"
+                               or isinstance(node, ast.ImportFrom) and any((alias.asname or alias.name) == "app" for alias in node.names)
+                               for node in syntax.body)
+                if not declared:
+                    errors.append("Default Python startup requires an app symbol in app:app")
+                asgi = any(isinstance(node, ast.AsyncFunctionDef) and node.name == "app"
+                           or isinstance(node, ast.Call) and (isinstance(node.func, ast.Name) and node.func.id in {"FastAPI", "Starlette"}
+                           or isinstance(node.func, ast.Attribute) and node.func.attr in {"FastAPI", "Starlette"}) for node in ast.walk(syntax))
+                if asgi:
+                    errors.append("ASGI applications require an explicit compatible start command and dependencies")
+            tools["python3"] = "3.9.0"
+        elif framework == "static":
+            if not (project / "index.html").is_file():
+                errors.append("Static applications require index.html")
+        else:
+            errors.append("Unsupported framework")
+    except (OSError, ValueError, UnicodeError, SyntaxError) as exc:
+        errors.append(str(exc))
+    return {"framework": framework, "project_directory": str(project), "tools": tools,
+            "errors": errors, "warnings": warnings}
 
 
 def get_adapter(name: str) -> FrameworkAdapter:

@@ -1,0 +1,12 @@
+# Managed by Cockpit App Manager
+/var/log/cockpit-app-manager/*/stdout.log /var/log/cockpit-app-manager/*/stderr.log {
+    daily
+    maxsize 10M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}

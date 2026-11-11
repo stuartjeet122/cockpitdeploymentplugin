@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import Mock, call as mock_call, patch
 
 import backend.app_manager as manager
-from backend.adapters import NextJSAdapter, detect_framework, get_adapter
+from backend.adapters import NextJSAdapter, detect_framework, get_adapter, inspect_project
 
 
 class AppManagerTests(unittest.TestCase):
@@ -532,6 +532,22 @@ class AppManagerTests(unittest.TestCase):
         self.assertIn("[REDACTED]", result.stdout)
         self.assertIn("[REDACTED]", live_log)
 
+    def test_run_command_explicit_redaction_preserves_nonsecret_environment_flags(self):
+        root = Path(self.temp_dir.name)
+        command = [manager.sys.executable, "-c", "print('100644 private-token')"]
+        environment = {"FEATURE_FLAG": "1", "SECRET": "private-token"}
+        for options in ({}, {"live_log_path": root / "redaction.log"}, {"cancel_file": root / "cancel"}):
+            with self.subTest(options=options):
+                result = manager.run_command(command, env=environment, redact_values=["private-token"], timeout=10, **options)
+                self.assertEqual(result.stdout.strip(), "100644 [REDACTED]")
+        default = manager.run_command(command, env={"SECRET": "private-token"}, timeout=10)
+        self.assertNotIn("private-token", default.stdout)
+        with patch.object(manager.subprocess, "run", side_effect=subprocess.TimeoutExpired(command, 1, output=b"100644 private-token")):
+            with self.assertRaises(RuntimeError) as raised:
+                manager.run_command(command, env=environment, redact_values=["private-token"])
+        self.assertIn("100644 [REDACTED]", str(raised.exception))
+        self.assertNotIn("private-token", str(raised.exception))
+
     def test_live_command_timeout_keeps_captured_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(RuntimeError) as raised:
@@ -590,6 +606,12 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(result["status"], "deploying")
         self.assertIn("Build started", result["logs"])
         self.assertIn("Build started", manager.logs_app(app["id"])["logs"])
+        with patch.object(manager, "_tail_log", side_effect=AssertionError("Status polling must not read logs")):
+            args = manager._build_parser().parse_args(["deployment-logs", app["id"], deployment_id, "--status-only"])
+            status = manager._dispatch(args)
+        self.assertTrue(status["active"])
+        self.assertEqual(status["status"], "deploying")
+        self.assertNotIn("logs", status)
 
     def test_deployment_records_and_releases_keep_only_the_current_version(self):
         app = self.add_app()["app"]
@@ -657,6 +679,31 @@ class AppManagerTests(unittest.TestCase):
                 manager._find_app(registry, app["id"])["deployments"][0]["status"] = "deployed"
             manager.abort_deployment_app(app["id"], deployment_id)
 
+    def test_abort_immediately_after_publication_survives_worker_start(self):
+        app = self.add_app()["app"]
+        transaction = manager._registry_transaction
+        aborted = False
+
+        @contextlib.contextmanager
+        def publish_then_abort():
+            nonlocal aborted
+            with transaction() as registry:
+                yield registry
+            if not aborted:
+                aborted = True
+                active = manager._find_app(manager.get_registry(), app["id"])["deployments"][0]
+                manager.abort_deployment_app(app["id"], active["id"])
+
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "ensure_app_user", return_value=app["service_user"]
+        ), patch.object(manager, "_registry_transaction", publish_then_abort), patch.object(
+            manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        ):
+            result = manager.deployment_start_app(app["id"])
+
+        self.assertTrue(aborted)
+        self.assertTrue(manager.deployment_logs_app(app["id"], result["deployment_id"])["aborting"])
+
     def test_cancellable_command_terminates_its_process(self):
         with tempfile.TemporaryDirectory() as temporary:
             cancel_file = Path(temporary) / "cancel"
@@ -703,15 +750,373 @@ class AppManagerTests(unittest.TestCase):
                 "commit": "a" * 40,
                 "status": "deployed",
             })
-        pulled = {"app": dict(app, latest_commit="b" * 40)}
         deployed = {"deployment": {"commit": "b" * 40}}
         with patch.object(manager, "_require_root"), patch.object(
-            manager, "pull_app", return_value=pulled
-        ) as pull, patch.object(manager, "deploy_app", return_value=deployed) as deploy:
+            manager, "_remote_app_commit", return_value="b" * 40
+        ) as remote, patch.object(manager, "deploy_app", return_value=deployed) as deploy:
             result = manager.auto_deploy_apps()
         self.assertEqual(result["results"][0]["status"], "deployed")
-        pull.assert_called_once_with(app["id"])
+        remote.assert_called_once()
         deploy.assert_called_once_with(app["id"])
+
+    def test_auto_deploy_pause_window_and_backoff_skip_repository(self):
+        app = self.add_app(auto_deploy=False)["app"]
+        with patch.object(manager, "_require_root"), patch.object(manager, "_remote_app_commit") as remote:
+            self.assertEqual(manager.auto_deploy_apps()["results"][0]["status"], "paused")
+            manager.edit_app(app["id"], {"auto_deploy": True, "deployment_window": {"start": "01:00", "end": "02:00"}})
+            with patch.object(manager, "_in_deployment_window", return_value=False):
+                self.assertEqual(manager.auto_deploy_apps()["results"][0]["status"], "outside-deployment-window")
+            remote.assert_not_called()
+
+    def test_remote_revision_check_does_not_require_a_checkout(self):
+        app = self.add_app()["app"]
+        with patch.object(manager, "ensure_app_user", return_value=app["service_user"]), patch.object(
+            manager, "_run_as_user", return_value=subprocess.CompletedProcess([], 0, "a" * 40 + "\trefs/heads/main\n", "")
+        ) as run:
+            self.assertEqual(manager._remote_app_commit(app), "a" * 40)
+        self.assertEqual(run.call_args.args[0], app["service_user"])
+        self.assertEqual(run.call_args.args[1], ["git", "ls-remote", "--exit-code", app["repo_url"], "refs/heads/main"])
+        self.assertFalse(Path(app["source_path"]).exists())
+
+    def test_preflight_validates_environment_disk_and_runtime_minimums(self):
+        app = self.add_app(framework="node", required_environment=["DATABASE_URL"], runtime_requirements={"node": "20.9"})["app"]
+        source = Path(app["source_path"])
+        source.mkdir(parents=True)
+        (source / "package.json").write_text('{"scripts":{"start":"node server.js"}}', encoding="utf-8")
+        with patch.object(manager, "_environment_values_app", return_value={}), patch.object(manager, "_run_as_user", return_value=subprocess.CompletedProcess([], 0, "v18.20.0", "")):
+            report = manager._deployment_preflight(app, source, app["service_user"], manager.get_config())
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("DATABASE_URL" in error for error in report["errors"]))
+        self.assertTrue(any("minimum 20.9" in error for error in report["errors"]))
+        with patch.object(manager, "_environment_values_app", return_value={"DATABASE_URL": "secret-must-not-appear"}), patch.object(manager, "_run_as_user", return_value=subprocess.CompletedProcess([], 0, "v22.1.0", "")):
+            report = manager._deployment_preflight(app, source, app["service_user"], manager.get_config())
+        self.assertTrue(report["passed"])
+        self.assertNotIn("secret-must-not-appear", json.dumps(report))
+
+    def test_approval_is_bound_to_commit_repository_branch_and_live_revision(self):
+        app = self.add_app(deployment_mode="approval")["app"]
+        commit = "b" * 40
+        with self.assertRaisesRegex(RuntimeError, "Review and approve"):
+            manager._validate_approval(app, commit)
+        app["pending_update"] = {"commit": commit, "repo_url": app["repo_url"], "branch": app["branch"], "base_commit": None}
+        manager._validate_approval(app, commit)
+        for mutation in ({"branch": "changed"}, {"deployed_commit": "a" * 40}):
+            with self.assertRaisesRegex(RuntimeError, "changed since review"):
+                manager._validate_approval({**app, **mutation}, commit)
+
+    def test_capacity_settings_and_new_payload_fields_reject_unsafe_values(self):
+        for payload in ({"max_concurrent_builds": 0}, {"max_concurrent_builds": 9}, {"max_concurrent_builds": True}, {"min_free_disk_mb": -1}):
+            with self.assertRaises(ValueError):
+                manager.update_settings(payload)
+        for payload in ({"deployment_mode": []}, {"required_environment": ["bad-key"]}, {"runtime_requirements": {"bash": "1"}}, {"runtime_requirements": {"node": ">=20"}}, {"storage_directories": ["data/escape"]}):
+            with self.assertRaises(ValueError):
+                self.add_app(**payload)
+        for key in ("APP_DATA_DIR", "APP_STORAGE_DIR", "APP_STORAGE_UPLOADS"):
+            with self.assertRaisesRegex(ValueError, "reserved"):
+                manager._parse_environment_data(f"{key}=outside\n")
+        with self.assertRaisesRegex(ValueError, "dir is reserved"):
+            self.add_app(storage_directories=["dir"])
+
+    def test_failed_build_preflight_never_invokes_adapter(self):
+        app = self.add_app(framework="node")["app"]
+        with manager._registry_transaction() as registry:
+            manager._record_deployment(manager._find_app(registry, app["id"]), {"id": "preflight", "status": "deploying"})
+        root = Path(self.temp_dir.name)
+        adapter = Mock()
+        with patch.object(manager, "_deployment_preflight", return_value={"passed": False, "checks": [], "errors": ["Missing API_KEY"]}):
+            with self.assertRaisesRegex(RuntimeError, "Missing API_KEY"):
+                manager._build_release(app, root / "source", root / "release", adapter, app["service_user"], manager.get_config(), "preflight", root / "cancel", root / "deployment.log")
+        adapter.build.assert_not_called()
+        self.assertEqual(manager._find_app(manager.get_registry(), app["id"])["deployments"][0]["build_status"], "preflight")
+
+    def test_approval_policy_blocks_direct_deploy_and_stale_review_before_build(self):
+        app = self.add_app(framework="node", deployment_mode="approval")["app"]
+        commit = "b" * 40
+        paths = manager._app_paths(app["id"], manager.get_config())
+        with patch.object(manager, "_require_root"):
+            with self.assertRaisesRegex(RuntimeError, "Review and approve"):
+                manager.deploy_app(app["id"])
+        with manager._registry_transaction() as registry:
+            manager._find_app(registry, app["id"])["pending_update"] = {
+                "commit": commit, "base_commit": None, "repo_url": app["repo_url"], "branch": app["branch"],
+            }
+        paths["source"].mkdir(parents=True)
+        paths["releases"].mkdir(parents=True)
+        with patch.object(manager, "_require_root"), patch.object(manager, "ensure_app_user", return_value=app["service_user"]), patch.object(
+            manager, "_setup_app_directories", return_value=paths
+        ), patch.object(manager, "clone_or_update_repo"), patch.object(manager, "_environment_values_app", return_value={}), patch.object(
+            manager, "git_output", return_value="c" * 40
+        ), patch.object(manager, "get_adapter"), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
+            manager, "_prepare_release_directory", side_effect=lambda path, user: path.mkdir()
+        ), patch.object(manager, "_build_release") as build:
+            with self.assertRaisesRegex(RuntimeError, "changed after approval"):
+                manager.deploy_app(app["id"], approved_commit=commit)
+            build.assert_not_called()
+
+    def test_stale_queued_approval_is_recorded_as_failed_before_fetch_or_build(self):
+        app = self.add_app(deployment_mode="approval")["app"]
+        deployment_id = "20261109220923-abcdef12"
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored["status"] = "deploying"
+            stored["pending_update"] = {
+                "commit": "c" * 40, "repo_url": app["repo_url"], "branch": app["branch"], "base_commit": None,
+            }
+            manager._record_deployment(stored, {
+                "id": deployment_id, "status": "deploying", "previous_status": "stopped", "approved_commit": "b" * 40,
+            })
+        paths = manager._app_paths(app["id"], manager.get_config())
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "ensure_app_user", return_value=app["service_user"]
+        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
+            manager, "clone_or_update_repo"
+        ) as fetch, patch.object(manager, "_build_release") as build:
+            with self.assertRaisesRegex(RuntimeError, "Review and approve"):
+                manager.deploy_app(app["id"], deployment_id=deployment_id)
+        fetch.assert_not_called()
+        build.assert_not_called()
+        result = manager.deployment_logs_app(app["id"], deployment_id)
+        self.assertFalse(result["active"])
+        self.assertEqual(result["status"], "failed")
+
+    def test_deployment_worker_rejects_replayed_missing_and_competing_jobs(self):
+        app = self.add_app()["app"]
+        deployment_id = "20261109220923-abcdef12"
+        for status in ("deployed", "failed", "aborted", None, "deploying"):
+            with self.subTest(status=status):
+                with manager._registry_transaction() as registry:
+                    stored = manager._find_app(registry, app["id"])
+                    stored["deployments"] = [] if status is None else [{"id": deployment_id, "status": status}]
+                before = manager.get_registry()
+                with patch.object(manager, "_require_root"), patch.object(manager, "_setup_app_directories") as setup:
+                    with self.assertRaisesRegex(ValueError, "not active|already active"):
+                        manager.deploy_app(app["id"], deployment_id=None if status == "deploying" else deployment_id)
+                setup.assert_not_called()
+                self.assertEqual(manager.get_registry(), before)
+
+    def test_failed_release_preparation_never_removes_an_existing_directory(self):
+        app = self.add_app()["app"]
+        deployment_id = "20261109220923-abcdef12"
+        paths = manager._app_paths(app["id"], manager.get_config())
+        release = paths["releases"] / deployment_id
+        release.mkdir(parents=True)
+        sentinel = release / "keep.txt"
+        sentinel.write_text("existing release", encoding="utf-8")
+        with manager._registry_transaction() as registry:
+            manager._record_deployment(manager._find_app(registry, app["id"]), {
+                "id": deployment_id, "status": "deploying", "previous_status": "stopped",
+            })
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "ensure_app_user", return_value=app["service_user"]
+        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
+            manager, "clone_or_update_repo"
+        ), patch.object(manager, "_build_release") as build:
+            with self.assertRaisesRegex(RuntimeError, "already exists"):
+                manager.deploy_app(app["id"], deployment_id=deployment_id)
+        build.assert_not_called()
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "existing release")
+        self.assertEqual(manager.deployment_logs_app(app["id"], deployment_id)["status"], "failed")
+
+    def test_auto_deploy_approval_only_records_pending_changes(self):
+        app = self.add_app(deployment_mode="approval")["app"]
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored["deployed_commit"] = "a" * 40
+            manager._record_deployment(stored, {"id": "previous", "status": "deployed", "commit": "a" * 40})
+        with patch.object(manager, "_require_root"), patch.object(manager, "_remote_app_commit", return_value="b" * 40), patch.object(
+            manager, "review_update_app"
+        ) as review, patch.object(manager, "deploy_app") as deploy:
+            result = manager.auto_deploy_apps()
+        self.assertEqual(result["results"][0]["status"], "awaiting-approval")
+        review.assert_called_once_with(app["id"])
+        deploy.assert_not_called()
+
+    def test_build_slots_wait_cancel_and_release_after_errors(self):
+        cancel = Path(self.temp_dir.name) / "cancel"
+        waited = threading.Event()
+        def wait_for_slot():
+            with manager._build_slot(cancel, on_wait=waited.set):
+                self.fail("Cancelled worker acquired a slot")
+        with manager._build_slot(cancel):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                worker = executor.submit(wait_for_slot)
+                self.assertTrue(waited.wait(5))
+                cancel.touch()
+                with self.assertRaises(manager.DeploymentAborted):
+                    worker.result(timeout=5)
+        cancel.unlink()
+        with self.assertRaisesRegex(RuntimeError, "build failure"):
+            with manager._build_slot(cancel):
+                raise RuntimeError("build failure")
+        with manager._build_slot(cancel):
+            pass
+
+    def test_two_build_slots_allow_two_workers_but_not_a_third(self):
+        manager.update_settings({"max_concurrent_builds": 2})
+        cancel = Path(self.temp_dir.name) / "cancel"
+        waiting = threading.Event()
+        def wait_for_slot():
+            with manager._build_slot(cancel, on_wait=waiting.set):
+                self.fail("Third worker exceeded capacity")
+        with manager._build_slot(cancel), manager._build_slot(cancel):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                worker = executor.submit(wait_for_slot)
+                self.assertTrue(waiting.wait(5))
+                cancel.touch()
+                with self.assertRaises(manager.DeploymentAborted):
+                    worker.result(timeout=5)
+
+    def test_build_slots_reduction_counts_active_higher_numbered_slots(self):
+        manager.update_settings({"max_concurrent_builds": 2})
+        cancel = Path(self.temp_dir.name) / "cancel"
+        waiting = threading.Event()
+        acquired = threading.Event()
+        def wait_for_slot():
+            with manager._build_slot(cancel, on_wait=waiting.set):
+                acquired.set()
+        with contextlib.ExitStack() as first, contextlib.ExitStack() as second:
+            first.enter_context(manager._build_slot(cancel))
+            second.enter_context(manager._build_slot(cancel))
+            manager.update_settings({"max_concurrent_builds": 1})
+            first.close()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                worker = executor.submit(wait_for_slot)
+                try:
+                    self.assertTrue(waiting.wait(5))
+                    self.assertFalse(acquired.is_set())
+                    second.close()
+                    worker.result(timeout=5)
+                    self.assertTrue(acquired.is_set())
+                finally:
+                    cancel.touch()
+
+    def test_metrics_use_systemd_counters_and_reset_cpu_after_restart(self):
+        app = self.add_app(framework="node")["app"]
+        properties = "ActiveState=active\nMemoryCurrent=1024\nMemoryPeak=2048\nCPUUsageNSec=1000000000\nTasksCurrent=2\nNRestarts=3\nInvocationID=first\nActiveEnterTimestampMonotonic=1000000\n"
+        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, properties, "")):
+            first = manager.metrics_app(app["id"])["metrics"]
+        self.assertIsNone(first["cpu_percent"])
+        self.assertEqual(first["memory_bytes"], 1024)
+        with manager._registry_transaction() as registry:
+            manager._find_app(registry, app["id"])["metrics"]["sample_time"] -= 10
+        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, properties.replace("1000000000", "2000000000"), "")):
+            second = manager.metrics_app(app["id"])["metrics"]
+        self.assertAlmostEqual(second["cpu_percent"], 10, delta=0.2)
+        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, properties.replace("InvocationID=first", "InvocationID=second"), "")):
+            self.assertIsNone(manager.metrics_app(app["id"])["metrics"]["cpu_percent"])
+
+    def test_persistent_storage_is_named_isolated_and_not_pruned(self):
+        app = self.add_app(storage_directories=["uploads"])["app"]
+        config = manager.get_config()
+        paths = manager._app_paths(app["id"], config)
+        paths["production"].mkdir(parents=True)
+        with patch.object(manager.os, "chown", create=True), patch.object(manager, "_account_ids", return_value=(1001, 1001)):
+            manager._setup_persistent_storage(app, app["service_user"], config)
+        saved = paths["storage"] / "uploads" / "saved.txt"
+        saved.write_text("retained", encoding="utf-8")
+        manager._prune_releases(app)
+        self.assertEqual(saved.read_text(), "retained")
+        service = manager._render_service(app, ["node", "server.js"], config)
+        self.assertIn("APP_STORAGE_UPLOADS=", service)
+        self.assertIn("APP_DATA_DIR=", service)
+        self.assertIn(manager._systemd_quote(str(paths["storage"] / "uploads")), service)
+        with self.assertRaises(ValueError):
+            self.add_app(storage_directories=["../outside"])
+
+    def test_fresh_clone_must_descend_from_deployed_commit(self):
+        app = {"deployed_commit": "a" * 40}
+        for returncode in (0, 1, 128):
+            with patch.object(manager, "_git", return_value=subprocess.CompletedProcess([], returncode, "", "")) as git:
+                if returncode == 0:
+                    manager._assert_deployed_ancestor(app, Path(self.temp_dir.name), "app-demo", 30)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "rewritten history"):
+                        manager._assert_deployed_ancestor(app, Path(self.temp_dir.name), "app-demo", 30)
+                self.assertEqual(git.call_args.args[2], ["merge-base", "--is-ancestor", "a" * 40, "HEAD"])
+
+    def test_auto_deploy_validation_and_failure_backoff(self):
+        for payload in ({"auto_deploy": "yes"}, {"deployment_window": {"start": "25:00", "end": "01:00"}}):
+            with self.assertRaises(ValueError):
+                self.add_app(**payload)
+        app = self.add_app()["app"]
+        with manager._registry_transaction() as registry:
+            manager._record_deployment(manager._find_app(registry, app["id"]), {"id": "first", "status": "failed"})
+        with patch.object(manager, "_require_root"), patch.object(manager, "_remote_app_commit", side_effect=RuntimeError("offline")):
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                manager.auto_deploy_apps()
+            self.assertEqual(manager.auto_deploy_apps()["results"][0]["status"], "retry-backoff")
+        self.assertIn("offline", manager.get_registry()["apps"][0]["auto_deploy_state"]["error"])
+
+    def test_health_reports_service_local_and_public_independently(self):
+        app = self.add_app(framework="node")["app"]
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored.update(hosting_active=True, active_route=stored["route"])
+        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
+            manager, "check_app_health", return_value=True
+        ), patch.object(manager.urllib.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = urllib.error.URLError("public DNS unavailable")
+            result = manager.health_check_app(app["id"])
+        self.assertEqual(result["service_state"], "active")
+        self.assertTrue(result["local_healthy"])
+        self.assertFalse(result["public_healthy"])
+        self.assertIn("DNS", result["public_error"])
+        self.assertEqual(manager.get_registry()["apps"][0]["health"]["checked_at"], result["checked_at"])
+
+    def test_nextjs_public_health_preserves_an_existing_route_prefix(self):
+        app = self.add_app(framework="nextjs")["app"]
+        route = app["route"]
+        for health in ("/health", route + "health", route.rstrip("/"), "/"):
+            with self.subTest(health=health):
+                with manager._registry_transaction() as registry:
+                    stored = manager._find_app(registry, app["id"])
+                    stored.update(hosting_active=True, active_route=route, health_check_url=health)
+                with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
+                    manager, "check_app_health", return_value=True
+                ), patch.object(manager.urllib.request, "build_opener") as opener:
+                    opener.return_value.open.return_value.__enter__.return_value.status = 200
+                    report = manager.health_check_app(app["id"])
+                local_path = report["url"].split(":" + str(app["port"]), 1)[1]
+                self.assertEqual(opener.return_value.open.call_args.args[0].full_url, manager.DEFAULT_PUBLIC_ORIGIN + local_path)
+                self.assertNotIn(route.rstrip("/") + route, local_path)
+
+    def test_health_started_before_stop_cannot_restore_an_active_observation(self):
+        app = self.add_app(framework="node")["app"]
+        def stop_during_check(*arguments):
+            with manager._registry_transaction() as registry:
+                stored = manager._find_app(registry, app["id"])
+                stored["status"] = "stopped"
+                stored.pop("health", None)
+            return True
+        with manager._registry_transaction() as registry:
+            manager._find_app(registry, app["id"])["status"] = "running"
+        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
+            manager, "check_app_health", side_effect=stop_during_check
+        ):
+            manager.health_check_app(app["id"])
+        stored = manager._find_app(manager.get_registry(), app["id"])
+        self.assertEqual(stored["status"], "stopped")
+        self.assertNotIn("health", stored)
+
+    def test_service_transitions_discard_previous_health_observations(self):
+        app = self.add_app(framework="node")["app"]
+        service = Path(self.temp_dir.name) / "service"
+        service.touch()
+        for operation, healthy, expected in (("stop", True, "stopped"), ("start", True, "running"), ("restart", False, "failed")):
+            with self.subTest(operation=operation):
+                with manager._registry_transaction() as registry:
+                    manager._find_app(registry, app["id"])["health"] = {"service_state": "active", "checked_at": manager.now_iso()}
+                with patch.object(manager, "_require_root"), patch.object(manager, "_service_path", return_value=service), patch.object(
+                    manager, "_systemctl"
+                ), patch.object(manager, "_wait_for_health", return_value=healthy), patch.object(manager, "_assert_loopback_binding"):
+                    if healthy:
+                        manager._service_action(app["id"], operation)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            manager._service_action(app["id"], operation)
+                stored = manager._find_app(manager.get_registry(), app["id"])
+                self.assertEqual(stored["status"], expected)
+                self.assertNotIn("health", stored)
 
     def test_detached_deployment_failure_preserves_previous_running_status(self):
         app = self.add_app()["app"]
@@ -739,12 +1144,21 @@ class AppManagerTests(unittest.TestCase):
         version_path = Path(manager.DEFAULT_PLUGIN_VERSION_PATH)
         version_path.parent.mkdir(parents=True)
         version_path.write_text(json.dumps({"commit": "a" * 40}), encoding="utf-8")
-        with patch.object(manager, "_plugin_remote_commit", return_value="b" * 40):
+        with patch.object(manager, "_plugin_remote_release", return_value={"commit": "b" * 40, "version": "v1.1.0"}):
             result = manager.plugin_update_check()
 
         self.assertTrue(result["available"])
         self.assertEqual(result["current_commit"], "a" * 40)
         self.assertEqual(result["latest_commit"], "b" * 40)
+
+    def test_plugin_update_rejects_downgrade_and_rewritten_release(self):
+        version_path = Path(manager.DEFAULT_PLUGIN_VERSION_PATH)
+        version_path.parent.mkdir(parents=True)
+        version_path.write_text(json.dumps({"commit": "a" * 40, "version": "v2.0.0"}), encoding="utf-8")
+        for version in ("v1.9.9", "v2.0.0"):
+            with patch.object(manager, "_plugin_remote_release", return_value={"commit": "b" * 40, "version": version}):
+                with self.assertRaisesRegex(RuntimeError, "older or rewritten"):
+                    manager.plugin_update_check()
 
     def test_plugin_update_downloads_fixed_upstream_and_runs_its_installer(self):
         commit = "b" * 40
@@ -757,10 +1171,12 @@ class AppManagerTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
             return subprocess.CompletedProcess(args, 0, stdout=commit + "\n", stderr="")
 
-        with patch.object(manager, "plugin_update_check", return_value={"available": True}), patch.object(
+        with patch.object(manager, "plugin_update_check", return_value={"available": True, "version": "v1.1.0", "latest_commit": commit}), patch.object(
             manager, "_account_ids", return_value=(65534, 65534)
         ), patch.object(manager, "_plugin_git", side_effect=fake_git) as plugin_git, patch.object(
             manager, "_seal_plugin_update_checkout"
+        ), patch.object(manager, "_verify_plugin_release") as verify, patch.object(manager, "_verify_plugin_checkout"), patch.object(
+            manager, "_require_root"
         ), patch.object(manager.os, "chown", create=True), patch.object(
             manager.os, "chmod"
         ), patch.object(
@@ -769,10 +1185,12 @@ class AppManagerTests(unittest.TestCase):
             result = manager.plugin_update()
 
         self.assertTrue(result["updated"])
+        verify.assert_called_once()
         self.assertEqual(result["commit"], commit)
         clone_command = plugin_git.call_args_list[0].args[0]
         self.assertIn(manager.PLUGIN_REPOSITORY_URL, clone_command)
         self.assertIn("--branch", clone_command)
+        self.assertNotEqual(Path(clone_command[-1]), verify.call_args.args[0])
         self.assertEqual(install.call_args_list[0].args[0][0], "bash")
         installer_path = install.call_args_list[0].args[0][1].replace("\\", "/")
         self.assertTrue(installer_path.endswith("scripts/install.sh"))
@@ -781,6 +1199,30 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(restart_command[0], "systemd-run")
         self.assertIn("--on-active=5s", restart_command)
         self.assertEqual(restart_command[-3:], ["systemctl", "restart", "cockpit.service"])
+
+    def test_plugin_update_never_installs_a_moved_or_untrusted_release(self):
+        commit = "b" * 40
+        def fake_git(args, timeout=120):
+            if "clone" in args:
+                checkout = Path(args[-1])
+                (checkout / "scripts").mkdir(parents=True)
+                (checkout / "scripts" / "install.sh").write_bytes(b"#!/bin/sh\n")
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 0, commit + "\n", "")
+        for moved in (True, False):
+            with self.subTest(moved=moved), patch.object(manager, "plugin_update_check", return_value={
+                "available": True, "version": "v1.1.0", "latest_commit": "a" * 40 if moved else commit,
+            }), patch.object(manager, "_account_ids", return_value=(65534, 65534)), patch.object(
+                manager, "_plugin_git", side_effect=fake_git
+            ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(
+                manager, "_verify_plugin_release", side_effect=RuntimeError("Untrusted signature")
+            ), patch.object(manager.os, "chown", create=True), patch.object(manager.os, "chmod"), patch.object(
+                manager, "run_command"
+            ) as install:
+                with self.assertRaisesRegex(RuntimeError, "changed|Untrusted"):
+                    manager.plugin_update()
+                install.assert_not_called()
+                self.assertFalse(list((Path(manager.DEFAULT_STATE_ROOT) / "plugin-updates").iterdir()))
 
     def test_plugin_update_does_not_restart_when_already_current(self):
         with patch.object(manager, "plugin_update_check", return_value={
@@ -805,10 +1247,10 @@ class AppManagerTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 1, stdout="", stderr="restart scheduler unavailable"),
             ]
             with self.subTest(install_succeeds=install_succeeds), patch.object(
-                manager, "plugin_update_check", return_value={"available": True}
+                manager, "plugin_update_check", return_value={"available": True, "version": "v1.1.0", "latest_commit": "b" * 40}
             ), patch.object(manager, "_account_ids", return_value=(65534, 65534)), patch.object(
                 manager, "_plugin_git", side_effect=fake_git
-            ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(
+            ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(manager, "_verify_plugin_release"), patch.object(manager, "_verify_plugin_checkout"), patch.object(
                 manager.os, "chown", create=True
             ), patch.object(manager.os, "chmod"), patch.object(manager, "run_command", side_effect=commands) as run:
                 if install_succeeds:
@@ -821,6 +1263,72 @@ class AppManagerTests(unittest.TestCase):
                         manager.plugin_update()
                 self.assertEqual(run.call_count, 2 if install_succeeds else 1)
                 self.assertFalse(list((Path(manager.DEFAULT_STATE_ROOT) / "plugin-updates").iterdir()))
+
+    def test_plugin_release_selection_requires_annotated_semantic_versions(self):
+        output = "\n".join([
+            "a" * 40 + "\trefs/tags/v1.9.0^{}",
+            "b" * 40 + "\trefs/tags/v1.10.0^{}",
+            "c" * 40 + "\trefs/tags/v99.0.0",
+        ])
+        with patch.object(manager, "_plugin_git", return_value=subprocess.CompletedProcess([], 0, output, "")):
+            self.assertEqual(manager._plugin_remote_release(), {"version": "v1.10.0", "commit": "b" * 40})
+
+    def test_plugin_tree_rejects_modified_and_unexpected_files(self):
+        import hashlib
+        checkout = Path(self.temp_dir.name) / "checkout"
+        checkout.mkdir()
+        installer = checkout / "install.sh"
+        installer.write_bytes(b"trusted")
+        digest = hashlib.sha1(b"blob 7\0trusted").hexdigest()
+        commit = "a" * 40
+        responses = [subprocess.CompletedProcess([], 0, commit + "\n", ""),
+                     subprocess.CompletedProcess([], 0, f"100644 blob {digest}\tinstall.sh\0", "")]
+        with patch.object(manager, "run_command", side_effect=responses):
+            manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
+        for modified in (True, False):
+            if modified:
+                installer.write_bytes(b"tampered")
+            else:
+                installer.write_bytes(b"trusted")
+                (checkout / "json.py").write_bytes(b"injected")
+            with patch.object(manager, "run_command", side_effect=responses):
+                with self.assertRaisesRegex(RuntimeError, "signed tree|unexpected files"):
+                    manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
+
+    def test_plugin_signature_requires_provisioned_trust(self):
+        with patch.object(manager, "PLUGIN_TRUSTED_SIGNERS", str(Path(self.temp_dir.name) / "missing")):
+            with self.assertRaisesRegex(RuntimeError, "Provision"):
+                manager._verify_plugin_release(Path(self.temp_dir.name), "v1.0.0")
+
+    @unittest.skipUnless(shutil.which("git"), "requires Git")
+    def test_plugin_tree_uses_real_git_and_rejects_replacement_refs(self):
+        checkout = Path(self.temp_dir.name) / "verified-checkout"
+        checkout.mkdir()
+        environment = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                           GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.invalid",
+                           GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@example.invalid")
+        def git(*arguments, content=None):
+            result = subprocess.run(["git", "-C", str(checkout), *arguments], input=content,
+                                    capture_output=True, check=True, timeout=10, env=environment)
+            return result.stdout.decode("utf-8").strip()
+        git("init", "-q")
+        original = b"trusted installer\n"
+        blob = git("hash-object", "-w", "--stdin", content=original)
+        tree = git("mktree", content=f"100644 blob {blob}\tinstall.sh\n".encode("ascii"))
+        commit = git("commit-tree", tree, content=b"Trusted release\n")
+        git("tag", "-a", "v1.0.0", commit, "-m", "Release")
+        installer = checkout / "install.sh"
+        installer.write_bytes(original)
+        manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
+        changed = b"untrusted installer\n"
+        blob = git("hash-object", "-w", "--stdin", content=changed)
+        tree = git("mktree", content=f"100644 blob {blob}\tinstall.sh\n".encode("ascii"))
+        replacement = git("commit-tree", tree, content=b"Replacement\n")
+        git("replace", commit, replacement)
+        manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
+        installer.write_bytes(changed)
+        with self.assertRaisesRegex(RuntimeError, "differs from the signed tree"):
+            manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
 
     def test_git_clone_failure_is_reported_and_partial_directory_removed(self):
         source = Path(manager.DEFAULT_SOURCE_ROOT) / "example-site"
@@ -935,7 +1443,9 @@ class AppManagerTests(unittest.TestCase):
             manager, "_run_as_user", return_value=subprocess.CompletedProcess(
                 args=["true"], returncode=0, stdout="", stderr=""
             )
-        ) as run_as_user, patch.object(manager, "get_adapter", return_value=adapter):
+        ) as run_as_user, patch.object(manager, "get_adapter", return_value=adapter), patch.object(
+            manager, "_deployment_preflight", return_value={"passed": True}
+        ):
             result = manager.deploy_app(app["id"])
 
         self.assertEqual(adapter.route, "/custom-route/")
@@ -988,7 +1498,9 @@ class AppManagerTests(unittest.TestCase):
                 stdout="",
                 stderr=expected_error,
             ),
-        ), patch("backend.adapters._prepare_build_copy_permissions"):
+        ), patch("backend.adapters._prepare_build_copy_permissions"), patch.object(
+            manager, "_deployment_preflight", return_value={"passed": True}
+        ):
             with self.assertRaisesRegex(RuntimeError, "ENOLOCK"):
                 manager.deploy_app(app["id"])
 
@@ -1063,6 +1575,99 @@ class AppManagerTests(unittest.TestCase):
         runtime_health.assert_not_called()
         self.assertTrue(result["app"]["hosting_active"])
         self.assertEqual(result["app"]["public_url"], manager.DEFAULT_PUBLIC_ORIGIN + app["route"])
+        self.assertFalse(paths["source"].exists())
+        self.assertTrue((Path(result["deployment"]["release"]) / "app" / "index.html").is_file())
+
+    def test_staged_deployment_checks_candidate_before_switch_and_keeps_old_on_failure(self):
+        for health_passes in (True, False):
+            with self.subTest(health_passes=health_passes):
+                app = self.add_app("Staged " + str(health_passes), framework="nextjs")["app"]
+                config = manager.get_config()
+                paths = manager._app_paths(app["id"], config)
+                paths["source"].mkdir(parents=True)
+                paths["releases"].mkdir(parents=True)
+                paths["current"].mkdir()
+                primary = Path(self.temp_dir.name) / (app["id"] + ".service")
+                secondary = Path(self.temp_dir.name) / (app["id"] + "-secondary.service")
+                primary.write_text(f"# Managed by Cockpit App Manager\nDescription=Cockpit App Manager - {app['id']}\nUser={app['service_user']}\n", encoding="utf-8")
+                with manager._registry_transaction() as registry:
+                    manager._find_app(registry, app["id"]).update(status="running", deployed_commit="a" * 40)
+                events = []
+                adapter = Mock()
+                def build(candidate, source, release, **kwargs):
+                    self.assertNotEqual(candidate["port"], app["port"])
+                    (release / "app").mkdir()
+                    return {"start_command": ["next", "start", "--port", str(candidate["port"])]}
+                adapter.build.side_effect = build
+                def write_service(candidate, release, command, settings, working_directory):
+                    text = manager._render_service(candidate, command, settings, working_directory, release)
+                    self.assertIn(str(release / "app"), text)
+                    secondary.write_text(text, encoding="utf-8")
+                def health(candidate, timeout):
+                    events.append("health")
+                    self.assertTrue(primary.exists())
+                    self.assertNotEqual(candidate["port"], app["port"])
+                    return health_passes
+                def systemctl(*args, **kwargs):
+                    events.append(tuple(args))
+                with contextlib.ExitStack() as stack:
+                    mocks = {
+                        "_require_root": Mock(), "ensure_app_user": Mock(return_value=app["service_user"]),
+                        "_setup_app_directories": Mock(return_value=paths), "clone_or_update_repo": Mock(),
+                        "_assert_deployed_ancestor": Mock(),
+                        "_deployment_preflight": Mock(return_value={"passed": True}),
+                        "git_output": Mock(return_value="b" * 40), "_account_ids": Mock(return_value=(1001, 1001)),
+                        "_environment_values_app": Mock(return_value={}), "get_adapter": Mock(return_value=adapter),
+                        "_prepare_release_directory": Mock(side_effect=lambda path, user: path.mkdir()),
+                        "_seal_release": Mock(), "_retire_legacy_root_service": Mock(),
+                        "_service_path": Mock(side_effect=lambda candidate: secondary if candidate.get("service_slot") == "secondary" else primary),
+                        "_write_service": Mock(side_effect=write_service), "_systemctl": Mock(side_effect=systemctl),
+                        "_wait_for_health": Mock(side_effect=health), "_assert_loopback_binding": Mock(),
+                        "_atomic_symlink": Mock(side_effect=lambda *args: events.append("symlink")),
+                        "_activate_nginx_config": Mock(side_effect=lambda *args: events.append("nginx") or {"active": True, "message": "active"}),
+                        "_prune_releases": Mock(), "_socket_port_available": Mock(return_value=True),
+                        "get_listening_ports": Mock(return_value=set()),
+                    }
+                    for name, replacement in mocks.items():
+                        stack.enter_context(patch.object(manager, name, replacement))
+                    if health_passes:
+                        manager.deploy_app(app["id"])
+                        self.assertLess(events.index("health"), events.index("symlink"))
+                        self.assertLess(events.index("nginx"), events.index(("disable", "--now", primary.name)))
+                        stored = manager._find_app(manager.get_registry(), app["id"])
+                        self.assertEqual(stored["service_slot"], "secondary")
+                        self.assertEqual(stored["deployed_commit"], "b" * 40)
+                        self.assertFalse(paths["source"].exists())
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "health check"):
+                            manager.deploy_app(app["id"])
+                        self.assertNotIn("nginx", events)
+                        self.assertNotIn(("restart", primary.name), events)
+                        self.assertNotIn(("disable", "--now", primary.name), events)
+                        self.assertTrue(primary.exists())
+                        self.assertFalse(secondary.exists())
+                        self.assertTrue(paths["source"].exists())
+                    self.assertNotIn("candidate_port", manager._find_app(manager.get_registry(), app["id"]))
+
+    def test_alternate_service_slot_cannot_collide_with_an_application_id(self):
+        primary = manager._service_path({"id": "demo-secondary"})
+        secondary = manager._service_path({"id": "demo", "service_slot": "secondary"})
+        self.assertNotEqual(primary, secondary)
+        self.assertEqual(secondary.name, "cockpit-app-demo@secondary.service")
+
+    def test_source_cleanup_rejects_symlink_and_preserves_runtime(self):
+        app = self.add_app()["app"]
+        config = manager.get_config()
+        paths = manager._app_paths(app["id"], config)
+        paths["source"].mkdir(parents=True)
+        (paths["source"] / "file.txt").write_text("source", encoding="utf-8")
+        paths["releases"].mkdir(parents=True)
+        manager._remove_deployed_source(app["id"], config)
+        self.assertFalse(paths["source"].exists())
+        self.assertTrue(paths["releases"].exists())
+        with patch.object(manager, "_assert_no_symlink_components", side_effect=RuntimeError("symlink")):
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                manager._remove_deployed_source(app["id"], config)
 
     def test_runtime_start_checks_health_and_socket_isolation(self):
         app = self.add_app("Runtime checks")["app"]
@@ -1098,7 +1703,8 @@ class AppManagerTests(unittest.TestCase):
         paths["current"].mkdir()
         (paths["source"] / "index.html").write_text("Ready", encoding="utf-8")
         service_path = Path(self.temp_dir.name) / "previous.service"
-        service_path.write_text("previous runtime service", encoding="utf-8")
+        previous_service = f"# Managed by Cockpit App Manager\nDescription=Cockpit App Manager - {app['id']}\nUser={app['service_user']}\n"
+        service_path.write_bytes(previous_service.encode("utf-8"))
         with manager._registry_transaction() as registry:
             manager._find_app(registry, app["id"])["status"] = "running"
         with patch.object(manager, "_require_root"), patch.object(
@@ -1121,7 +1727,7 @@ class AppManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Nginx refused activation"):
                 manager.deploy_app(app["id"])
         self.assertEqual([item.args for item in restore.call_args_list], [
-            (service_path, None), (service_path, b"previous runtime service"),
+            (service_path, None), (service_path, previous_service.encode("utf-8")),
         ])
         actions = [item.args for item in systemctl.call_args_list]
         self.assertIn(("disable", "--now", service_path.name), actions)
@@ -1646,6 +2252,22 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
 
 
 class FrameworkAdapterTests(unittest.TestCase):
+    def test_project_inspection_checks_startup_without_executing_repository_code(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text('{"scripts":{"build":"compile"}}', encoding="utf-8")
+            report = inspect_project(root, "node", {})
+            self.assertIn("start script", report["errors"][0])
+            self.assertFalse(inspect_project(root, "node", {"start_command": ["node", "server.js"]})["errors"])
+            (root / "requirements.txt").write_text("", encoding="utf-8")
+            self.assertIn("app:app", inspect_project(root, "python", {})["errors"][0])
+            (root / "app.py").write_text("app = object()\nraise RuntimeError('must never be imported')", encoding="utf-8")
+            self.assertFalse(inspect_project(root, "python", {})["errors"])
+            (root / "app.py").write_text("from fastapi import FastAPI\napp = FastAPI()", encoding="utf-8")
+            self.assertTrue(any("ASGI" in error for error in inspect_project(root, "python", {})["errors"]))
+            self.assertFalse(inspect_project(root, "python", {"start_command": ["uvicorn", "app:app"]})["errors"])
+            self.assertTrue(inspect_project(root, "static", {})["errors"])
+
     def test_static_build_requires_no_runtime_by_default(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1848,6 +2470,9 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", service)
         self.assertIn("ProtectHome=true", service)
         self.assertIn("PrivateDevices=true", service)
+        self.assertIn("MemoryMax=1024M", service)
+        self.assertIn("CPUQuota=100%", service)
+        self.assertIn("TasksMax=256", service)
         self.assertIn("CapabilityBoundingSet=\n", service)
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", service)
         self.assertIn("Environment=\"APP_BASE_PATH=/demo\"", service)
@@ -1878,6 +2503,26 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         read_write_paths = next(line for line in service.splitlines() if line.startswith("ReadWritePaths="))
         self.assertNotIn(manager._systemd_quote(str(paths["current"] / "app")), read_write_paths)
         self.assertNotIn(manager._systemd_quote(str(paths["releases"])), read_write_paths)
+
+    def test_resource_limits_reject_unsafe_values_and_persist(self):
+        for value in ({"memory_mb": True}, {"tasks_max": 0}, {"unknown": 1}, "unlimited"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                manager._resource_limits(value)
+        app = {"id": "demo", "service_user": "app-demo", "port": 8100,
+               "resource_limits": manager._resource_limits({"memory_mb": 512})}
+        self.assertEqual(app["resource_limits"]["memory_mb"], 512)
+        self.assertIn("MemoryMax=512M", manager._render_service(app, ["node", "server.js"], manager._default_config()))
+
+    def test_build_commands_have_cgroup_resource_limits(self):
+        with patch.object(manager, "_require_root"), patch.object(manager.os, "name", "posix"), patch.object(
+            manager, "_account_exists", return_value=True
+        ), patch.object(manager, "_home_path", return_value="/managed/home"), patch.object(manager, "run_command") as run:
+            manager._run_as_user("app-demo", ["npm", "ci"], resource_limits={"build_memory_mb": 768})
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "systemd-run")
+        self.assertIn("--property=MemoryMax=768M", command)
+        self.assertIn("runuser", command)
+        self.assertIn("app-demo", command)
 
     def test_nextjs_service_runs_with_production_node_environment(self):
         config = manager._default_config()

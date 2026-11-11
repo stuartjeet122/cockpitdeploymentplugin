@@ -160,7 +160,7 @@
       ["Applications", data.total_apps],
       ["Live", data.running_apps],
       ["Stopped", data.stopped_apps],
-      ["Needs attention", data.failed_deployments],
+      ["Needs attention", state.apps.filter(needsAttention).length],
     ];
     byId("overviewCards").innerHTML = cards.map(([label, value]) => `
       <div class="am-metric">
@@ -201,12 +201,25 @@
     renderAppList();
   }
 
+  function observedStatus(app) {
+    const health = app.health;
+    if (app.status === "deploying" || !health || health.service_state === "not-required" || Date.now() - Date.parse(health.checked_at) > 600000 || !Number.isFinite(Date.parse(health.checked_at)) || Date.parse(health.checked_at) < Date.parse(app.updated_at)) return app.status;
+    return health.service_state === "active" ? "running" : health.service_state === "failed" ? "failed" : health.service_state === "inactive" ? "stopped" : app.status;
+  }
+
+  function needsAttention(app) {
+    return observedStatus(app) === "failed" || app.deployments?.at(-1)?.status === "failed"
+      || app.health?.local_healthy === false || app.health?.public_healthy === false
+      || Boolean(app.auto_deploy_state?.error || app.deployments?.at(-1)?.cleanup_error
+        || app.pending_update?.commit && app.pending_update.commit !== app.deployed_commit);
+  }
+
   function renderAppList() {
     byId("appCount").textContent = String(state.apps.length);
     const filtered = state.apps.filter((app) => {
       const matchesStatus = state.filter === "all" || (state.filter === "failed"
-        ? app.status === "failed" || app.deployments?.[0]?.status === "failed"
-        : app.status === state.filter);
+        ? needsAttention(app)
+        : observedStatus(app) === state.filter);
       return matchesStatus && [app.name, app.repo_url, app.route, frameworkName(app.framework)]
         .join(" ").toLowerCase().includes(state.query.toLowerCase());
     }).sort((first, second) => state.sort === "name"
@@ -238,7 +251,7 @@
       const unavailable = deploying ? " disabled data-unavailable" : "";
       const runtimeUnavailable = deploying || !app.last_deploy ? " disabled data-unavailable" : "";
       const appId = escapeHtml(app.id);
-      const serviceControl = app.status === "running"
+      const serviceControl = observedStatus(app) === "running"
         ? `<button type="button" data-action="stop" data-id="${appId}"${runtimeUnavailable}>${icon("pause")} Stop application</button>`
         : `<button type="button" data-action="start" data-id="${appId}"${runtimeUnavailable}>${icon("play")} Start application</button>`;
       const routeStatus = routeIsActive && app.active_route === app.route
@@ -249,7 +262,9 @@
       const appInitial = String(app.name || "A").trim().charAt(0).toUpperCase() || "A";
       const deployControl = app.status === "deploying"
         ? `<button type="button" class="am-button am-button--primary" data-action="deployment-log" data-id="${appId}">${icon("loader-circle")} View deployment</button>`
-        : `<button type="button" class="am-button am-button--primary" data-action="deploy" data-id="${appId}">${icon("arrow-up-right")} ${app.last_deploy ? "Redeploy" : "Deploy"}</button>`;
+        : app.deployment_mode === "approval"
+          ? `<button type="button" class="am-button am-button--primary" data-action="review-update" data-id="${appId}">${icon("git-branch")} Review update</button>`
+          : `<button type="button" class="am-button am-button--primary" data-action="deploy" data-id="${appId}">${icon("arrow-up-right")} ${app.last_deploy ? "Redeploy" : "Deploy"}</button>`;
       const lastFailure = app.deployments?.[0]?.status === "failed";
       return `
         <article class="am-app-card">
@@ -259,7 +274,7 @@
               <h3>${escapeHtml(app.name)}</h3>
               <span class="am-app-framework">${escapeHtml(frameworkName(app.framework || "auto"))}</span>
             </div>
-            ${renderStatus(app.status)}
+            ${renderStatus(observedStatus(app))}
           </header>
           <div class="am-app-route">${icon("globe")}${safeUrl && routeIsActive
             ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(app.active_route)}${icon("external-link")}</a>`
@@ -268,8 +283,23 @@
           <dl class="am-app-meta">
             <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
             <div><dt>${app.framework === "static" && !app.build_config?.start_command ? "Hosting" : "Runtime"}</dt><dd>${app.framework === "static" && !app.build_config?.start_command ? "Nginx" : `127.0.0.1:${escapeHtml(app.port)}`}</dd></div>
-            <div class="am-meta-wide"><dt>Last deployed</dt><dd>${escapeHtml(formatDate(app.last_deploy))}${app.latest_commit ? ` <code>${escapeHtml(app.latest_commit.slice(0, 7))}</code>` : ""}</dd></div>
+            <div class="am-meta-wide"><dt>Last deployed</dt><dd>${escapeHtml(formatDate(app.last_deploy))}${app.deployed_commit ? ` <code>${escapeHtml(app.deployed_commit.slice(0, 7))}</code>` : ""}</dd></div>
+            <div><dt>Service</dt><dd>${escapeHtml(app.health?.service_state || "Not checked")}</dd></div>
+            <div><dt>Readiness</dt><dd title="${escapeHtml(app.health?.local_error || "")}">${app.health ? (app.health.local_healthy ? "Healthy" : "Failed") : "Not checked"}</dd></div>
+            <div><dt>Public route</dt><dd title="${escapeHtml(app.health?.public_error || "")}">${app.health?.public_healthy == null ? "Not checked" : app.health.public_healthy ? "Reachable" : "Failed"}</dd></div>
+            <div><dt>Checked</dt><dd>${escapeHtml(app.health?.checked_at ? formatDate(app.health.checked_at) : "Never")}</dd></div>
+            <div><dt>Auto-deploy</dt><dd>${app.auto_deploy === false ? "Paused" : "Enabled"}</dd></div>
+            <div><dt>Last repository check</dt><dd>${escapeHtml(app.auto_deploy_state?.checked_at ? formatDate(app.auto_deploy_state.checked_at) : "Never")}</dd></div>
+            <div><dt>CPU</dt><dd>${app.metrics?.cpu_percent == null ? "Not sampled" : `${escapeHtml(app.metrics.cpu_percent)}%`}</dd></div>
+            <div><dt>Memory</dt><dd>${formatBytes(app.metrics?.memory_bytes)}</dd></div>
+            <div><dt>Metrics sampled</dt><dd>${app.metrics?.checked_at ? escapeHtml(formatDate(app.metrics.checked_at)) : "Never"}</dd></div>
+            <div><dt>Build phase</dt><dd>${escapeHtml(deploying ? app.deployments?.[0]?.build_status || "pending" : "Idle")}</dd></div>
+            <div><dt>Deployment policy</dt><dd>${app.deployment_mode === "approval" ? "Approval required" : "Automatic"}</dd></div>
           </dl>
+          ${app.deployment_mode === "approval" && app.pending_update && app.pending_update.commit !== app.deployed_commit ? `<p class="am-route-state">Awaiting approval: <code>${escapeHtml(app.pending_update.commit.slice(0, 7))}</code></p>` : ""}
+          ${app.health && (app.health.local_healthy === false || app.health.public_healthy === false || app.health.service_error) ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${escapeHtml(app.health.local_error || app.health.public_error || app.health.service_error)}</span></p>` : ""}
+          ${app.auto_deploy_state?.error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Automatic deployment: ${escapeHtml(app.auto_deploy_state.error)}</span></p>` : ""}
+          ${app.deployments?.[0]?.cleanup_error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Deployment is live; cleanup needs attention: ${escapeHtml(app.deployments[0].cleanup_error)}</span></p>` : ""}
           ${lastFailure ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${app.status === "running" ? "Latest deployment failed. Previous release is still live." : "Latest deployment failed."} <button type="button" data-action="deployment-log" data-id="${appId}">View log</button></span></p>` : ""}
           <div class="am-app-actions" aria-label="Actions for ${escapeHtml(app.name)}">
             ${deployControl}
@@ -281,6 +311,8 @@
                 ${serviceControl}
                 <button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>
                 <button type="button" data-action="health" data-id="${appId}"${runtimeUnavailable}>${icon("activity")} Check health</button>
+                <button type="button" data-action="preflight" data-id="${appId}"${unavailable}>${icon("search")} Run preflight</button>
+                <button type="button" data-action="metrics" data-id="${appId}">${icon("activity")} Metrics and storage</button>
                 <button type="button" data-action="edit" data-id="${appId}"${unavailable}>${icon("settings-2")} Edit configuration</button>
                 <button type="button" data-action="pull" data-id="${appId}"${unavailable}>${icon("download")} Pull repository</button>
                 <button type="button" class="am-menu-danger" data-action="remove" data-id="${appId}"${unavailable}>${icon("trash-2")} Remove application</button>
@@ -339,6 +371,8 @@
   function renderSettings(data) {
     const config = data.config || {};
     state.settings = config;
+    const existing = byId("settingsForm");
+    if (existing && Array.from(existing.elements).some((input) => input.name && input.value !== input.defaultValue)) return;
     byId("settingsPanel").innerHTML = `
       <section class="am-surface am-settings">
         <div class="am-surface-heading">
@@ -367,6 +401,8 @@
               <label for="settingCommandTimeout">Command timeout (seconds)</label>
               <input id="settingCommandTimeout" type="number" min="1" max="86400" step="1" name="command_timeout_seconds" value="${escapeHtml(config.command_timeout_seconds ?? 30)}" required>
             </div>
+            <label>Concurrent builds<input type="number" name="max_concurrent_builds" min="1" max="8" value="${escapeHtml(config.max_concurrent_builds ?? 1)}" required></label>
+            <label>Minimum free disk (MiB)<input type="number" name="min_free_disk_mb" min="1" max="1048576" value="${escapeHtml(config.min_free_disk_mb ?? 512)}" required></label>
           </div>
           <div class="am-form-actions"><button type="submit" class="am-button am-button--primary">Save settings</button></div>
         </form>
@@ -378,7 +414,10 @@
       const payload = Object.fromEntries(new FormData(form).entries());
       for (const key of Object.keys(payload)) payload[key] = Number(payload[key]);
       void runOperation(
-        () => callBackend("settings", [JSON.stringify(payload)]),
+        async () => {
+          await callBackend("settings", [JSON.stringify(payload)]);
+          Array.from(form.elements).forEach((input) => { if (input.name) input.defaultValue = input.value; });
+        },
         "Settings saved.",
       );
     });
@@ -392,8 +431,8 @@
         callBackend("deployments"),
         callBackend("settings"),
       ]);
-      renderOverview(overview);
       renderApps(apps);
+      renderOverview(overview);
       renderDeployments(deployments);
       renderSettings(settings);
       byId("lastRefreshed").textContent = `Updated ${new Intl.DateTimeFormat(undefined, { timeStyle: "short" }).format(new Date())}`;
@@ -495,8 +534,8 @@
         payload.build_config.start_command = command;
       }
       const environmentRows = parseEnvironmentContent(environment);
-      const reserved = new Set(["HOME", "PATH", "PORT", "HOST", "NODE_ENV", "APP_BASE_PATH", "APP_CONFIG_DIR"]);
-      const blocked = environmentRows.find((row) => reserved.has(row.key));
+      const reserved = new Set(["HOME", "PATH", "PORT", "HOST", "NODE_ENV", "APP_BASE_PATH", "APP_CONFIG_DIR", "APP_DATA_DIR"]);
+      const blocked = environmentRows.find((row) => reserved.has(row.key) || row.key.startsWith("APP_STORAGE_"));
       if (blocked) throw new Error(`${blocked.key} is managed automatically and cannot be overridden.`);
       const content = serializeEnvironmentRows(environmentRows);
       if (new TextEncoder().encode(content).length > 64 * 1024) throw new Error("Environment variables exceed 64 KiB.");
@@ -510,7 +549,9 @@
         if (!created) {
           created = (await callBackend("add", [JSON.stringify(setup.payload)])).app;
           if (!created?.id) throw new Error("The backend did not return the registered application.");
-          backButton.setAttribute("data-unavailable", "");
+          form.querySelectorAll("input, select, textarea").forEach((input) => {
+            if (!["environment", "deploy_now"].includes(input.name)) input.setAttribute("readonly", "");
+          });
         }
         if (setup.content) await callBackendInput("env-save", [created.id], setup.content);
       }, deployAfterSetup ? "" : "Application created.");
@@ -541,7 +582,7 @@
         if (Number(marker.dataset.setupMarker) === step) marker.setAttribute("aria-current", "step");
         else marker.removeAttribute("aria-current");
       });
-      backButton.hidden = step === 0;
+      backButton.hidden = step === 0 || (created && step === 1);
       nextButton.hidden = step === 2;
       submitButton.hidden = step !== 2;
       form.querySelector(`[data-setup-step="${step}"] input`)?.focus();
@@ -559,8 +600,8 @@
         }
         if (step === 1) {
           const setup = collect(form);
-          if (state.apps.some((app) => app.id === setup.payload.slug)) throw new Error("That application ID is already registered.");
-          if (state.apps.some((app) => [app.route, app.active_route].includes(setup.payload.route))) throw new Error("That hosted route is already assigned.");
+          if (state.apps.some((app) => app.id !== created?.id && app.id === setup.payload.slug)) throw new Error("That application ID is already registered.");
+          if (state.apps.some((app) => app.id !== created?.id && [app.route, app.active_route].includes(setup.payload.route))) throw new Error("That hosted route is already assigned.");
           const review = [
             ["Application", setup.payload.name], ["Repository", setup.payload.repo_url], ["Branch", setup.payload.branch],
             ["Framework", frameworkName(setup.payload.framework)], ["Public URL", `https://stuserver.online${setup.payload.route}`],
@@ -619,24 +660,54 @@
         <label>Name<input name="name" value="${escapeHtml(app.name)}" required></label>
         <label>Git repository URL<input name="repo_url" value="${escapeHtml(app.repo_url)}" required></label>
         <label>Branch<input name="branch" value="${escapeHtml(app.branch)}" required></label>
-        <label>Framework<select name="framework">${options}</select></label>
         <label>Hosted route<input name="route" value="${escapeHtml(app.route || `/${app.id}/`)}" required autocomplete="off"></label>
-        <label>Port<input type="number" name="port" min="8100" max="8999" value="${escapeHtml(app.port)}" required></label>
-        <label>Health-check URL<input name="health_check_url" value="${escapeHtml(app.health_check_url || "/")}" required></label>
         <label>Description<textarea name="description" rows="3">${escapeHtml(app.description || "")}</textarea></label>
-        <label>Build configuration (JSON object)<textarea name="build_config" rows="5">${escapeHtml(JSON.stringify(app.build_config || {}, null, 2))}</textarea></label>
+        <label>Deployment policy<select name="deployment_mode"><option value="automatic"${app.deployment_mode !== "approval" ? " selected" : ""}>Automatic</option><option value="approval"${app.deployment_mode === "approval" ? " selected" : ""}>Approval required</option></select></label>
+        <label class="am-checkbox"><input type="checkbox" name="auto_deploy"${app.auto_deploy !== false ? " checked" : ""}> Automatic deployment</label>
       </div>
       <small class="am-field-hint">A route change is applied by the next deployment. Next.js projects must build with the same basePath (APP_BASE_PATH is supplied during build).</small>
+      <details class="am-advanced"><summary>Build and runtime</summary><div class="am-form-grid">
+        <label>Framework<select name="framework">${options}</select></label>
+        <label>Port<input type="number" name="port" min="8100" max="8999" value="${escapeHtml(app.port)}" required></label>
+        <label>Health-check URL<input name="health_check_url" value="${escapeHtml(app.health_check_url || "/")}" required></label>
+        <label>Required environment names<input name="required_environment" value="${escapeHtml((app.required_environment || []).join(", "))}"></label>
+        <label>Persistent directory names<input name="storage_directories" value="${escapeHtml((app.storage_directories || ["data"]).join(", "))}"></label>
+        <label>Build configuration (JSON object)<textarea name="build_config" rows="5">${escapeHtml(JSON.stringify(app.build_config || {}, null, 2))}</textarea></label>
+        <label>Minimum runtime versions (JSON object)<textarea name="runtime_requirements" rows="3">${escapeHtml(JSON.stringify(app.runtime_requirements || {}, null, 2))}</textarea></label>
+      </div></details>
+      <details class="am-advanced"><summary>Deployment schedule (UTC)</summary><div class="am-form-grid">
+        <label>Window start<input type="time" name="window_start" value="${escapeHtml(app.deployment_window?.start || "")}"></label>
+        <label>Window end<input type="time" name="window_end" value="${escapeHtml(app.deployment_window?.end || "")}"></label>
+      </div></details>
+      <details class="am-advanced"><summary>Resource limits</summary><div class="am-form-grid">
+        ${Object.entries({ memory_mb: ["Runtime memory (MiB)", 1024], cpu_percent: ["Runtime CPU (%)", 100], tasks_max: ["Runtime process limit", 256], build_memory_mb: ["Build memory (MiB)", 2048], build_cpu_percent: ["Build CPU (%)", 100], build_tasks_max: ["Build process limit", 512] }).map(([key, [label, fallback]]) => `<label>${label}<input type="number" name="limit_${key}" min="1" max="${key.endsWith("memory_mb") ? 1048576 : 10000}" value="${escapeHtml(app.resource_limits?.[key] ?? fallback)}" required></label>`).join("")}
+      </div></details>
     `;
     openDialog("Edit application", body, "Save changes", async (form) => {
       const payload = Object.fromEntries(new FormData(form).entries());
       payload.port = Number(payload.port);
       payload.build_config = parseBuildConfig(payload.build_config || "");
+      payload.runtime_requirements = parseBuildConfig(payload.runtime_requirements || "{}");
+      payload.required_environment = payload.required_environment.split(/[\s,]+/).filter(Boolean);
+      payload.storage_directories = payload.storage_directories.split(/[\s,]+/).filter(Boolean);
+      payload.auto_deploy = form.elements.auto_deploy.checked;
+      if (Boolean(payload.window_start) !== Boolean(payload.window_end)) throw new Error("Set both UTC deployment window times or leave both empty.");
+      payload.deployment_window = payload.window_start ? { start: payload.window_start, end: payload.window_end } : {};
+      delete payload.window_start;
+      delete payload.window_end;
+      payload.resource_limits = {};
+      for (const key of Object.keys(payload).filter((key) => key.startsWith("limit_"))) {
+        payload.resource_limits[key.slice(6)] = Number(payload[key]);
+        delete payload[key];
+      }
       return runOperation(
         () => callBackend("edit", [app.id, JSON.stringify(payload)]),
         "Application updated.",
       );
     });
+    byId("appManagerDialog").querySelector("form").addEventListener("invalid", (event) => {
+      event.target.closest("details")?.setAttribute("open", "");
+    }, true);
   }
 
   function parseEnvironmentContent(content) {
@@ -820,21 +891,26 @@
       || (state.logTarget.deploymentId && state.logTarget.deploymentId !== result.deployment_id)) return;
     state.logTarget.deploymentId = result.deployment_id;
     const text = result.logs || "Waiting for deployment output…";
-    output.innerHTML = text.split("\n").map((line) => {
-      const level = /^\[stderr\]/i.test(line) || /\b(error|failed|failure|aborted)\b/i.test(line)
-        ? "error"
-        : /\b(success|completed|deployed)\b/i.test(line)
-          ? "success"
-          : /^\[stdout\]/i.test(line)
-            ? "output"
-            : "info";
-      return `<span class="am-log-line am-log-line--${level}">${escapeHtml(line)}</span>`;
-    }).join("\n");
-    output.scrollTop = output.scrollHeight;
+    if (typeof result.logs === "string" && state.logTarget.logs !== text) {
+      const previousScroll = output.scrollTop;
+      const follow = state.logTarget.logs === undefined || output.scrollHeight - previousScroll - output.clientHeight < 32;
+      output.innerHTML = text.split("\n").map((line) => {
+        const level = /^\[stderr\]/i.test(line) || /\b(error|failed|failure|aborted)\b/i.test(line)
+          ? "error"
+          : /\b(success|completed|deployed)\b/i.test(line)
+            ? "success"
+            : /^\[stdout\]/i.test(line)
+              ? "output"
+              : "info";
+        return `<span class="am-log-line am-log-line--${level}">${escapeHtml(line)}</span>`;
+      }).join("\n");
+      output.scrollTop = follow ? output.scrollHeight : previousScroll;
+      state.logTarget.logs = text;
+    }
     if (result.active) {
       status.textContent = result.abortable === false
         ? "Finalizing deployment"
-        : "Deployment in progress";
+        : result.build_status === "queued" ? "Queued: waiting for build capacity" : result.build_status === "preflight" ? "Running preflight checks" : "Deployment in progress";
     } else {
       const finalStatuses = {
         deployed: "Deployment complete",
@@ -870,18 +946,19 @@
     state.deploymentMonitor = monitor;
     monitor.promise = (async () => {
       while (state.deploymentMonitor === monitor) {
+        const logsVisible = byId("appManagerDialog").open && state.logTarget?.appId === appId
+          && state.logTarget?.deploymentId === deploymentId;
         try {
-          const result = await callBackend("deployment-logs", [appId, deploymentId]);
+          const result = await callBackend("deployment-logs", [appId, deploymentId, ...(logsVisible ? [] : ["--status-only"])]);
           renderDeploymentLog(result);
           if (!result.active) break;
         } catch (error) {
-          const output = byId("deploymentLiveLog");
-          if (output && state.logTarget?.appId === appId && state.logTarget?.deploymentId === deploymentId) {
-            output.textContent += `\nLive log polling failed: ${error.message}`;
-            output.scrollTop = output.scrollHeight;
+          const status = byId("deploymentLiveStatus");
+          if (status && state.logTarget?.appId === appId && state.logTarget?.deploymentId === deploymentId) {
+            status.textContent = `Live log unavailable; retrying: ${error.message}`;
           }
         }
-        await new Promise((resolve) => window.setTimeout(resolve, 750));
+        await new Promise((resolve) => window.setTimeout(resolve, logsVisible ? 1500 : 3000));
       }
       if (state.deploymentMonitor === monitor) state.deploymentMonitor = null;
       void refreshData().catch(showError);
@@ -930,7 +1007,9 @@
       <dl class="am-settings-paths">
         <div><dt>Installed</dt><dd>${escapeHtml(result.current_commit || "Unknown")}</dd></div>
         <div><dt>Available</dt><dd>${escapeHtml(latest || "Unknown")}</dd></div>
+        <div><dt>Release</dt><dd>${escapeHtml(result.version || "Unknown")}</dd></div>
       </dl>
+      ${/^v\d+\.\d+\.\d+$/.test(result.version || "") ? `<p><a href="https://github.com/stuartjeet122/cockpitdeploymentplugin/releases/tag/${escapeHtml(result.version)}" target="_blank" rel="noopener noreferrer">Release notes</a></p>` : ""}
       <p class="am-update-warning">${icon("circle-alert")} Cockpit will restart after installation. Running applications are not restarted.</p>
     `;
     openDialog("Update App Manager", body, "Install update and restart Cockpit", async () => {
@@ -967,6 +1046,57 @@
     }, "", false);
   }
 
+  function formatBytes(value) {
+    if (value == null || !Number.isFinite(Number(value))) return "Unavailable";
+    return `${(Number(value) / 1048576).toFixed(1)} MiB`;
+  }
+
+  async function showMetrics(app) {
+    const result = await callBackend("metrics", [app.id]);
+    const metrics = result.metrics || {};
+    app.metrics = metrics;
+    renderAppList();
+    const fields = [
+      ["Service", metrics.service_state || "Unknown"], ["CPU", metrics.cpu_percent == null ? "Not sampled" : `${metrics.cpu_percent}%`],
+      ["Memory", formatBytes(metrics.memory_bytes)], ["Peak memory", formatBytes(metrics.peak_memory_bytes)],
+      ["Processes", metrics.tasks ?? "Unavailable"], ["Restarts", metrics.restarts ?? "Unavailable"],
+      ["Uptime", metrics.uptime_seconds == null ? "Unavailable" : `${Math.floor(metrics.uptime_seconds)} seconds`],
+      ["Production files", `${formatBytes(metrics.disk_bytes)}${metrics.disk_truncated ? " (partial)" : ""}`],
+      ["Persistent data", `${formatBytes(metrics.storage_bytes)}${metrics.storage_truncated ? " (partial)" : ""}`],
+      ["Logs", `${formatBytes(metrics.logs_bytes)}${metrics.logs_truncated ? " (partial)" : ""}`],
+      ["Source checkout", `${formatBytes(metrics.source_bytes)}${metrics.source_truncated ? " (partial)" : ""}`],
+      ["Sampled", formatDate(metrics.checked_at)], ["Persistent directories", (app.storage_directories || ["data"]).join(", ")],
+    ];
+    openDialog(`Metrics: ${app.name}`, `<dl class="am-settings-paths">${fields.map(([name, value]) => `<div><dt>${escapeHtml(name)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>
+      ${(metrics.errors || []).map((error) => `<p class="am-deploy-error">${escapeHtml(error)}</p>`).join("")}
+      <button type="button" class="am-button" data-action="metrics" data-id="${escapeHtml(app.id)}">${icon("refresh-cw")} Refresh metrics</button>`);
+  }
+
+  async function showPreflight(app) {
+    const report = await callBackend("preflight", [app.id]);
+    openDialog(`Preflight: ${app.name}`, `<p class="am-dialog-intro">${report.passed ? "Checks passed" : "Checks failed"}</p>
+      <dl class="am-settings-paths">${(report.checks || []).map((check) => `<div><dt>${escapeHtml(check.name)}</dt><dd>${check.passed ? "PASS" : "FAIL"}: ${escapeHtml(check.message)}</dd></div>`).join("")}</dl>
+      ${(report.errors || []).map((error) => `<p class="am-deploy-error">${escapeHtml(error)}</p>`).join("")}
+      ${(report.warnings || []).map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}`);
+  }
+
+  async function showUpdateReview(app) {
+    const result = await callBackend("review-update", [app.id]);
+    const pending = result.pending_update;
+    let started;
+    openDialog(`Review: ${app.name}`, `<dl class="am-settings-paths"><div><dt>Live commit</dt><dd>${escapeHtml(pending.base_commit || "Not deployed")}</dd></div><div><dt>Candidate</dt><dd>${escapeHtml(pending.commit)}</dd></div></dl>
+      <pre class="am-log-output">${escapeHtml(pending.commits || "No commit summary")}</pre><pre class="am-log-output">${escapeHtml(pending.diffstat || "No file changes")}</pre>`, "Approve deployment", async () => {
+      return runOperation(async () => {
+        started = await callBackend("approve", [app.id, pending.commit]);
+        if (!started.deployment_id) throw new Error("The backend did not return a deployment ID.");
+      }, "", false);
+    }, () => {
+      openDeploymentLogDialog(app.id);
+      state.logTarget.deploymentId = started.deployment_id;
+      void monitorDeployment(app.id, started.deployment_id).catch(showError);
+    });
+  }
+
   async function handleAppAction(action, appId, deploymentId) {
     const app = state.apps.find((item) => item.id === appId);
     if (!app) {
@@ -981,16 +1111,16 @@
       showLogs(appId);
       return;
     }
+    if (action === "metrics" || action === "preflight" || action === "review-update" || action === "deploy" && app.deployment_mode === "approval") {
+      await runOperation(() => action === "metrics" ? showMetrics(app) : action === "preflight" ? showPreflight(app) : showUpdateReview(app), "", false);
+      return;
+    }
     if (action === "deployment-log") {
-      try {
-        await viewDeploymentLog(appId, deploymentId);
-      } catch (error) {
-        showError(error);
-      }
+      await runOperation(() => viewDeploymentLog(appId, deploymentId), "", false);
       return;
     }
     if (action === "environment") {
-      void manageEnvironment(app).catch(showError);
+      await runOperation(() => manageEnvironment(app), "", false);
       return;
     }
     if (action === "remove") {
@@ -1004,7 +1134,9 @@
     if (action === "health") {
       await runOperation(async () => {
         const result = await callBackend("health", [appId]);
+        await refreshData();
         if (!result.healthy) throw new Error(`Health check failed (${result.url}).`);
+        if (result.public_healthy === false) throw new Error(`Local readiness passed, but the public route failed: ${result.public_error || result.public_url || "unavailable"}.`);
         showNotice(app.framework === "static" && !app.build_config?.start_command
           ? "Static release is available."
           : `Runtime health check passed (${result.url}).`);
@@ -1114,9 +1246,13 @@
   });
   byId("deploymentHistory").addEventListener("click", (event) => {
     const button = event.target instanceof Element ? event.target.closest('button[data-action="deployment-log"]') : null;
-    if (button) void viewDeploymentLog(button.dataset.id, button.dataset.deploymentId).catch(showError);
+    if (button) void runOperation(() => viewDeploymentLog(button.dataset.id, button.dataset.deploymentId), "", false);
   });
   byId("appManagerDialog").addEventListener("click", (event) => {
+    const metricsButton = event.target instanceof Element ? event.target.closest('[data-action="metrics"]') : null;
+    if (metricsButton && !metricsButton.disabled && !state.busy) {
+      void handleAppAction("metrics", metricsButton.dataset.id).catch(showError);
+    }
     const abortButton = event.target instanceof Element ? event.target.closest('[data-action="abort-deployment"]') : null;
     if (abortButton) {
       abortButton.disabled = true;

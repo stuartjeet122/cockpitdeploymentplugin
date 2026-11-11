@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import errno
 import hashlib
 import ipaddress
 import json
@@ -47,9 +48,9 @@ except ImportError:  # pragma: no cover - Windows has no POSIX group database
     grp = None
 
 try:
-    from .adapters import detect_framework, get_adapter
+    from .adapters import detect_framework, get_adapter, inspect_project
 except ImportError:  # pragma: no cover - direct execution after installation
-    from adapters import detect_framework, get_adapter
+    from adapters import detect_framework, get_adapter, inspect_project
 
 APP_NAME = "app-manager"
 DEFAULT_STATE_ROOT = "/var/lib/cockpit/app-manager"
@@ -66,6 +67,7 @@ DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
 PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
 PLUGIN_REPOSITORY_BRANCH = "main"
 PLUGIN_UPDATE_USER = "nobody"
+PLUGIN_TRUSTED_SIGNERS = "/etc/cockpit/app-manager/trusted-signers"
 PORT_START = 8100
 PORT_END = 8999
 RESERVED_PORTS = {8080}
@@ -77,6 +79,21 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 APP_ROUTE_SEGMENT_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 FRAMEWORKS = {"auto", "nextjs", "go", "node", "python", "static"}
+RESOURCE_DEFAULTS = {
+    "memory_mb": 1024, "cpu_percent": 100, "tasks_max": 256,
+    "build_memory_mb": 2048, "build_cpu_percent": 100, "build_tasks_max": 512,
+}
+
+
+def _resource_limits(value: Any) -> Dict[str, int]:
+    if not isinstance(value, dict) or set(value) - RESOURCE_DEFAULTS.keys():
+        raise ValueError("Resource limits must be an object with supported limit names")
+    limits = {**RESOURCE_DEFAULTS, **value}
+    for key, limit in limits.items():
+        maximum = 1048576 if key.endswith("memory_mb") else 10000
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
+            raise ValueError(f"Resource limit {key} must be an integer from 1 to {maximum}")
+    return limits
 
 
 def now_iso() -> str:
@@ -95,6 +112,8 @@ def _default_config() -> Dict[str, Any]:
         "build_timeout_seconds": 900,
         "health_timeout_seconds": 30,
         "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
+        "min_free_disk_mb": 512,
+        "max_concurrent_builds": 1,
         "log_root": DEFAULT_LOG_ROOT,
         "nginx_template": "/etc/cockpit/app-manager/templates/nginx.conf.tpl",
         "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl",
@@ -127,14 +146,15 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
 
 
 @contextlib.contextmanager
-def _file_lock(path: Path) -> Iterator[None]:
+def _file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
+    _assert_no_symlink_components(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.touch(mode=0o600, exist_ok=True)
-    handle = path.open("r+b")
+    descriptor = os.open(str(path), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    handle = os.fdopen(descriptor, "r+b")
     locked = False
     try:
         if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             locked = True
         elif msvcrt is not None:  # pragma: no cover - Windows development host
             handle.seek(0)
@@ -143,7 +163,9 @@ def _file_lock(path: Path) -> Iterator[None]:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     locked = True
                     break
-                except OSError:
+                except OSError as exc:
+                    if not blocking or exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
                     time.sleep(0.01)
         else:  # pragma: no cover - unsupported platform
             raise RuntimeError("No supported file-locking implementation is available")
@@ -210,6 +232,7 @@ def get_config() -> Dict[str, Any]:
         value = config[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{key} must be a positive integer")
+            _validate_capacity_settings(config)
     return config
 
 
@@ -451,6 +474,41 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(description, str) or len(description) > 2000 or any(ord(char) < 32 and char not in "\t" for char in description):
         raise ValueError("Description must be a string of at most 2000 printable characters")
     result["description"] = description
+    result["resource_limits"] = _resource_limits(payload.get("resource_limits", {}))
+    enabled = payload.get("auto_deploy", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("auto_deploy must be a boolean")
+    window = payload.get("deployment_window", {})
+    if not isinstance(window, dict) or set(window) - {"start", "end"}:
+        raise ValueError("Deployment window must contain start and end UTC times")
+    if window and (set(window) != {"start", "end"} or any(
+        not isinstance(value, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
+        for value in window.values()
+    )):
+        raise ValueError("Deployment window requires start and end in HH:MM UTC")
+    result["auto_deploy"] = enabled
+    result["deployment_window"] = window
+    required = payload.get("required_environment", [])
+    if not isinstance(required, list) or len(required) > 256 or any(not isinstance(key, str) or not ENV_KEY_RE.fullmatch(key) for key in required):
+        raise ValueError("required_environment must be an array of environment variable names")
+    requirements = payload.get("runtime_requirements", {})
+    if not isinstance(requirements, dict) or set(requirements) - {"node", "npm", "pnpm", "yarn", "bun", "go", "python3"} or any(
+        not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,3}){0,2}", value) for value in requirements.values()
+    ):
+        raise ValueError("runtime_requirements must map supported tools to minimum numeric versions")
+    storage = payload.get("storage_directories", ["data"])
+    if not isinstance(storage, list) or len(storage) > 16 or any(not isinstance(name, str) or not APP_ROUTE_SEGMENT_RE.fullmatch(name) for name in storage):
+        raise ValueError("storage_directories must contain at most 16 lowercase directory names")
+    environment_names = ["APP_STORAGE_" + name.upper().replace("-", "_") for name in dict.fromkeys(storage)]
+    if "APP_STORAGE_DIR" in environment_names or len(set(environment_names)) != len(environment_names):
+        raise ValueError("Persistent directory names conflict with managed environment names; dir is reserved")
+    mode = payload.get("deployment_mode", "automatic")
+    if not isinstance(mode, str) or mode not in {"automatic", "approval"}:
+        raise ValueError("deployment_mode must be automatic or approval")
+    result.update(required_environment=list(dict.fromkeys(required)), runtime_requirements=requirements,
+                  storage_directories=list(dict.fromkeys(["data", *storage])), deployment_mode=mode)
+    if len(result["storage_directories"]) > 16:
+        raise ValueError("storage_directories allows at most 16 names including data")
     if "port" in payload and payload["port"] is not None:
         port = payload["port"]
         if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
@@ -529,6 +587,7 @@ def _socket_port_available(port: int) -> bool:
 
 def _select_port(registry: Dict[str, Any], config: Dict[str, Any]) -> int:
     used = {app.get("port") for app in registry["apps"]}
+    used.update(app.get("candidate_port") for app in registry["apps"])
     _clear_expired_port_reservations(registry)
     reservations = {int(port) for port in registry.get("port_reservations", {})}
     used.update(reservations)
@@ -655,19 +714,14 @@ def run_command(
 ) -> subprocess.CompletedProcess:
     if not args or not all(isinstance(arg, str) and "\0" not in arg for arg in args):
         raise ValueError("Subprocess arguments must be a non-empty list of strings")
+    values = list(env.values()) if redact_values is None and env else list(redact_values or ())
     try:
         if live_log_path is not None:
-            values = list(redact_values or ())
-            if env:
-                values.extend(env.values())
             return _run_command_with_live_log(
                 args, cwd, timeout, env, live_log_path, values, cancel_file
             )
         if cancel_file is not None:
             result = _run_cancellable_command(args, cwd, timeout, env, cancel_file)
-            values = list(redact_values or ())
-            if env:
-                values.extend(env.values())
             return subprocess.CompletedProcess(
                 result.args,
                 result.returncode,
@@ -683,9 +737,6 @@ def run_command(
             check=False,
             timeout=max(1, int(timeout)),
         )
-        values = list(redact_values or ())
-        if env:
-            values.extend(env.values())
         return subprocess.CompletedProcess(
             result.args,
             result.returncode,
@@ -693,9 +744,6 @@ def run_command(
             _redact_text(result.stderr or "", values),
         )
     except subprocess.TimeoutExpired as exc:
-        values = list(redact_values or ())
-        if env:
-            values.extend(env.values())
         details = []
         for label, output in (("stdout", exc.stdout), ("stderr", exc.stderr)):
             if output:
@@ -981,6 +1029,7 @@ def _run_as_user(
     environment: Optional[Dict[str, str]] = None,
     live_log_path: Optional[Path] = None,
     cancel_file: Optional[Path] = None,
+    resource_limits: Optional[Dict[str, int]] = None,
 ) -> subprocess.CompletedProcess:
     _require_root()
     if os.name == "nt":
@@ -999,8 +1048,18 @@ def _run_as_user(
         if not ENV_KEY_RE.fullmatch(key) or not isinstance(value, str) or "\0" in value:
             raise ValueError("Invalid application environment variable")
         env_args.append(f"{key}={value}")
+    command = ["runuser", "--user", username, "--", *env_args, *args]
+    if resource_limits is not None:
+        limits = _resource_limits(resource_limits)
+        command = [
+            "systemd-run", "--scope", "--quiet", "--collect",
+            f"--property=MemoryMax={limits['build_memory_mb']}M",
+            f"--property=CPUQuota={limits['build_cpu_percent']}%",
+            f"--property=TasksMax={limits['build_tasks_max']}",
+            "--", *command,
+        ]
     return run_command(
-        ["runuser", "--user", username, "--", *env_args, *args],
+        command,
         cwd=cwd,
         timeout=timeout,
         live_log_path=live_log_path,
@@ -1124,17 +1183,24 @@ def git_output(
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def _routed_health_path(app: Dict[str, Any]) -> str:
+    health = app.get("health_check_url") or "/"
+    if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
+        raise ValueError("Health-check URL must be a local path")
+    route = validate_app_route(app.get("active_route") or app.get("route"), app["id"])
+    if app.get("framework") == "nextjs" and (health == route.rstrip("/") or health.startswith(route)):
+        return health
+    return route + health.lstrip("/")
+
+
 def app_health_url(app: Dict[str, Any]) -> str:
     health = app.get("health_check_url") or "/"
     if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
         raise ValueError("Health-check URL must be a local path")
     if app.get("framework") == "static" and not app.get("build_config", {}).get("start_command"):
-        route = validate_app_route(app.get("active_route") or app.get("route"), app["id"])
-        return _public_url_for_route(route) + health.lstrip("/")
+        return DEFAULT_PUBLIC_ORIGIN + _routed_health_path(app)
     if app.get("framework") == "nextjs":
-        route = validate_app_route(app.get("route"), app["id"])
-        if health != route.rstrip("/") and not health.startswith(route):
-            health = route + health.lstrip("/")
+        health = _routed_health_path(dict(app, active_route=app.get("route")))
     port = app.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
         raise ValueError("Application has an invalid port")
@@ -1230,6 +1296,7 @@ def _app_paths(app_id: str, config: Dict[str, Any]) -> Dict[str, Path]:
         "logs": log_root / app_id,
         "home": home_root / app_id,
         "environment": environment_root / f"{app_id}.env",
+        "storage": production / "shared",
     }
     if (
         not _path_is_within(source, source_root)
@@ -1240,6 +1307,7 @@ def _app_paths(app_id: str, config: Dict[str, Any]) -> Dict[str, Path]:
         or not _path_is_within(paths["logs"], log_root)
         or not _path_is_within(paths["home"], home_root)
         or not _path_is_within(paths["environment"], environment_root)
+        or not _path_is_within(paths["storage"], production)
     ):
         raise ValueError("Application paths resolve outside their managed roots")
     return paths
@@ -1298,7 +1366,11 @@ def _parse_environment_data(contents: str) -> Tuple[str, Dict[str, str]]:
             "NODE_ENV",
             "APP_BASE_PATH",
             "APP_CONFIG_DIR",
+            "APP_DATA_DIR",
+            "APP_STORAGE_DIR",
         }:
+            raise ValueError(f"Environment key {key!r} is reserved by App Manager")
+        if key.startswith("APP_STORAGE_"):
             raise ValueError(f"Environment key {key!r} is reserved by App Manager")
         raw_value = raw_value.strip()
         if raw_value.startswith(("'", '"')):
@@ -1428,6 +1500,9 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         if not isinstance(app, dict):
             raise ValueError("Each application registry entry must be an object")
         app_id = validate_app_id(app.get("id"))
+        for field in ("metrics", "pending_update"):
+            if field in app and not isinstance(app[field], dict):
+                raise ValueError(f"Application {field} must be an object")
         if app_id in seen_ids:
             raise ValueError(f"Duplicate application ID in registry: {app_id}")
         seen_ids.add(app_id)
@@ -1459,6 +1534,16 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         if port in seen_ports:
             raise ValueError(f"Duplicate application port in registry: {port}")
         seen_ports.add(port)
+        candidate_port = app.get("candidate_port")
+        if candidate_port is not None:
+            if isinstance(candidate_port, bool) or not isinstance(candidate_port, int) or not PORT_START <= candidate_port <= PORT_END or candidate_port in RESERVED_PORTS or candidate_port in seen_ports:
+                raise ValueError("Invalid or conflicting candidate port in registry")
+            seen_ports.add(candidate_port)
+        if app.get("service_slot", "primary") not in {"primary", "secondary"}:
+            raise ValueError("Invalid managed service slot in registry")
+        normalized_policy = validate_app_payload(app)
+        for key in ("auto_deploy", "deployment_window", "resource_limits", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode"):
+            app[key] = normalized_policy[key]
         expected_paths = _app_paths(app_id, config)
         expected_user = _account_name(app_id)
         fields = {
@@ -1474,6 +1559,10 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         if app.get("service_user", expected_user) != expected_user:
             raise ValueError(f"Application {app_id!r} has an invalid service account")
         app["service_user"] = expected_user
+        if "deployed_commit" not in app:
+            successful = next((record for record in app.get("deployments", [])
+                               if isinstance(record, dict) and record.get("status") in {"deployed", "rolled_back"}), None)
+            app["deployed_commit"] = successful.get("commit") if successful else None
         if app.get("slug", app_id) != app_id:
             raise ValueError(f"Application {app_id!r} has an invalid slug")
         build_config = app.get("build_config", {})
@@ -1525,7 +1614,7 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
             _clear_expired_port_reservations(registry)
             reservations = registry.get("port_reservations", {})
             if (
-                any(app.get("port") == port for app in registry["apps"])
+                any(port in {app.get("port"), app.get("candidate_port")} for app in registry["apps"])
                 or port in get_listening_ports()
                 or not _socket_port_available(port)
             ):
@@ -1545,6 +1634,13 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
             "description": normalized.get("description", ""),
             "health_check_url": normalized["health_check_url"],
             "build_config": normalized["build_config"],
+            "resource_limits": normalized["resource_limits"],
+            "auto_deploy": normalized["auto_deploy"],
+            "deployment_window": normalized["deployment_window"],
+            "required_environment": normalized["required_environment"],
+            "runtime_requirements": normalized["runtime_requirements"],
+            "storage_directories": normalized["storage_directories"],
+            "deployment_mode": normalized["deployment_mode"],
             "port": port,
             "public_url": None,
             "source_path": str(paths["source"]),
@@ -1608,6 +1704,7 @@ def _plugin_update_environment() -> Dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
     }
 
 
@@ -1625,27 +1722,88 @@ def _plugin_git(args: Sequence[str], timeout: int = 120) -> subprocess.Completed
         ["runuser", "--user", PLUGIN_UPDATE_USER, "--", *env_args],
         timeout=timeout,
         env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"]},
+        redact_values=[],
     )
 
 
-def _plugin_remote_commit() -> str:
+def _plugin_remote_release() -> Dict[str, str]:
     result = _plugin_git(
         [
             "git",
             "ls-remote",
             "--exit-code",
             PLUGIN_REPOSITORY_URL,
-            f"refs/heads/{PLUGIN_REPOSITORY_BRANCH}",
+            "refs/tags/v*",
         ]
     )
     _command_error(result, "Checking for App Manager updates")
-    match = re.fullmatch(
-        rf"([0-9a-f]{{40,64}})\trefs/heads/{re.escape(PLUGIN_REPOSITORY_BRANCH)}\s*",
-        result.stdout or "",
-    )
-    if not match:
-        raise RuntimeError("The App Manager update source returned an invalid Git revision")
-    return match.group(1)
+    releases = {}
+    for line in (result.stdout or "").splitlines():
+        match = re.fullmatch(r"([0-9a-f]{40,64})\trefs/tags/(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\^\{\}", line)
+        if match:
+            releases[tuple(int(part) for part in match.groups()[2:])] = {
+                "version": match.group(2), "commit": match.group(1),
+            }
+    if not releases:
+        raise RuntimeError("No annotated versioned App Manager release is available")
+    return releases[max(releases)]
+
+
+def _verify_plugin_release(checkout: Path, version: str) -> None:
+    trust = Path(PLUGIN_TRUSTED_SIGNERS)
+    _assert_no_symlink_components(trust)
+    if not trust.is_file():
+        raise RuntimeError("Provision a trusted release signing key in " + str(trust))
+    metadata = trust.stat()
+    if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        raise RuntimeError("Trusted release signers must be root-owned and not group/world writable")
+    result = run_command([
+        "git", "-c", f"safe.directory={checkout}",
+        "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+        "-c", "gpg.format=ssh", "-c", "gpg.ssh.program=/usr/bin/ssh-keygen",
+        "-c", f"gpg.ssh.allowedSignersFile={trust}",
+        "-C", str(checkout), "verify-tag", version,
+    ], timeout=30, env=_plugin_update_environment(), redact_values=[])
+    _command_error(result, "Verifying the trusted App Manager release signature")
+
+
+def _verify_plugin_checkout(checkout: Path, version: str, commit: str) -> None:
+    prefix = ["git", "-c", f"safe.directory={checkout}", "-c", "core.fsmonitor=false",
+              "-c", "core.hooksPath=/dev/null", "-C", str(checkout)]
+    revision = run_command([*prefix, "rev-parse", f"{version}^{{commit}}"], timeout=30, env=_plugin_update_environment(), redact_values=[])
+    _command_error(revision, "Resolving the signed release commit")
+    if (revision.stdout or "").strip() != commit:
+        raise RuntimeError("The signed release tag does not match the selected commit")
+    listing = run_command([*prefix, "ls-tree", "-r", "-z", "--full-tree", commit], timeout=30, env=_plugin_update_environment(), redact_values=[])
+    _command_error(listing, "Reading the signed release file manifest")
+    expected = set()
+    for entry in (listing.stdout or "").split("\0"):
+        if not entry:
+            continue
+        metadata, separator, name = entry.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[0] not in {"100644", "100755"} or fields[1] != "blob":
+            raise RuntimeError("Unsupported entry in the signed release manifest")
+        if not name or Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name or name.split("/")[0] == ".git":
+            raise RuntimeError("Unsafe path in the signed release manifest")
+        path = checkout / name
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("Missing or unsafe file in the release checkout")
+        blob = path.read_bytes()
+        digest = hashlib.sha1() if len(fields[2]) == 40 else hashlib.sha256()
+        digest.update(f"blob {len(blob)}\0".encode("ascii"))
+        digest.update(blob)
+        if digest.hexdigest() != fields[2]:
+            raise RuntimeError("Release checkout differs from the signed tree: " + name)
+        expected.add(name)
+    actual = set()
+    for root, directories, filenames in os.walk(checkout, followlinks=False):
+        if Path(root) == checkout:
+            directories[:] = [name for name in directories if name != ".git"]
+        for name in filenames:
+            actual.add((Path(root) / name).relative_to(checkout).as_posix())
+    if not expected or actual != expected:
+        raise RuntimeError("Release checkout contains unexpected files or an empty manifest")
 
 
 def _installed_plugin_commit() -> Optional[str]:
@@ -1668,12 +1826,24 @@ def _installed_plugin_commit() -> Optional[str]:
 
 def plugin_update_check() -> Dict[str, Any]:
     current_commit = _installed_plugin_commit()
-    latest_commit = _plugin_remote_commit()
+    release = _plugin_remote_release()
+    latest_commit = release["commit"]
+    installed = load_json(Path(DEFAULT_PLUGIN_VERSION_PATH), {})
+    installed_version = installed.get("version") if isinstance(installed, dict) else None
+    if installed_version is not None:
+        if not isinstance(installed_version, str) or not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", installed_version):
+            raise RuntimeError("Installed plugin release version is invalid")
+        current_version = tuple(int(part) for part in installed_version[1:].split("."))
+        remote_version = tuple(int(part) for part in release["version"][1:].split("."))
+        if remote_version < current_version or (remote_version == current_version and current_commit != latest_commit):
+            raise RuntimeError("Refusing an older or rewritten plugin release")
     return {
         "ok": True,
         "available": current_commit != latest_commit,
         "current_commit": current_commit,
         "latest_commit": latest_commit,
+        "version": release["version"],
+        "release_notes_url": "https://github.com/stuartjeet122/cockpitdeploymentplugin/releases/tag/" + release["version"],
     }
 
 
@@ -1707,6 +1877,7 @@ def plugin_update() -> Dict[str, Any]:
     os.chmod(str(update_parent), 0o711)
     update_root = Path(tempfile.mkdtemp(prefix="app-manager-update-", dir=str(update_parent)))
     checkout = update_root / "checkout"
+    verified_root: Optional[Path] = None
     try:
         uid, gid = _account_ids(PLUGIN_UPDATE_USER)
         os.chown(str(update_root), uid, gid)
@@ -1717,9 +1888,8 @@ def plugin_update() -> Dict[str, Any]:
                 "--depth",
                 "1",
                 "--branch",
-                PLUGIN_REPOSITORY_BRANCH,
+                check["version"],
                 "--single-branch",
-                "--no-tags",
                 PLUGIN_REPOSITORY_URL,
                 str(checkout),
             ],
@@ -1733,7 +1903,16 @@ def plugin_update() -> Dict[str, Any]:
         match = re.fullmatch(r"[0-9a-f]{40,64}", (commit_result.stdout or "").strip())
         if not match:
             raise RuntimeError("The downloaded App Manager update has an invalid Git revision")
-        _seal_plugin_update_checkout(checkout, update_root)
+        if match.group(0) != check["latest_commit"]:
+            raise RuntimeError("The release changed after the update check; check again")
+        verified_root = Path(tempfile.mkdtemp(prefix="app-manager-verified-", dir=str(update_parent)))
+        os.chmod(str(verified_root), 0o700)
+        verified_checkout = verified_root / "checkout"
+        shutil.copytree(checkout, verified_checkout, symlinks=True)
+        checkout = verified_checkout
+        _seal_plugin_update_checkout(checkout, verified_root)
+        _verify_plugin_release(checkout, check["version"])
+        _verify_plugin_checkout(checkout, check["version"], check["latest_commit"])
         installer = checkout / "scripts" / "install.sh"
         if installer.is_symlink() or not installer.is_file():
             raise RuntimeError("The App Manager update does not contain a regular installer")
@@ -1741,7 +1920,7 @@ def plugin_update() -> Dict[str, Any]:
             ["bash", str(installer)],
             cwd=checkout,
             timeout=300,
-            env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"]},
+            env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"], "APP_MANAGER_RELEASE_VERSION": check["version"]},
         )
         _command_error(install_result, "Reinstalling the App Manager plugin")
         result = {"ok": True, "updated": True, "commit": match.group(0)}
@@ -1769,7 +1948,18 @@ def plugin_update() -> Dict[str, Any]:
             result["restart_error"] = str(exc)
         return result
     finally:
-        shutil.rmtree(update_root)
+        try:
+            if verified_root is not None:
+                shutil.rmtree(verified_root)
+        finally:
+            shutil.rmtree(update_root)
+
+
+def _validate_capacity_settings(config: Dict[str, Any]) -> None:
+    for key, maximum in (("max_concurrent_builds", 8), ("min_free_disk_mb", 1048576)):
+        value = config[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+            raise ValueError(f"{key} must be an integer from 1 to {maximum}")
 
 
 def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1787,6 +1977,8 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         "build_timeout_seconds",
         "health_timeout_seconds",
         "command_timeout_seconds",
+        "max_concurrent_builds",
+        "min_free_disk_mb",
     }
     update = dict(payload)
     for key in update:
@@ -1839,6 +2031,7 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         update.pop("release_retention")
     merged = config.copy()
     merged.update(update)
+    _validate_capacity_settings(merged)
     path = Path(DEFAULT_CONFIG_PATH)
     with _file_lock(path.with_name(path.name + ".lock")):
         _atomic_json_write(path, merged)
@@ -1874,13 +2067,13 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError(f"Route {normalized['route']} is already assigned to another application")
         port = normalized.get("port", app.get("port"))
         if port != app.get("port"):
-            if any(other.get("id") != app_id and other.get("port") == port for other in registry["apps"]):
+            if any(other.get("id") != app_id and port in {other.get("port"), other.get("candidate_port")} for other in registry["apps"]):
                 raise ValueError(f"Port {port} is already in use")
             if port in get_listening_ports() or not _socket_port_available(port):
                 raise ValueError(f"Port {port} is already in use")
         with _registry_transaction() as registry2:
             app = _find_app(registry2, app_id)
-            for key in ("name", "repo_url", "branch", "framework", "route", "description", "health_check_url", "build_config", "port", "public_url"):
+            for key in ("name", "repo_url", "branch", "framework", "route", "description", "health_check_url", "build_config", "resource_limits", "auto_deploy", "deployment_window", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode", "port", "public_url"):
                 if key in normalized:
                     app[key] = normalized[key]
             app["slug"] = app_id
@@ -1891,7 +2084,22 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _service_path(app: Dict[str, Any]) -> Path:
     validate_app_id(app["id"])
-    return Path("/etc/systemd/system") / f"cockpit-app-{app['id']}.service"
+    slot = app.get("service_slot", "primary")
+    if slot not in {"primary", "secondary"}:
+        raise ValueError("Invalid managed service slot")
+    suffix = "@secondary" if slot == "secondary" else ""
+    return Path("/etc/systemd/system") / f"cockpit-app-{app['id']}{suffix}.service"
+
+
+def _verified_service_bytes(app: Dict[str, Any], service_path: Path) -> Optional[bytes]:
+    _assert_no_symlink_components(service_path)
+    if not service_path.exists():
+        return None
+    contents = service_path.read_bytes()
+    required = {"# Managed by Cockpit App Manager", f"Description=Cockpit App Manager - {app['id']}", f"User={app['service_user']}"}
+    if not required.issubset(set(contents.decode("utf-8").splitlines())):
+        raise RuntimeError("Refusing to modify an unverified managed service unit")
+    return contents
 
 
 def _legacy_service_path(app: Dict[str, Any]) -> Path:
@@ -1931,6 +2139,7 @@ def _render_service(
     start_command: Sequence[str],
     config: Dict[str, Any],
     working_directory: Optional[Path] = None,
+    release_directory: Optional[Path] = None,
 ) -> str:
     if not start_command:
         raise ValueError("Application start command cannot be empty")
@@ -1944,10 +2153,16 @@ def _render_service(
         raise ValueError("Application working directory must be inside its managed release") from exc
     if ".." in relative_working_directory.parts:
         raise ValueError("Application working directory must not traverse outside its managed release")
+    if release_directory is not None:
+        if not _path_is_within(release_directory, paths["releases"]) or release_directory == paths["releases"]:
+            raise ValueError("Service release must be inside managed releases")
+        working_directory = release_directory / "app" / relative_working_directory
+        start_command = _release_command_path(start_command, paths["current"], release_directory)
     writable_paths = (
         paths["home"],
         paths["config"],
         paths["logs"],
+        *(paths["storage"] / name for name in app.get("storage_directories", ["data"])),
     )
     read_write_paths = " ".join(_systemd_quote(str(path)) for path in writable_paths)
     exec_start = " ".join(_systemd_quote(part) for part in start_command)
@@ -1955,6 +2170,11 @@ def _render_service(
         f"Environment={_systemd_quote('NODE_ENV=production')}\n"
         if app.get("framework") in {"nextjs", "node"}
         else ""
+    )
+    limits = _resource_limits(app.get("resource_limits", {}))
+    storage_environment = "".join(
+        f"Environment={_systemd_quote('APP_STORAGE_' + name.upper().replace('-', '_') + '=' + str(paths['storage'] / name))}\n"
+        for name in app.get("storage_directories", ["data"])
     )
     return (
         "[Unit]\n"
@@ -1973,9 +2193,18 @@ def _render_service(
         f"{node_environment}"
         f"Environment={_systemd_quote('APP_BASE_PATH=' + validate_app_route(app.get('route'), app['id']).rstrip('/'))}\n"
         f"Environment={_systemd_quote('APP_CONFIG_DIR=' + str(paths['config']))}\n"
+        f"Environment={_systemd_quote('APP_DATA_DIR=' + str(paths['storage'] / 'data'))}\n"
+        f"Environment={_systemd_quote('APP_STORAGE_DIR=' + str(paths['storage']))}\n"
+        f"{storage_environment}"
         f"Environment={_systemd_quote('HOME=' + str(paths['home']))}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
+        "CPUAccounting=true\n"
+        "MemoryAccounting=true\n"
+        "TasksAccounting=true\n"
+        f"MemoryMax={limits['memory_mb']}M\n"
+        f"CPUQuota={limits['cpu_percent']}%\n"
+        f"TasksMax={limits['tasks_max']}\n"
         f"StandardOutput=append:{paths['logs'] / 'stdout.log'}\n"
         f"StandardError=append:{paths['logs'] / 'stderr.log'}\n"
         "NoNewPrivileges=true\n"
@@ -2494,8 +2723,9 @@ def _write_service(
     config: Dict[str, Any],
     working_directory: Optional[Path] = None,
 ) -> Path:
-    service = _render_service(app, start_command, config, working_directory)
+    service = _render_service(app, start_command, config, working_directory, release_dir if "service_slot" in app else None)
     service_path = _service_path(app)
+    _verified_service_bytes(app, service_path)
     service_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{service_path.name}.", dir=str(service_path.parent))
     try:
@@ -2657,6 +2887,24 @@ def _append_deployment_log(path: Path, message: str) -> None:
             os.close(descriptor)
 
 
+def _setup_persistent_storage(app: Dict[str, Any], username: str, config: Dict[str, Any]) -> None:
+    paths = _app_paths(app["id"], config)
+    storage = paths["storage"]
+    _assert_no_symlink_components(storage)
+    storage.mkdir(mode=0o755, exist_ok=True)
+    os.chown(str(storage), 0, 0)
+    os.chmod(str(storage), 0o755)
+    uid, group_id = _account_ids(username)
+    for name in app.get("storage_directories", ["data"]):
+        if not isinstance(name, str) or not APP_ROUTE_SEGMENT_RE.fullmatch(name):
+            raise ValueError("Invalid persistent directory name")
+        directory = storage / name
+        _assert_no_symlink_components(directory)
+        directory.mkdir(mode=0o750, exist_ok=True)
+        os.chown(str(directory), uid, group_id, follow_symlinks=False)
+        os.chmod(str(directory), 0o750)
+
+
 def _setup_app_directories(app: Dict[str, Any], username: str, config: Dict[str, Any]) -> Dict[str, Path]:
     paths = _app_paths(app["id"], config)
     paths["home"].parent.mkdir(parents=True, exist_ok=True, mode=0o711)
@@ -2675,6 +2923,7 @@ def _setup_app_directories(app: Dict[str, Any], username: str, config: Dict[str,
         _chown_tree(paths[key], username)
 
     _, group_id = _account_ids(username)
+    _setup_persistent_storage(app, username, config)
     public_releases = {
         _resolved_path(Path(item["release"]))
         for item in app.get("deployments", [])
@@ -2717,6 +2966,75 @@ def pull_app(app_id: str) -> Dict[str, Any]:
         return {"ok": True, "result": result, "app": app}
 
 
+def _remote_app_commit(app: Dict[str, Any]) -> str:
+    username = ensure_app_user(app["id"])
+    branch = validate_branch(app["branch"])
+    if not validate_git_url(app["repo_url"]):
+        raise ValueError("Invalid repository URL")
+    result = _run_as_user(username, ["git", "ls-remote", "--exit-code", app["repo_url"], f"refs/heads/{branch}"],
+                          timeout=int(get_config()["command_timeout_seconds"]))
+    _command_error(result, "Checking application repository")
+    match = re.fullmatch(r"([0-9a-f]{40,64})\t" + re.escape(f"refs/heads/{branch}") + r"\s*", result.stdout or "")
+    if not match:
+        raise RuntimeError("Repository returned an invalid branch revision")
+    return match.group(1)
+
+
+def _in_deployment_window(window: Dict[str, str]) -> bool:
+    if not window or window["start"] == window["end"]:
+        return True
+    current = datetime.now(timezone.utc).strftime("%H:%M")
+    if window["start"] < window["end"]:
+        return window["start"] <= current < window["end"]
+    return current >= window["start"] or current < window["end"]
+
+
+def review_update_app(app_id: str) -> Dict[str, Any]:
+    _require_root()
+    config = get_config()
+    with _app_lock(app_id):
+        app = _find_app(get_registry(), app_id)
+        username = ensure_app_user(app_id)
+        paths = _setup_app_directories(app, username, config)
+        clone_or_update_repo(app["repo_url"], paths["source"], app["branch"], username, int(config["command_timeout_seconds"]))
+        _assert_deployed_ancestor(app, paths["source"], username, int(config["command_timeout_seconds"]))
+        commit = git_output(paths["source"], "rev-parse", "HEAD", username=username)
+        if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+            raise RuntimeError("Invalid candidate revision")
+        base = app.get("deployed_commit")
+        revision_range = f"{base}..{commit}" if base else commit
+        commits = _git(paths["source"], username, ["log", "--format=%h %s", "--max-count=20", revision_range], int(config["command_timeout_seconds"]))
+        _command_error(commits, "Reading changes for approval")
+        arguments = ["diff", "--stat", base, commit] if base else ["show", "--stat", "--format=", commit]
+        difference = _git(paths["source"], username, arguments, int(config["command_timeout_seconds"]))
+        _command_error(difference, "Reading changed file summary")
+        pending = {"commit": commit, "base_commit": base, "repo_url": app["repo_url"], "branch": app["branch"],
+                   "checked_at": now_iso(), "commits": (commits.stdout or "")[:8192], "diffstat": (difference.stdout or "")[:8192]}
+        with _registry_transaction() as registry:
+            stored = _find_app(registry, app_id)
+            stored["pending_update"] = pending
+            stored["latest_commit"] = commit
+        return {"ok": True, "app_id": app_id, "pending_update": pending}
+
+
+def _validate_approval(app: Dict[str, Any], commit: Optional[str]) -> None:
+    if app.get("deployment_mode", "automatic") != "approval":
+        return
+    pending = app.get("pending_update", {})
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit) or commit != pending.get("commit"):
+        raise RuntimeError("Review and approve the exact candidate commit before deploying")
+    if pending.get("repo_url") != app["repo_url"] or pending.get("branch") != app["branch"] or pending.get("base_commit") != app.get("deployed_commit"):
+        raise RuntimeError("Application changed since review; review the update again")
+
+
+def approve_deployment_app(app_id: str, commit: str) -> Dict[str, Any]:
+    app = _find_app(get_registry(), app_id)
+    if app.get("deployment_mode") != "approval":
+        raise ValueError("Application is not in approval mode")
+    _validate_approval(app, commit)
+    return deployment_start_app(app_id, approved_commit=commit)
+
+
 def auto_deploy_apps() -> Dict[str, Any]:
     _require_root()
     app_ids = [app["id"] for app in get_registry()["apps"]]
@@ -2725,6 +3043,20 @@ def auto_deploy_apps() -> Dict[str, Any]:
     for app_id in app_ids:
         try:
             app = _find_app(get_registry(), app_id)
+            if app.get("last_deploy"):
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    health_check_app(app_id)
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    metrics_app(app_id)
+            if not app.get("auto_deploy", True):
+                outcomes.append({"app_id": app_id, "status": "paused"})
+                continue
+            if not _in_deployment_window(app.get("deployment_window", {})):
+                outcomes.append({"app_id": app_id, "status": "outside-deployment-window"})
+                continue
+            if app.get("auto_deploy_state", {}).get("retry_after", 0) > time.time():
+                outcomes.append({"app_id": app_id, "status": "retry-backoff"})
+                continue
             latest = app.get("deployments", [])[-1] if app.get("deployments") else None
             if isinstance(latest, dict) and latest.get("status") == "deploying":
                 outcomes.append({"app_id": app_id, "status": "deployment-in-progress"})
@@ -2732,28 +3064,41 @@ def auto_deploy_apps() -> Dict[str, Any]:
             if latest is None:
                 outcomes.append({"app_id": app_id, "status": "awaiting-first-deployment"})
                 continue
-            pulled = pull_app(app_id)
+            commit = _remote_app_commit(app)
             current = _find_app(get_registry(), app_id)
             deployment = current.get("deployments", [])[-1] if current.get("deployments") else None
-            commit = pulled["app"].get("latest_commit")
-            if deployment is None or deployment.get("commit") != commit:
-                result = deploy_app(app_id)
-                outcomes.append({
-                    "app_id": app_id,
-                    "status": "deployed",
-                    "commit": result["deployment"].get("commit"),
-                })
+            live_commit = current.get("deployed_commit") or (deployment or {}).get("commit")
+            if live_commit != commit:
+                if current.get("deployment_mode") == "approval":
+                    pending = current.get("pending_update", {})
+                    if pending.get("commit") != commit or pending.get("base_commit") != live_commit:
+                        review_update_app(app_id)
+                    outcomes.append({"app_id": app_id, "status": "awaiting-approval", "commit": commit})
+                else:
+                    result = deploy_app(app_id)
+                    outcomes.append({"app_id": app_id, "status": "deployed", "commit": result["deployment"].get("commit")})
             else:
                 outcomes.append({"app_id": app_id, "status": "up-to-date", "commit": commit})
+            with _registry_transaction() as registry:
+                stored = _find_app(registry, app_id)
+                stored["latest_commit"] = commit
+                stored["auto_deploy_state"] = {"checked_at": now_iso(), "error": None, "failures": 0, "retry_after": 0}
         except (OSError, RuntimeError, ValueError) as exc:
             errors.append(f"{app_id}: {exc}")
             outcomes.append({"app_id": app_id, "status": "failed", "error": str(exc)})
+            with _registry_transaction() as registry:
+                stored = _find_app(registry, app_id)
+                failures = min(stored.get("auto_deploy_state", {}).get("failures", 0) + 1, 8)
+                stored["auto_deploy_state"] = {
+                    "checked_at": now_iso(), "error": str(exc), "failures": failures,
+                    "retry_after": time.time() + min(3600, 300 * 2 ** (failures - 1)),
+                }
     if errors:
         raise RuntimeError("Automatic deployment errors: " + "; ".join(errors))
     return {"ok": True, "results": outcomes}
 
 
-def deployment_start_app(app_id: str) -> Dict[str, Any]:
+def deployment_start_app(app_id: str, approved_commit: Optional[str] = None) -> Dict[str, Any]:
     _require_root()
     app_id = validate_app_id(app_id)
     _find_app(get_registry(), app_id)
@@ -2762,6 +3107,7 @@ def deployment_start_app(app_id: str) -> Dict[str, Any]:
     started_at = now_iso()
     with _registry_transaction() as registry:
         app = _find_app(registry, app_id)
+        _validate_approval(app, approved_commit)
         current = app.get("deployments", [])[-1] if app.get("deployments") else None
         if isinstance(current, dict) and current.get("status") == "deploying":
             return {
@@ -2775,6 +3121,7 @@ def deployment_start_app(app_id: str) -> Dict[str, Any]:
             "name": app["name"],
             "date": started_at,
             "previous_status": app.get("status", "stopped"),
+            "approved_commit": approved_commit,
             "commit": None,
             "release": None,
             "release_available": False,
@@ -2787,9 +3134,6 @@ def deployment_start_app(app_id: str) -> Dict[str, Any]:
         app["status"] = "deploying"
         _record_deployment(app, record)
 
-    cancel_file = _deployment_cancel_path(app_id, release_id)
-    with contextlib.suppress(FileNotFoundError):
-        cancel_file.unlink()
     log_path = None
     unit_name = f"cockpit-app-manager-deploy-{app_id}-{release_id}.service"
     try:
@@ -2880,7 +3224,157 @@ def abort_deployment_app(app_id: str, deployment_id: str) -> Dict[str, Any]:
     return {"ok": True, "app_id": app_id, "deployment_id": deployment_id, "aborting": True}
 
 
-def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, Any]:
+@contextlib.contextmanager
+def _build_slot(cancel_file: Path, on_wait: Optional[Callable[[], None]] = None) -> Iterator[None]:
+    root = Path(DEFAULT_STATE_ROOT) / "build-slots"
+    _assert_no_symlink_components(root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    deadline = time.monotonic() + 3600
+    waiting = False
+    while True:
+        _raise_if_deployment_cancelled(cancel_file)
+        if time.monotonic() > deadline:
+            raise RuntimeError("Timed out waiting for a build slot")
+        with contextlib.ExitStack() as slot:
+            selected = False
+            occupied = 0
+            with _file_lock(root / "admission.lock"):
+                for index in range(8):
+                    with contextlib.ExitStack() as probe:
+                        try:
+                            probe.enter_context(_file_lock(root / f"{index}.lock", blocking=False))
+                        except OSError as exc:
+                            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                                raise
+                            occupied += 1
+                        else:
+                            if not selected:
+                                slot.enter_context(probe.pop_all())
+                                selected = True
+                admitted = selected and occupied < get_config()["max_concurrent_builds"]
+            if admitted:
+                _raise_if_deployment_cancelled(cancel_file)
+                yield
+                return
+        if not waiting and on_wait is not None:
+            on_wait()
+        waiting = True
+        time.sleep(0.1)
+
+
+def _host_preflight(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    checks = []
+    environment = _environment_values_app(app["id"])
+    missing = [key for key in app.get("required_environment", []) if not environment.get(key)]
+    checks.append({"name": "Environment", "passed": not missing,
+                   "message": "Missing required variables: " + ", ".join(missing) if missing else "Required variable names are present"})
+    for key in ("source_root", "production_root"):
+        path = Path(config[key])
+        while not path.exists():
+            path = path.parent
+        free = shutil.disk_usage(path).free
+        checks.append({"name": key, "passed": free >= config.get("min_free_disk_mb", 512) * 1024 * 1024,
+                       "message": f"{free // (1024 * 1024)} MiB free; minimum {config.get('min_free_disk_mb', 512)} MiB"})
+    return {"checks": checks, "errors": [check["message"] for check in checks if not check["passed"]], "warnings": []}
+
+
+def _deployment_preflight(app: Dict[str, Any], source: Path, username: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    report = _host_preflight(app, config)
+    project = inspect_project(source, app["framework"], app.get("build_config", {}))
+    report["errors"].extend(project["errors"])
+    report["warnings"].extend(project["warnings"])
+    report["framework"] = app["framework"]
+    report["project_directory"] = project["project_directory"]
+    for tool, minimum in {**project["tools"], **app.get("runtime_requirements", {})}.items():
+        declared_minimum = project["tools"].get(tool)
+        if declared_minimum and minimum:
+            minimum = max((minimum, declared_minimum), key=lambda version: tuple(int(part) for part in version.split(".")) + (0,) * (3 - len(version.split("."))))
+        try:
+            result = _run_as_user(username, [tool, "version" if tool == "go" else "--version"], timeout=10)
+            output = (result.stdout or "") + " " + (result.stderr or "")
+            match = re.search(r"(?:v|go)?([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", output)
+            actual = tuple(int(part or 0) for part in match.groups()) if match else None
+            needed = tuple(int(part) for part in minimum.split(".")) if minimum else None
+            if needed:
+                needed += (0,) * (3 - len(needed))
+            passed = result.returncode == 0 and (needed is None or actual is not None and actual >= needed)
+            message = f"{tool}: " + (".".join(map(str, actual)) if actual else "version unavailable")
+            if minimum:
+                message += f"; minimum {minimum}"
+        except (OSError, RuntimeError) as exc:
+            passed, message = False, f"{tool}: {type(exc).__name__}; runtime is unavailable"
+        report["checks"].append({"name": tool, "passed": passed, "message": message})
+        if not passed:
+            report["errors"].append(message)
+    report["passed"] = not report["errors"]
+    report["checked_at"] = now_iso()
+    return report
+
+
+def preflight_app(app_id: str) -> Dict[str, Any]:
+    _require_root()
+    config = get_config()
+    with _app_lock(app_id):
+        app = dict(_find_app(get_registry(), app_id))
+        host = _host_preflight(app, config)
+        if host["errors"]:
+            return {"ok": True, "passed": False, "checked_at": now_iso(), **host}
+        username = ensure_app_user(app_id)
+        paths = _setup_app_directories(app, username, config)
+        clone_or_update_repo(app["repo_url"], paths["source"], app["branch"], username, int(config["command_timeout_seconds"]))
+        _assert_deployed_ancestor(app, paths["source"], username, int(config["command_timeout_seconds"]))
+        if app["framework"] == "auto":
+            app["framework"] = detect_framework(paths["source"], app.get("build_config", {}))
+        report = _deployment_preflight(app, paths["source"], username, config)
+        report["checks"].insert(0, {"name": "Repository", "passed": True, "message": "Repository access and fast-forward history verified"})
+        return {"ok": True, **report}
+
+
+def _assert_deployed_ancestor(app: Dict[str, Any], source: Path, username: str, timeout: int,
+                              cancel_file: Optional[Path] = None) -> None:
+    commit = app.get("deployed_commit")
+    if commit is None:
+        return
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise ValueError("Invalid deployed Git revision")
+    result = _git(source, username, ["merge-base", "--is-ancestor", commit, "HEAD"], timeout, cancel_file)
+    if result.returncode != 0:
+        raise RuntimeError("Repository history does not fast-forward the deployed commit; refusing rewritten history")
+
+
+def _remove_deployed_source(app_id: str, config: Dict[str, Any]) -> None:
+    source = _app_paths(validate_app_id(app_id), config)["source"]
+    _assert_no_symlink_components(source)
+    if source.exists():
+        if not source.is_dir():
+            raise RuntimeError("Managed source checkout is not a directory")
+        shutil.rmtree(source)
+
+
+def _build_release(app: Dict[str, Any], source: Path, release: Path, adapter: Any, username: str,
+                   config: Dict[str, Any], release_id: str, cancel_file: Path, deployment_log: Path,
+                   **build_arguments: Any) -> Dict[str, Any]:
+    def set_phase(phase: str) -> None:
+        with _registry_transaction() as registry:
+            record = _find_app(registry, app["id"])["deployments"][0]
+            record["build_status"] = phase
+        _append_deployment_log(deployment_log, "Build phase: " + phase)
+    set_phase("queued")
+    with _build_slot(cancel_file):
+        _raise_if_deployment_cancelled(cancel_file)
+        set_phase("preflight")
+        report = _deployment_preflight(app, source, username, config)
+        for check in report.get("checks", []):
+            _append_deployment_log(deployment_log, ("PASS " if check["passed"] else "FAIL ") + check["name"] + ": " + check["message"])
+        for warning in report.get("warnings", []):
+            _append_deployment_log(deployment_log, "Preflight warning: " + warning)
+        if not report["passed"]:
+            raise RuntimeError("Deployment preflight failed: " + "; ".join(report["errors"]))
+        set_phase("running")
+        return adapter.build(app, source, release, **build_arguments)
+
+
+def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit: Optional[str] = None) -> Dict[str, Any]:
     _require_root()
     config = get_config()
     with _app_lock(app_id):
@@ -2893,13 +3387,21 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 (item for item in app.get("deployments", []) if item.get("id") == release_id),
                 None,
             )
+            if deployment_id is not None and (existing is None or existing.get("status") != "deploying"):
+                raise ValueError("That deployment is not active")
+            if existing is None and any(item.get("status") == "deploying" for item in app.get("deployments", [])):
+                raise ValueError("Another deployment is already active")
             if existing is not None:
                 app_snapshot["status"] = existing.get("previous_status", app_snapshot["status"])
+                approved_commit = existing.get("approved_commit")
+            else:
+                _validate_approval(app_snapshot, approved_commit)
         record = dict(existing) if existing else {
             "id": release_id,
             "name": app_snapshot["name"],
             "date": now_iso(),
             "previous_status": app_snapshot.get("status", "stopped"),
+            "approved_commit": approved_commit,
             "commit": None,
             "release": None,
             "release_available": False,
@@ -2917,6 +3419,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
 
         paths: Optional[Dict[str, Path]] = None
         release_dir: Optional[Path] = None
+        release_prepared = False
         current_release: Optional[Path] = None
         service_path: Optional[Path] = None
         previous_service_content: Optional[bytes] = None
@@ -2924,6 +3427,11 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
         unit_written = False
         activation_attempted = False
         runtime_required = True
+        staged = False
+        previous_app = dict(app_snapshot)
+        previous_unit_path = _service_path(previous_app)
+        old_service_retired = True
+        route_activated = False
         try:
             deployment_log = _deployment_log_path(app_id, release_id, create=True)
             _prune_deployment_logs(app_id, release_id)
@@ -2932,6 +3440,10 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
             username = ensure_app_user(app_id)
             paths = _setup_app_directories(app_snapshot, username, config)
             current_release = paths["current"].resolve(strict=False) if paths["current"].exists() or paths["current"].is_symlink() else None
+            _validate_approval(app_snapshot, approved_commit)
+            host_report = _host_preflight(app_snapshot, config)
+            if host_report["errors"]:
+                raise RuntimeError("Deployment preflight failed: " + "; ".join(host_report["errors"]))
             source_path = paths["source"]
             _append_deployment_log(deployment_log, "Updating the application source repository")
             clone_or_update_repo(
@@ -2942,6 +3454,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 int(config["command_timeout_seconds"]),
                 cancel_file,
             )
+            _assert_deployed_ancestor(app_snapshot, source_path, username, int(config["command_timeout_seconds"]), cancel_file)
             _raise_if_deployment_cancelled(cancel_file)
             framework = app_snapshot.get("framework", "auto")
             if framework == "auto":
@@ -2951,6 +3464,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
             adapter = get_adapter(framework)
             release_dir = paths["releases"] / release_id
             _prepare_release_directory(release_dir, username)
+            release_prepared = True
             record.update({
                 "release": str(release_dir),
                 "release_available": True,
@@ -2958,19 +3472,40 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 "build_status": "running",
             })
             commit = git_output(source_path, "rev-parse", "HEAD", username=username)
+            if app_snapshot.get("deployment_mode") == "approval" and commit != approved_commit:
+                raise RuntimeError("Repository changed after approval; review and approve the new commit")
             record["commit"] = commit or None
             service_path = _service_path(app_snapshot)
-            previous_service_content = service_path.read_bytes() if service_path.exists() else None
+            previous_service_content = _verified_service_bytes(app_snapshot, service_path)
+            expects_runtime = framework != "static" or bool(app_snapshot.get("build_config", {}).get("start_command"))
+            if expects_runtime and current_release is not None and previous_service_content is not None and previous_app.get("status") == "running":
+                staged = True
+                old_service_retired = False
+                with _registry_transaction() as registry:
+                    candidate_port = _select_port(registry, config)
+                    _find_app(registry, app_id)["candidate_port"] = candidate_port
+                app_snapshot = dict(app_snapshot, port=candidate_port,
+                                    service_slot="secondary" if previous_app.get("service_slot", "primary") == "primary" else "primary")
+                service_path = _service_path(app_snapshot)
+                if service_path.exists():
+                    raise RuntimeError("Inactive service slot is occupied; administrator cleanup is required")
+                previous_service_content = None
             build_environment = _environment_values_app(app_id)
             build_environment["APP_BASE_PATH"] = validate_app_route(
                 app_snapshot.get("route"),
                 app_id,
             ).rstrip("/")
             _, release_group = _account_ids(username)
-            build_result = adapter.build(
+            build_result = _build_release(
                 app_snapshot,
                 source_path,
                 release_dir,
+                adapter,
+                username,
+                config,
+                release_id,
+                cancel_file,
+                deployment_log,
                 runner=lambda args, cwd, timeout: _run_as_user(
                     username,
                     args,
@@ -2979,6 +3514,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                     environment=build_environment,
                     live_log_path=deployment_log,
                     cancel_file=cancel_file,
+                    resource_limits=app_snapshot.get("resource_limits", {}),
                 ),
                 timeout=int(config["build_timeout_seconds"]),
                 group_id=release_group,
@@ -3012,7 +3548,8 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 _restore_service_file(service_path, None)
                 _systemctl("daemon-reload")
             _retire_legacy_root_service(app_snapshot)
-            _atomic_symlink(release_dir, paths["current"])
+            if not staged:
+                _atomic_symlink(release_dir, paths["current"])
             activation_attempted = True
             if runtime_required:
                 _systemctl("enable", service_path.name)
@@ -3025,12 +3562,15 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
             elif not (release_dir / "app" / "index.html").is_file():
                 raise RuntimeError("Static release is missing index.html")
             _raise_if_deployment_cancelled(cancel_file)
+            if staged:
+                _atomic_symlink(release_dir, paths["current"])
             _append_deployment_log(deployment_log, "Generating and activating the application Nginx route")
             with _registry_transaction() as registry:
                 _raise_if_deployment_cancelled(cancel_file)
                 latest = _find_app(registry, app_id)["deployments"][0]
                 latest["abortable"] = False
             hosting_result = _activate_nginx_config(app_snapshot, framework, config)
+            route_activated = True
             record["hosting"] = hosting_result
             record["abortable"] = False
             _append_deployment_log(deployment_log, hosting_result["message"])
@@ -3049,6 +3589,17 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                     app.get("active_route") or app["route"]
                 )
                 app["last_deploy"] = record["date"]
+                app["deployed_commit"] = commit or None
+                app.pop("pending_update", None)
+                app["port"] = app_snapshot["port"]
+                if staged:
+                    app["service_slot"] = app_snapshot["service_slot"]
+                app.pop("candidate_port", None)
+                app["health"] = {
+                    "checked_at": now_iso(), "service_state": "active" if runtime_required else "not-required",
+                    "service_error": None, "local_healthy": True, "local_error": None,
+                    "public_healthy": None, "public_error": "Public reachability has not been checked",
+                }
                 app["latest_commit"] = commit or app.get("latest_commit")
                 stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
                 stored_record.update(record)
@@ -3060,12 +3611,22 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                     _append_deployment_log(deployment_log, message)
             rollback_error = None
             try:
-                if unit_written and service_path is not None:
+                if staged:
+                    if route_activated:
+                        previous_route_app = dict(previous_app, route=previous_app.get("active_route") or previous_app["route"])
+                        _activate_nginx_config(previous_route_app, previous_app["framework"], config)
+                    if unit_written and service_path is not None:
+                        _systemctl("disable", "--now", service_path.name)
+                        _restore_service_file(service_path, None)
+                        _systemctl("daemon-reload")
+                    if paths is not None and current_release is not None:
+                        _atomic_symlink(current_release, paths["current"])
+                elif unit_written and service_path is not None:
                     _restore_service_file(service_path, previous_service_content)
                     _systemctl("daemon-reload")
                     if not runtime_required and previous_service_content is not None:
                         _systemctl("enable", service_path.name)
-                if activation_attempted and paths is not None and current_release is not None and current_release.is_dir():
+                if not staged and activation_attempted and paths is not None and current_release is not None and current_release.is_dir():
                     _atomic_symlink(current_release, paths["current"])
                     if previous_service_content is not None and service_path is not None:
                         if app_snapshot.get("status") == "running":
@@ -3078,7 +3639,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                     else:
                         if runtime_required and service_path is not None:
                             _systemctl("stop", service_path.name)
-                elif activation_attempted and previous_service_content is None:
+                elif not staged and activation_attempted and previous_service_content is None:
                     if paths is not None and paths["current"].is_symlink():
                         paths["current"].unlink()
                     if runtime_required and service_path is not None:
@@ -3091,12 +3652,12 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
             record.update({
                 "build_status": "aborted" if isinstance(exc, DeploymentAborted) else "failed",
                 "status": "aborted" if isinstance(exc, DeploymentAborted) else "failed",
-                "release_available": bool(release_dir and release_dir.is_dir()),
+                "release_available": bool(release_prepared and release_dir and release_dir.is_dir()),
                 "error": str(exc),
             })
             if rollback_error:
                 record["rollback_error"] = rollback_error
-            if release_dir is not None:
+            if release_prepared and release_dir is not None and not rollback_error:
                 with contextlib.suppress(OSError):
                     if release_dir.is_dir() and not release_dir.is_symlink():
                         shutil.rmtree(release_dir)
@@ -3105,6 +3666,8 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 app = _find_app(registry, app_id)
                 stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
                 stored_record.update(record)
+                if not rollback_error:
+                    app.pop("candidate_port", None)
                 app["updated_at"] = now_iso()
                 app["status"] = (
                     "failed" if rollback_error
@@ -3115,17 +3678,32 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, An
                 cancel_file.unlink()
             raise
 
+        cleanup_errors = []
         try:
-            _prune_releases(app)
-        except OSError as exc:
-            record["cleanup_error"] = str(exc)
+            _remove_deployed_source(app_id, config)
+            _append_deployment_log(deployment_log, "Removed the managed source checkout; runtime release retained")
+        except (OSError, RuntimeError) as exc:
+            cleanup_errors.append("Source cleanup: " + str(exc))
+        try:
+            if staged:
+                _verified_service_bytes(previous_app, previous_unit_path)
+                _systemctl("disable", "--now", previous_unit_path.name)
+                _restore_service_file(previous_unit_path, None)
+                _systemctl("daemon-reload")
+                old_service_retired = True
+            if old_service_retired:
+                _prune_releases(app)
+        except (OSError, RuntimeError) as exc:
+            cleanup_errors.append("Previous release cleanup: " + str(exc))
+        if cleanup_errors:
+            record["cleanup_error"] = "; ".join(cleanup_errors)
             _append_deployment_log(
                 _deployment_log_path(app_id, release_id),
-                f"Could not remove previous releases: {exc}",
+                record["cleanup_error"],
             )
             with _registry_transaction() as registry:
                 stored = _find_app(registry, app_id)
-                stored["deployments"][0]["cleanup_error"] = str(exc)
+                stored["deployments"][0]["cleanup_error"] = record["cleanup_error"]
         with contextlib.suppress(FileNotFoundError):
             cancel_file.unlink()
         app_snapshot.update({"status": "running", "framework": framework, "latest_commit": commit or app_snapshot.get("latest_commit")})
@@ -3234,6 +3812,7 @@ def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
                 app["hosting_active"] = status == "running"
                 app["active_route"] = route
                 app["updated_at"] = now_iso()
+                app.pop("health", None)
             return {"ok": True, "app_id": app_id, "status": status}
         service_path = _service_path(app_snapshot)
         if not service_path.exists():
@@ -3253,12 +3832,14 @@ def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
                         stored = _find_app(registry, app_id)
                         stored["status"] = "failed"
                         stored["updated_at"] = now_iso()
+                        stored.pop("health", None)
                 raise
         status = "stopped" if action_name == "stop" else "running"
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
             app["status"] = status
             app["updated_at"] = now_iso()
+            app.pop("health", None)
         return {"ok": True, "app_id": app_id, "status": status}
 
 
@@ -3312,7 +3893,7 @@ def logs_app(app_id: str, lines: int = 100) -> Dict[str, Any]:
     }
 
 
-def deployment_logs_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, Any]:
+def deployment_logs_app(app_id: str, deployment_id: Optional[str] = None, *, status_only: bool = False) -> Dict[str, Any]:
     app_id = validate_app_id(app_id)
     app = _find_app(get_registry(), app_id)
     latest = next(
@@ -3335,9 +3916,10 @@ def deployment_logs_app(app_id: str, deployment_id: Optional[str] = None) -> Dic
         "deployment_id": latest["id"],
         "active": latest.get("status") == "deploying",
         "aborting": latest.get("status") == "deploying" and cancel_file.exists(),
+        "build_status": latest.get("build_status", "pending"),
         "abortable": latest.get("abortable", True) is not False,
         "status": latest.get("status"),
-        "logs": _tail_log(log_path, 1000, max_bytes=1024 * 1024),
+        **({} if status_only else {"logs": _tail_log(log_path, 1000, max_bytes=1024 * 1024)}),
     }
 
 
@@ -3358,12 +3940,108 @@ def _tail_log(path: Path, lines: int, max_bytes: int = 1024 * 1024) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
+def _directory_usage(path: Path, max_entries: int = 10000) -> Dict[str, Any]:
+    size = 0
+    entries = 0
+    deadline = time.monotonic() + 1
+    truncated = False
+    def scan_error(error: OSError) -> None:
+        nonlocal truncated
+        if error.errno != errno.ENOENT:
+            truncated = True
+    if path.is_symlink():
+        return {"bytes": 0, "truncated": True}
+    for root, directories, filenames in os.walk(path, followlinks=False, onerror=scan_error):
+        directories[:] = [name for name in directories if not (Path(root) / name).is_symlink()]
+        for name in directories + filenames:
+            entries += 1
+            if entries > max_entries or time.monotonic() > deadline:
+                return {"bytes": size, "truncated": True}
+            try:
+                metadata = (Path(root) / name).lstat()
+                if stat.S_ISREG(metadata.st_mode):
+                    size += metadata.st_size
+            except OSError:
+                truncated = True
+    return {"bytes": size, "truncated": truncated}
+
+
+def metrics_app(app_id: str) -> Dict[str, Any]:
+    app = _find_app(get_registry(), app_id)
+    paths = _app_paths(app_id, get_config())
+    metrics = {"checked_at": now_iso(), "sample_time": time.monotonic(), "cpu_percent": None,
+               "memory_bytes": None, "peak_memory_bytes": None, "tasks": None, "restarts": None,
+               "uptime_seconds": None, "service_state": "not-required", "errors": []}
+    if app.get("framework") != "static" or app.get("build_config", {}).get("start_command"):
+        try:
+            result = _systemctl("show", _service_path(app).name,
+                                "--property=ActiveState,CPUUsageNSec,MemoryCurrent,MemoryPeak,TasksCurrent,NRestarts,ActiveEnterTimestampMonotonic,InvocationID", timeout=5)
+            properties = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
+            metrics["service_state"] = properties.get("ActiveState", "unknown")
+            for name, property_name in (("memory_bytes", "MemoryCurrent"), ("peak_memory_bytes", "MemoryPeak"),
+                                        ("tasks", "TasksCurrent"), ("restarts", "NRestarts"), ("cpu_usage_nsec", "CPUUsageNSec")):
+                value = properties.get(property_name, "")
+                metrics[name] = int(value) if re.fullmatch(r"[0-9]{1,20}", value) and int(value) < 2 ** 64 - 1 else None
+            metrics["invocation_id"] = properties.get("InvocationID")
+            entered = properties.get("ActiveEnterTimestampMonotonic", "")
+            if metrics["service_state"] == "active" and entered.isdigit() and int(entered) > 0:
+                metrics["uptime_seconds"] = max(0, metrics["sample_time"] - int(entered) / 1000000)
+            previous = app.get("metrics", {})
+            previous_time = previous.get("sample_time")
+            elapsed = metrics["sample_time"] - previous_time if type(previous_time) in (int, float) and 0 <= previous_time < metrics["sample_time"] else 0
+            previous_cpu = previous.get("cpu_usage_nsec")
+            if elapsed > 0 and metrics["invocation_id"] and metrics["invocation_id"] == previous.get("invocation_id") and metrics.get("cpu_usage_nsec") is not None and type(previous_cpu) is int and 0 <= previous_cpu < 2 ** 64 - 1:
+                difference = metrics["cpu_usage_nsec"] - previous_cpu
+                if difference >= 0:
+                    metrics["cpu_percent"] = round(difference / elapsed / 10000000, 1)
+        except (OSError, RuntimeError) as exc:
+            metrics["service_state"] = "unknown"
+            metrics["errors"].append(str(exc))
+    for name, directory in (("disk", paths["production"]), ("storage", paths["storage"]),
+                             ("logs", paths["logs"]), ("source", paths["source"])):
+        usage = _directory_usage(directory)
+        metrics[name + "_bytes"] = usage["bytes"]
+        metrics[name + "_truncated"] = usage["truncated"]
+    with _registry_transaction() as registry:
+        _find_app(registry, app_id)["metrics"] = metrics
+    return {"ok": True, "app_id": app_id, "metrics": metrics}
+
+
 def health_check_app(app_id: str) -> Dict[str, Any]:
     app = _find_app(get_registry(), app_id)
     app = dict(app, route=app.get("active_route") or app["route"])
     url = app_health_url(app)
-    healthy = check_app_health(app, int(get_config()["health_timeout_seconds"]))
-    return {"ok": True, "app_id": app_id, "healthy": healthy, "url": url}
+    static = app.get("framework") == "static" and not app.get("build_config", {}).get("start_command")
+    service_state = "not-required" if static else "unknown"
+    service_error = None
+    if not static:
+        try:
+            result = _systemctl("show", "--property=ActiveState", "--value", _service_path(app).name, timeout=5)
+            service_state = (result.stdout or "").strip() or "unknown"
+        except (OSError, RuntimeError) as exc:
+            service_error = str(exc)
+    healthy = check_app_health(app, 3)
+    public_healthy = None
+    public_error = "Route is not active" if not app.get("hosting_active") else None
+    if app.get("hosting_active"):
+        public_url = DEFAULT_PUBLIC_ORIGIN + _routed_health_path(app)
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+            with opener.open(urllib.request.Request(public_url, method="GET"), timeout=3) as response:
+                public_healthy = 200 <= response.status < 300
+                if not public_healthy:
+                    public_error = f"Public route returned HTTP {response.status}"
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            public_healthy = False
+            public_error = str(exc)
+    health = {"checked_at": now_iso(), "service_state": service_state, "service_error": service_error,
+              "local_healthy": healthy, "local_error": None if healthy else "Local readiness check failed",
+              "public_healthy": public_healthy, "public_error": public_error}
+    with _registry_transaction() as registry:
+        stored = _find_app(registry, app_id)
+        if stored.get("status") == app.get("status") and stored.get("updated_at") == app.get("updated_at"):
+            stored["health"] = health
+    return {"ok": True, "app_id": app_id, "healthy": healthy, "url": url, **health}
 
 
 def remove_app(app_id: str) -> Dict[str, Any]:
@@ -3374,10 +4052,13 @@ def remove_app(app_id: str) -> Dict[str, Any]:
         _remove_nginx_config(app_id, get_config())
         service_path = _service_path(app)
         _retire_legacy_root_service(app)
-        if service_path.exists():
-            _systemctl("disable", "--now", service_path.name)
-            service_path.unlink()
-            _systemctl("daemon-reload")
+        for slot in ("primary", "secondary"):
+            service_path = _service_path(dict(app, service_slot=slot))
+            if service_path.exists():
+                _verified_service_bytes(app, service_path)
+                _systemctl("disable", "--now", service_path.name)
+                service_path.unlink()
+                _systemctl("daemon-reload")
         with _registry_transaction() as registry:
             _find_app(registry, app_id)
             registry["apps"] = [item for item in registry["apps"] if item.get("id") != app_id]
@@ -3443,6 +4124,7 @@ def _build_parser() -> argparse.ArgumentParser:
     deployment_logs = commands.add_parser("deployment-logs")
     deployment_logs.add_argument("app_id")
     deployment_logs.add_argument("deployment_id", nargs="?")
+    deployment_logs.add_argument("--status-only", action="store_true")
     deployment_abort = commands.add_parser("deployment-abort")
     deployment_abort.add_argument("app_id")
     deployment_abort.add_argument("deployment_id")
@@ -3457,10 +4139,13 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy = commands.add_parser("deploy")
     deploy.add_argument("app_id")
     deploy.add_argument("--deployment-id")
-    for name in ("pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "open"):
+    for name in ("pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "open", "preflight", "metrics", "review-update"):
         command = commands.add_parser(name)
         command.add_argument("app_id")
     logs = commands.add_parser("logs")
+    approve = commands.add_parser("approve")
+    approve.add_argument("app_id")
+    approve.add_argument("commit")
     logs.add_argument("app_id")
     logs.add_argument("--lines", type=int, default=100)
     env_get = commands.add_parser("env-get")
@@ -3484,7 +4169,7 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
     if args.command == "deployments":
         return get_deployments()
     if args.command == "deployment-logs":
-        return deployment_logs_app(args.app_id, args.deployment_id)
+        return deployment_logs_app(args.app_id, args.deployment_id, status_only=args.status_only)
     if args.command == "deployment-abort":
         return abort_deployment_app(args.app_id, args.deployment_id)
     if args.command == "deployment-start":
@@ -3515,6 +4200,14 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         return health_check_app(args.app_id)
     if args.command == "open":
         return open_app(args.app_id)
+    if args.command == "preflight":
+        return preflight_app(args.app_id)
+    if args.command == "metrics":
+        return metrics_app(args.app_id)
+    if args.command == "review-update":
+        return review_update_app(args.app_id)
+    if args.command == "approve":
+        return approve_deployment_app(args.app_id, args.commit)
     if args.command == "env-get":
         return get_environment_app(args.app_id)
     if args.command == "env-save":

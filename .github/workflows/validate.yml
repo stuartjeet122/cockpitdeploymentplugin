@@ -1,0 +1,35 @@
+name: Validate
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --ignore-scripts --no-audit
+      - run: python -m unittest discover -s tests -q
+      - run: npm run test:ui
+      - run: npm run lint
+      - run: bash -n scripts/install.sh scripts/uninstall.sh
+  ubuntu-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y nginx python3-venv logrotate openssh-client nodejs npm golang-go
+      - run: sudo systemctl start nginx
+      - name: Real systemd and Nginx deployments on disposable VM
+        run: sudo env "PATH=$PATH" APP_MANAGER_DISPOSABLE_UBUNTU=1 python3 -m unittest discover -s tests -p test_ubuntu_integration.py -v
+      - name: Host diagnostics
+        if: failure()
+        run: sudo journalctl -u 'cockpit-app-it-*' -u nginx --no-pager -n 200
