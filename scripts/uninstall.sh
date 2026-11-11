@@ -362,6 +362,49 @@ remove_default_plugin_files() {
   remove_empty_directory "$CONFIG_DEST"
 }
 
+remove_auto_deploy_units() {
+  local service_path="${SYSTEMD_DIR}/cockpit-app-manager-auto-deploy.service"
+  local timer_path="${SYSTEMD_DIR}/cockpit-app-manager-auto-deploy.timer"
+  local unit
+  for unit in "$service_path" "$timer_path"; do
+    [[ -e "$unit" || -L "$unit" ]] || continue
+    if [[ -L "$unit" || ! -f "$unit" ]] || has_symlink_ancestor "$unit" ||
+      ! grep -Fqx "# Managed by Cockpit App Manager" "$unit"; then
+      log "Leaving unverified automatic-deployment unit untouched: $unit" >&2
+      return 0
+    fi
+  done
+  if [[ -e "$service_path" ]] &&
+    { ! grep -Fqx "Description=Cockpit App Manager automatic repository deployment" "$service_path" ||
+      ! grep -Fqx "ExecStart=/usr/libexec/cockpit/app-manager/app-manager auto-deploy" "$service_path"; }; then
+    log "Leaving unverified automatic-deployment service untouched: $service_path" >&2
+    return 0
+  fi
+  if [[ -e "$timer_path" ]] &&
+    { ! grep -Fqx "Description=Check managed repositories for deployment updates" "$timer_path" ||
+      ! grep -Fqx "Unit=cockpit-app-manager-auto-deploy.service" "$timer_path"; }; then
+    log "Leaving unverified automatic-deployment timer untouched: $timer_path" >&2
+    return 0
+  fi
+  if [[ ! -e "$service_path" && ! -e "$timer_path" ]]; then
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 ||
+    fail "systemctl is required to safely remove automatic-deployment units."
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: systemctl disable --now cockpit-app-manager-auto-deploy.timer"
+    log "DRY-RUN: systemctl stop cockpit-app-manager-auto-deploy.service"
+    [[ -e "$timer_path" ]] && log "DRY-RUN: remove $timer_path"
+    [[ -e "$service_path" ]] && log "DRY-RUN: remove $service_path"
+    log "DRY-RUN: systemctl daemon-reload"
+    return 0
+  fi
+  systemctl disable --now cockpit-app-manager-auto-deploy.timer >/dev/null 2>&1 || true
+  systemctl stop cockpit-app-manager-auto-deploy.service >/dev/null 2>&1 || true
+  rm -f -- "$timer_path" "$service_path"
+  systemctl daemon-reload || fail "Could not reload systemd after removing automatic-deployment units."
+}
+
 if [[ $# -gt 0 ]]; then
   for arg in "$@"; do
     case "$arg" in
@@ -393,6 +436,7 @@ if [[ "$REMOVE_MANAGED_DATA" -eq 1 ]]; then
   log 'Finished App Manager data removal.'
 else
   log 'Removing only App Manager-owned Cockpit and backend files; preserving app data and production releases.'
+  remove_auto_deploy_units
   remove_default_plugin_files
   log 'Finished App Manager plugin uninstallation.'
 fi

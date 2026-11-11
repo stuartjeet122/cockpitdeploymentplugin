@@ -929,6 +929,72 @@
   overflow-wrap: anywhere;
 }
 
+.am-log-line {
+  display: block;
+  min-height: 1.3em;
+}
+
+.am-log-line--error {
+  color: #ff8f87;
+}
+
+.am-log-line--success {
+  color: #8de0a0;
+}
+
+.am-log-line--info {
+  color: #8fc7ff;
+}
+
+.am-deployment-log-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 0.75rem;
+}
+
+.am-env-rows {
+  display: grid;
+  gap: 0.625rem;
+  margin-bottom: 0.75rem;
+}
+
+.am-env-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.8fr) minmax(12rem, 1.4fr) auto;
+  align-items: end;
+  gap: 0.625rem;
+}
+
+.am-env-row label {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--am-muted);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+
+.am-env-row input {
+  width: 100%;
+  min-width: 0;
+}
+
+.am-env-row--heading {
+  align-items: center;
+  margin-bottom: 0.35rem;
+}
+
+.am-env-row--heading span {
+  color: var(--am-muted);
+  font-size: 0.7rem;
+  font-weight: 750;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.am-env-row .am-button {
+  min-height: 2.5rem;
+}
+
 .am-env-tools {
   display: flex;
   flex-wrap: wrap;
@@ -942,20 +1008,6 @@
   margin-bottom: 0.4rem;
   color: var(--am-text);
   font-weight: 650;
-}
-
-.am-env-editor {
-  display: block;
-  width: 100%;
-  min-height: 16rem;
-  resize: vertical;
-  border: 1px solid var(--am-border);
-  border-radius: var(--am-radius-sm);
-  background: var(--am-surface);
-  color: var(--am-text);
-  padding: 0.875rem;
-  font: 0.85rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
-  tab-size: 2;
 }
 
 .am-visually-hidden {
@@ -1001,6 +1053,14 @@
 
   .am-app-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .am-env-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .am-env-row--heading {
+    display: none;
   }
 }
 

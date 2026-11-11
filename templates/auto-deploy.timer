@@ -1,0 +1,12 @@
+[Unit]
+# Managed by Cockpit App Manager
+Description=Check managed repositories for deployment updates
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=cockpit-app-manager-auto-deploy.service
+
+[Install]
+WantedBy=timers.target

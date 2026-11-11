@@ -7,6 +7,7 @@
     apps: [],
     deployments: [],
     busy: false,
+    deploymentMonitor: null,
   };
   const byId = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -217,6 +218,9 @@
           ? `Change pending (currently live: ${app.active_route})`
           : "Deploy to activate";
       const appInitial = String(app.name || "A").trim().charAt(0).toUpperCase() || "A";
+      const deployControl = app.status === "deploying"
+        ? `<button type="button" class="am-button am-button--primary" data-action="deployment-log" data-id="${escapeHtml(app.id)}">View deployment</button>`
+        : `<button type="button" class="am-button am-button--primary" data-action="deploy" data-id="${escapeHtml(app.id)}">Deploy</button>`;
       return `
         <article class="am-app-card">
           <header class="am-app-card__heading">
@@ -238,7 +242,7 @@
           </dl>
           <div class="am-app-actions" aria-label="Actions for ${escapeHtml(app.name)}">
             ${openControl}
-            <button type="button" class="am-button am-button--primary" data-action="deploy" data-id="${escapeHtml(app.id)}">Deploy</button>
+            ${deployControl}
             <button type="button" class="am-button" data-action="pull" data-id="${escapeHtml(app.id)}">Pull</button>
             <button type="button" class="am-button" data-action="edit" data-id="${escapeHtml(app.id)}">Edit</button>
             <button type="button" class="am-button" data-action="health" data-id="${escapeHtml(app.id)}">Health</button>
@@ -269,9 +273,8 @@
       return;
     }
     const rows = state.deployments.map((deployment) => {
-      const canRollback = deployment.status === "deployed" && deployment.release_available !== false;
-      const rollbackControl = canRollback
-        ? `<button type="button" class="am-button" data-action="rollback" data-id="${escapeHtml(deployment.app_id)}" data-release="${escapeHtml(deployment.id)}">Rollback</button>`
+      const viewControl = deployment.id
+        ? `<button type="button" class="am-button" data-action="deployment-log" data-id="${escapeHtml(deployment.app_id)}" data-deployment-id="${escapeHtml(deployment.id)}">View log</button>`
         : "";
       return `
         <tr>
@@ -281,7 +284,7 @@
           <td>${escapeHtml(deployment.build_status || "pending")}</td>
           <td>${escapeHtml(deployment.status || "pending")}</td>
           <td>${escapeHtml(deployment.error || "—")}</td>
-          <td>${rollbackControl}</td>
+          <td>${viewControl}</td>
         </tr>
       `;
     }).join("");
@@ -290,7 +293,7 @@
       <table class="table">
         <thead><tr>
           <th>Name</th><th>Date</th><th>Commit</th><th>Build status</th>
-          <th>Deployment status</th><th>Error</th><th>Actions</th>
+          <th>Deployment status</th><th>Error</th><th>Log</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -316,11 +319,6 @@
         </dl>
         <form id="settingsForm" class="am-settings-form">
           <div class="am-form-grid">
-            <div>
-              <label for="settingRetention">Release retention</label>
-              <input id="settingRetention" type="number" min="0" max="100" step="1" name="release_retention" value="${escapeHtml(config.release_retention ?? 5)}" required>
-              <small class="am-field-hint">Number of previous releases to keep.</small>
-            </div>
             <div>
               <label for="settingBuildTimeout">Build timeout (seconds)</label>
               <input id="settingBuildTimeout" type="number" min="1" max="86400" step="1" name="build_timeout_seconds" value="${escapeHtml(config.build_timeout_seconds ?? 900)}" required>
@@ -363,6 +361,7 @@
       renderDeployments(deployments);
       renderSettings(settings);
       updateConnection("connected", `${state.apps.length} ${state.apps.length === 1 ? "application" : "applications"}`);
+      resumeActiveDeployment();
     } catch (error) {
       updateConnection("error", "Could not load data");
       throw error;
@@ -502,25 +501,109 @@
     });
   }
 
+  function parseEnvironmentContent(content) {
+    const rows = [];
+    const seen = new Set();
+    for (const [index, rawLine] of String(content || "").split(/\r?\n/).entries()) {
+      let line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      if (line.startsWith("export ")) line = line.slice(7).trimStart();
+      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (!match) throw new Error(`Invalid environment assignment on line ${index + 1}.`);
+      const key = match[1];
+      let value = match[2].trim();
+      if (seen.has(key)) throw new Error(`Duplicate environment key "${key}".`);
+      seen.add(key);
+      if (value.startsWith('"') || value.startsWith("'")) {
+        const quote = value[0];
+        let closingQuote = -1;
+        let escaped = false;
+        for (let position = 1; position < value.length; position += 1) {
+          if (quote === '"' && value[position] === "\\" && !escaped) {
+            escaped = true;
+            continue;
+          }
+          if (value[position] === quote && !escaped) {
+            closingQuote = position;
+            break;
+          }
+          escaped = false;
+        }
+        const suffix = closingQuote >= 0 ? value.slice(closingQuote + 1).trim() : "";
+        if (closingQuote < 0 || (suffix && !suffix.startsWith("#"))) {
+          throw new Error(`Unclosed quoted value on line ${index + 1}.`);
+        }
+        value = value.slice(1, closingQuote);
+        if (quote === '"') {
+          value = value.replace(/\\(["\\$`])/g, "$1");
+        }
+      } else {
+        value = value.replace(/\s+#.*$/, "").trim();
+      }
+      rows.push({ key, value });
+    }
+    return rows;
+  }
+
+  function environmentMarkup(rows) {
+    return rows.map(({ key, value }) => `
+      <div class="am-env-row">
+        <label>Key<input type="text" data-env-key value="${escapeHtml(key)}" autocomplete="off" spellcheck="false" placeholder="VARIABLE_NAME"></label>
+        <label>Value<input type="text" data-env-value value="${escapeHtml(value)}" autocomplete="off" spellcheck="false" placeholder="Value"></label>
+        <button type="button" class="am-button am-button--danger" data-env-remove aria-label="Remove environment variable ${escapeHtml(key || "row")}">Remove</button>
+      </div>
+    `).join("");
+  }
+
+  function readEnvironmentRows(container) {
+    const rows = [];
+    const seen = new Set();
+    for (const row of container.querySelectorAll(".am-env-row")) {
+      const key = row.querySelector("[data-env-key]").value.trim();
+      const value = row.querySelector("[data-env-value]").value;
+      if (!key && !value) continue;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        throw new Error(`"${key || "Blank"}" is not a valid environment variable name.`);
+      }
+      if (seen.has(key)) throw new Error(`Environment variable "${key}" is duplicated.`);
+      seen.add(key);
+      rows.push({ key, value });
+    }
+    return rows;
+  }
+
+  function serializeEnvironmentRows(rows) {
+    return rows.map(({ key, value }) => {
+      const escaped = value
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"')
+        .replace(/\$/g, "\\$")
+        .replace(/`/g, "\\`");
+      return `${key}="${escaped}"`;
+    }).join("\n") + (rows.length ? "\n" : "");
+  }
+
   async function manageEnvironment(app) {
     const result = await callBackend("env-get", [app.id]);
     const body = `
-      <p class="am-dialog-intro">Manage private runtime variables for ${escapeHtml(app.name)}. Secrets are stored outside the source checkout and are not included in deployments.</p>
+      <p class="am-dialog-intro">Manage private runtime variables for ${escapeHtml(app.name)}. Values are stored outside the source checkout.</p>
       <div class="am-env-tools">
-        <label class="am-button" for="environmentImport">Import .env file</label>
-        <input id="environmentImport" class="am-visually-hidden" type="file" accept=".env,text/plain">
+        <label class="am-button" for="environmentImport">Import .env or text file</label>
+        <input id="environmentImport" class="am-visually-hidden" type="file" accept=".env,.env.*,.txt,text/plain">
+        <button type="button" class="am-button" data-env-add>Add variable</button>
         <button type="button" class="am-button" data-env-export>Export .env</button>
       </div>
-      <label class="am-env-label" for="environmentContent">Environment variables</label>
-      <textarea id="environmentContent" class="am-env-editor" name="environment_content" rows="16" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="DATABASE_URL=…&#10;API_KEY=…">${escapeHtml(result.content || "")}</textarea>
-      <small class="am-field-hint">Use KEY=value assignments, one per line. Values are applied when the application next starts or deploys. Maximum size: 64 KiB.</small>
+      <div class="am-env-row am-env-row--heading" aria-hidden="true"><span>Key</span><span>Value</span><span></span></div>
+      <div id="environmentRows" class="am-env-rows">${environmentMarkup(parseEnvironmentContent(result.content || ""))}</div>
+      <small class="am-field-hint">Import files with one KEY=value assignment per line. Values are applied when the application next starts or deploys. Maximum size: 64 KiB.</small>
     `;
-    openDialog(`Environment: ${app.name}`, body, "Save .env", async (form) => {
-      const content = form.elements.namedItem("environment_content").value;
+    openDialog(`Environment: ${app.name}`, body, "Save variables", async (form) => {
+      const rows = readEnvironmentRows(form.querySelector("#environmentRows"));
+      const content = serializeEnvironmentRows(rows);
       if (new TextEncoder().encode(content).length > 64 * 1024) {
-        throw new Error("The .env file must be no larger than 64 KiB.");
+        throw new Error("The environment file must be no larger than 64 KiB.");
       }
-      const saved = await runOperation(
+      return runOperation(
         async () => {
           const response = await callBackendInput("env-save", [app.id], content);
           showNotice(
@@ -529,34 +612,47 @@
         },
         "",
       );
-      return saved;
     });
 
     const dialog = byId("appManagerDialog");
+    const container = byId("environmentRows");
     const importInput = byId("environmentImport");
-    const editor = byId("environmentContent");
+    const addRow = (key = "", value = "") => {
+      container.insertAdjacentHTML("beforeend", environmentMarkup([{ key, value }]));
+      container.lastElementChild.querySelector("[data-env-key]").focus();
+    };
+    dialog.querySelector("[data-env-add]").addEventListener("click", () => addRow());
+    container.addEventListener("click", (event) => {
+      const removeButton = event.target instanceof Element ? event.target.closest("[data-env-remove]") : null;
+      if (removeButton) removeButton.closest(".am-env-row").remove();
+    });
     importInput.addEventListener("change", async () => {
       const file = importInput.files && importInput.files[0];
       if (!file) return;
       if (file.size > 64 * 1024) {
-        showError(new Error("The selected .env file is larger than 64 KiB."));
+        showError(new Error("The selected environment file is larger than 64 KiB."));
         importInput.value = "";
         return;
       }
       try {
-        editor.value = await file.text();
+        container.innerHTML = environmentMarkup(parseEnvironmentContent(await file.text()));
       } catch (error) {
-        showError(new Error(`Could not read the selected .env file: ${error.message}`));
+        showError(new Error(`Could not import the selected file: ${error.message}`));
       }
     });
     dialog.querySelector("[data-env-export]").addEventListener("click", () => {
-      const file = new Blob([editor.value], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(file);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = ".env";
-      link.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      try {
+        const content = serializeEnvironmentRows(readEnvironmentRows(container));
+        const file = new Blob([content], { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(file);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = ".env";
+        link.click();
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      } catch (error) {
+        showError(error);
+      }
     });
   }
 
@@ -571,29 +667,59 @@
     const output = byId("deploymentLiveLog");
     const status = byId("deploymentLiveStatus");
     if (!output || !status) return;
-    output.textContent = result.logs || "Waiting for deployment output…";
+    const text = result.logs || "Waiting for deployment output…";
+    output.innerHTML = text.split("\n").map((line) => {
+      const level = /^\[stderr\]/i.test(line) || /\b(error|failed|failure|aborted)\b/i.test(line)
+        ? "error"
+        : /\b(success|completed|deployed)\b/i.test(line)
+          ? "success"
+          : /^\[stdout\]/i.test(line)
+            ? "output"
+            : "info";
+      return `<span class="am-log-line am-log-line--${level}">${escapeHtml(line)}</span>`;
+    }).join("\n");
     output.scrollTop = output.scrollHeight;
-    status.textContent = result.active
-      ? "Deployment in progress"
-      : result.status === "deployed"
-        ? "Deployment complete"
-        : result.status === "failed"
-          ? "Deployment failed"
-          : "Preparing deployment";
+    if (result.active) {
+      status.textContent = result.abortable === false
+        ? "Finalizing deployment"
+        : "Deployment in progress";
+    } else {
+      const finalStatuses = {
+        deployed: "Deployment complete",
+        failed: "Deployment failed",
+        aborted: "Deployment aborted",
+      };
+      status.textContent = finalStatuses[result.status] || "Preparing deployment";
+    }
+    const abortButton = byId("abortDeploymentButton");
+    if (abortButton) {
+      abortButton.hidden = !result.active || result.abortable === false;
+      abortButton.disabled = result.aborting === true;
+      abortButton.textContent = result.aborting ? "Aborting…" : "Abort deployment";
+      abortButton.dataset.deploymentId = result.deployment_id || "";
+      abortButton.dataset.appId = result.app_id || "";
+    }
   }
 
-  async function deployWithLiveLog(appId) {
+  function openDeploymentLogDialog(appId) {
     openDialog(
       "Live deployment log",
       `<p id="deploymentLiveStatus" class="am-dialog-intro" role="status" aria-live="polite">Starting deployment…</p>
+       <div class="am-deployment-log-actions"><button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort deployment</button></div>
        <pre id="deploymentLiveLog" class="am-log-output" aria-live="polite">Waiting for deployment output…</pre>`,
     );
-    let finished = false;
-    const deploymentPromise = callBackend("deploy", [appId]);
-    const pollPromise = (async () => {
-      while (!finished) {
+  }
+
+  async function monitorDeployment(appId, deploymentId) {
+    if (state.deploymentMonitor?.deploymentId === deploymentId) return state.deploymentMonitor.promise;
+    const monitor = { appId, deploymentId, promise: null };
+    state.deploymentMonitor = monitor;
+    monitor.promise = (async () => {
+      while (state.deploymentMonitor === monitor) {
         try {
-          renderDeploymentLog(await callBackend("deployment-logs", [appId]));
+          const result = await callBackend("deployment-logs", [appId, deploymentId]);
+          renderDeploymentLog(result);
+          if (!result.active) break;
         } catch (error) {
           const output = byId("deploymentLiveLog");
           if (output) {
@@ -601,22 +727,45 @@
             output.scrollTop = output.scrollHeight;
           }
         }
-        if (!finished) await new Promise((resolve) => window.setTimeout(resolve, 750));
+        await new Promise((resolve) => window.setTimeout(resolve, 750));
       }
+      if (state.deploymentMonitor === monitor) state.deploymentMonitor = null;
+      void refreshData().catch(showError);
     })();
-    try {
-      const deploymentResult = await deploymentPromise;
-      return deploymentResult;
-    } finally {
-      finished = true;
-      await pollPromise;
-      try {
-        renderDeploymentLog(await callBackend("deployment-logs", [appId]));
-      } catch (error) {
-        const output = byId("deploymentLiveLog");
-        if (output) output.textContent += `\nFinal log refresh failed: ${error.message}`;
-      }
+    return monitor.promise;
+  }
+
+  async function deployWithLiveLog(appId) {
+    openDeploymentLogDialog(appId);
+    const started = await callBackend("deployment-start", [appId]);
+    if (!started.deployment_id) throw new Error("The backend did not return a deployment identifier.");
+    renderDeploymentLog({
+      app_id: appId,
+      deployment_id: started.deployment_id,
+      active: true,
+      status: "deploying",
+      logs: "Deployment queued",
+    });
+    void monitorDeployment(appId, started.deployment_id);
+  }
+
+  async function viewDeploymentLog(appId, deploymentId) {
+    const args = deploymentId ? [appId, deploymentId] : [appId];
+    const result = await callBackend("deployment-logs", args);
+    if (!result.deployment_id) {
+      throw new Error("No deployment log is available for this application.");
     }
+    openDeploymentLogDialog(appId);
+    renderDeploymentLog(result);
+    if (result.active) void monitorDeployment(appId, result.deployment_id);
+  }
+
+  function resumeActiveDeployment() {
+    if (state.deploymentMonitor || byId("appManagerDialog").open) return;
+    const active = state.deployments.find((deployment) => deployment.status === "deploying");
+    if (!active) return;
+    openDeploymentLogDialog(active.app_id);
+    void monitorDeployment(active.app_id, active.id);
   }
 
   function showPluginUpdate(result) {
@@ -654,7 +803,7 @@
     }, "", false);
   }
 
-  async function handleAppAction(action, appId) {
+  async function handleAppAction(action, appId, deploymentId) {
     const app = state.apps.find((item) => item.id === appId);
     if (!app) {
       showError(new Error("Application is no longer in the list. Refresh and try again."));
@@ -666,6 +815,14 @@
     }
     if (action === "logs") {
       showLogs(appId);
+      return;
+    }
+    if (action === "deployment-log") {
+      try {
+        await viewDeploymentLog(appId, deploymentId);
+      } catch (error) {
+        showError(error);
+      }
       return;
     }
     if (action === "environment") {
@@ -696,12 +853,10 @@
     };
     if (confirmations[action] && !window.confirm(confirmations[action])) return;
     if (action === "deploy") {
-      let deploymentResult;
-      const completed = await runOperation(async () => {
-        deploymentResult = await deployWithLiveLog(appId);
-      }, "");
-      if (completed) {
-        showNotice(deploymentResult?.hosting?.message || "Deployment completed.");
+      try {
+        await deployWithLiveLog(appId);
+      } catch (error) {
+        showError(error);
       }
       return;
     }
@@ -715,21 +870,6 @@
     await runOperation(
       () => callBackend(action, [appId]),
       labels[action] || `${action} completed.`,
-    );
-  }
-
-  function handleRollback(button) {
-    const appId = button.dataset.id;
-    const releaseId = button.dataset.release;
-    const deployment = state.deployments.find((item) => item.app_id === appId && item.id === releaseId);
-    if (!deployment) {
-      showError(new Error("That release is no longer available. Refresh and try again."));
-      return;
-    }
-    if (!window.confirm(`Roll back to release ${releaseId} for "${deployment.name}"?`)) return;
-    void runOperation(
-      () => callBackend("rollback", [appId, releaseId]),
-      `Rolled back "${deployment.name}" to ${releaseId}.`,
     );
   }
 
@@ -775,13 +915,26 @@
   byId("checkUpdateButton").addEventListener("click", checkPluginUpdates);
   byId("appsTableContainer").addEventListener("click", (event) => {
     const button = event.target instanceof Element ? event.target.closest("button[data-action]") : null;
-    if (button) void handleAppAction(button.dataset.action, button.dataset.id).catch(showError);
+    if (button) void handleAppAction(button.dataset.action, button.dataset.id, button.dataset.deploymentId).catch(showError);
   });
   byId("deploymentHistory").addEventListener("click", (event) => {
-    const button = event.target instanceof Element ? event.target.closest('button[data-action="rollback"]') : null;
-    if (button) handleRollback(button);
+    const button = event.target instanceof Element ? event.target.closest('button[data-action="deployment-log"]') : null;
+    if (button) void viewDeploymentLog(button.dataset.id, button.dataset.deploymentId).catch(showError);
   });
   byId("appManagerDialog").addEventListener("click", (event) => {
+    const abortButton = event.target instanceof Element ? event.target.closest('[data-action="abort-deployment"]') : null;
+    if (abortButton) {
+      abortButton.disabled = true;
+      abortButton.textContent = "Aborting…";
+      void callBackend("deployment-abort", [
+        abortButton.dataset.appId,
+        abortButton.dataset.deploymentId,
+      ]).catch((error) => {
+        abortButton.disabled = false;
+        abortButton.textContent = "Abort deployment";
+        showError(error);
+      });
+    }
     if (event.target === event.currentTarget) event.currentTarget.close();
   });
   bindTabs();

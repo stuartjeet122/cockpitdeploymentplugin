@@ -15,7 +15,7 @@
     "/var/lib/cockpit/app-manager/sources"
   ],
   "default_branch": "main",
-  "release_retention": 5,
+  "release_retention": 1,
   "build_timeout_seconds": 900,
   "health_timeout_seconds": 30,
   "command_timeout_seconds": 30,

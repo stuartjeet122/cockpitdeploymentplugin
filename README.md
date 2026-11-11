@@ -2,7 +2,9 @@
 
 App Manager is a Cockpit navigation plugin with a Python command-line backend for registering and operating multiple web applications on an Ubuntu host.
 
-The Cockpit interface provides application registration and editing, deployment and repository updates, service controls, health checks, private per-application `.env` management with import/export, logs, deployment history with per-release rollback, and deployment settings. Deployments stream their build output into a live log dialog and retain the latest release log in the application's Logs view. Removing an application unregisters it and stops its service; source and release files are retained.
+The Cockpit interface provides application registration and editing, deployment and repository updates, service controls, health checks, per-variable private `.env` management with import/export, logs, and deployment settings. Only the current release and latest deployment record are kept. Deployments run independently of the browser session, so the live, color-coded log can be reopened after a refresh; an active deployment can be aborted from the log dialog.
+
+The installer enables a systemd timer that checks each repository branch for applications that have been deployed at least once, then deploys new commits using the same fast-forward-only Git update safety. Deploy an application once manually to establish its initial release; subsequent repository updates deploy automatically every five minutes. The timer runs on the host and does not depend on the Cockpit page being open.
 
 The header's **Check for updates** action checks the fixed upstream GitHub `main` branch. If a newer revision is available, an explicit **Pull and reinstall** confirmation downloads the source as the unprivileged `nobody` account and invokes the project's installer as root. The updater does not modify managed application data or host website configuration.
 
@@ -18,9 +20,9 @@ The installer requires Ubuntu, root privileges, Python 3.9 or newer, systemd, an
 
 The UI requests Cockpit's required superuser mode when launching the backend. The user must be authorized for Cockpit privilege escalation by the host's existing polkit/Cockpit policy; the installer does not grant extra users system-wide privileges. Registry and runtime configuration files are mode `0600`; state/source parent directories are not listable by application accounts.
 
-The backend stores its registry at `/var/lib/cockpit/app-manager/apps.json` and configuration at `/var/lib/cockpit/app-manager/config.json`. Registry/configuration JSON is atomically replaced and protected by file locks. App environment files are stored outside source and release trees at `/var/lib/cockpit/app-manager/environment/<app-id>.env`, owned by root and readable only by that application's service group. Values are applied by systemd when the application starts; restart or redeploy after editing.
+The backend stores its registry at `/var/lib/cockpit/app-manager/apps.json` and configuration at `/var/lib/cockpit/app-manager/config.json`. Registry/configuration JSON is atomically replaced and protected by file locks. App environment files are stored outside source and release trees at `/var/lib/cockpit/app-manager/environment/<app-id>.env`, owned by root and readable only by that application's service group. The UI shows one key/value row per variable and imports `.env`, `.env.*`, or text files with one assignment per line. Values are applied by systemd when the application starts; restart or redeploy after editing.
 
-Each application has a configurable single-prefix route such as `/shop/`. When Deploy is clicked, App Manager writes its Nginx snippet to `/etc/nginx/snippets/cockpit-app-manager/<app-id>.conf` and adds a marked include to the unique HTTPS `server` block whose `server_name` exactly matches `stuserver.online`. It selects the block from `nginx -T`, saves a private pre-change backup under `/var/lib/cockpit/app-manager/nginx-backups`, runs `nginx -t`, verifies the generated snippet is loaded, and reloads Nginx. If the matching server block is missing or ambiguous, or validation/reload fails, deployment reports the error and restores the edited configuration and snippet. No other virtual host or root-site directives are changed. The public URL and Open action are withheld until route activation succeeds.
+Each application has a configurable single-prefix route such as `/shop/`. When a manual or automatic deployment starts, App Manager writes its Nginx snippet to `/etc/nginx/snippets/cockpit-app-manager/<app-id>.conf` and adds a marked include to the unique HTTPS `server` block whose `server_name` exactly matches `stuserver.online`. It selects the block from `nginx -T`, saves a private pre-change backup under `/var/lib/cockpit/app-manager/nginx-backups`, runs `nginx -t`, verifies the generated snippet is loaded, and reloads Nginx. If the matching server block is missing or ambiguous, or validation/reload fails, deployment reports the error and restores the edited configuration and snippet. No other virtual host or root-site directives are changed. The public URL and Open action are withheld until route activation succeeds.
 
 ```nginx
 include /etc/nginx/snippets/cockpit-app-manager/*.conf;
@@ -58,18 +60,20 @@ The executable returns one JSON object on stdout for successful and failed opera
 
 ```text
 list | overview | add <json> | edit <app-id> <json>
-deploy <app-id> | pull <app-id>
+deploy <app-id> | deployment-start <app-id> | deployment-abort <app-id> <deployment-id>
+deployment-logs <app-id> [deployment-id] | auto-deploy
+pull <app-id>
 start <app-id> | stop <app-id> | restart <app-id>
 logs <app-id> [--lines N] | health <app-id>
 env-get <app-id> | env-save <app-id>  # env-save reads content from stdin
-remove <app-id> | rollback <app-id> [release-id]
+remove <app-id>
 deployments | settings [<json>]
 action <action> <app-id>
 ```
 
 Project conventions and deployment requirements are documented in `AGENTS.md` and must be followed for all future changes.
 
-`action` supports the operations used by the Cockpit UI: `open`, `deploy`, `pull`, `start`, `stop`, `restart`, `logs`, `remove`, `health`, and `rollback`.
+`action` supports the operations used by the Cockpit UI: `open`, `deploy`, `pull`, `start`, `stop`, `restart`, `logs`, `remove`, and `health`.
 
 ## Deployment and safety
 
@@ -77,7 +81,7 @@ Project conventions and deployment requirements are documented in `AGENTS.md` an
 - Git remotes must use HTTPS or SSH. Updates reject local changes and branch changes, fetch the selected branch, and only merge with `--ff-only`.
 - Each app uses a dedicated system account named `app-<app-id>`. Git operations, dependency installation, and build commands run as that account, never as root. The generated systemd service also uses that account and binds framework defaults to loopback where the framework supports it.
 - Generated systemd services drop all capabilities and enable filesystem, device, kernel, namespace/personality, and privilege-escalation hardening. Release files are root-owned and read-only; static release content is readable by Nginx. Service writes are limited to that app's private home, config, and log paths. App ports are unprivileged, so `CAP_NET_BIND_SERVICE` is not granted.
-- Source trees, releases, application configuration, and logs use app-specific paths. Environment secrets are atomically saved outside source checkouts in root-owned files with app-group-only read access. Deployment history and retained releases support rollback.
+- Source trees, releases, application configuration, and logs use app-specific paths. Environment secrets are atomically saved outside source checkouts in root-owned files with app-group-only read access. Only the latest deployment record and current release are retained.
 - The backend never edits an existing Nginx server configuration or Cloudflare Tunnel configuration. It generates an exact route redirect (`/app` to `/app/`) and one owned location snippet per application. Next.js receives `APP_BASE_PATH` during build and at runtime; configure `next.config` to use the same path for `basePath`, including API routes and `/_next/` assets. Go, Node.js, and Python proxy routes strip the prefix upstream and send `X-Forwarded-Prefix` plus `APP_BASE_PATH` so application routers and generated URLs can honor it. Static routes serve assets from the release tree directly and fall back to `index.html` for nested pages. WebSocket requests receive `Connection: upgrade`; ordinary HTTP requests omit the `Connection` header. This per-location handling requires no global `map`.
 - Removing an app unregisters it, removes its verified App Manager route snippet, and stops/removes its App Manager service, but intentionally retains source and release data.
 

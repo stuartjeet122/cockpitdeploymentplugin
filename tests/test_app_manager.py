@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -180,9 +181,11 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(stored["name"], "Updated Demo")
 
     def test_settings_update_persists_valid_config(self):
-        result = manager.update_settings({"release_retention": 9, "health_timeout_seconds": 45})
-        self.assertEqual(result["config"]["release_retention"], 9)
+        result = manager.update_settings({"release_retention": 1, "health_timeout_seconds": 45})
+        self.assertEqual(result["config"]["release_retention"], 1)
         self.assertEqual(result["config"]["health_timeout_seconds"], 45)
+        with self.assertRaisesRegex(ValueError, "retains only the current deployment"):
+            manager.update_settings({"release_retention": 2})
 
     def test_environment_file_normalizes_supported_dotenv_values(self):
         normalized = manager._parse_environment_file(
@@ -555,6 +558,126 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(result["status"], "deploying")
         self.assertIn("Build started", result["logs"])
         self.assertIn("Build started", manager.logs_app(app["id"])["logs"])
+
+    def test_deployment_records_and_releases_keep_only_the_current_version(self):
+        app = self.add_app()["app"]
+        record = {"id": "20261109220923-abcdef12", "status": "deployed", "date": "2026-11-09"}
+        manager._record_deployment(app, record)
+        manager._record_deployment(app, {"id": "20261110220923-abcdef12", "status": "deploying"})
+        self.assertEqual(len(app["deployments"]), 1)
+        self.assertEqual(app["deployments"][0]["status"], "deploying")
+
+        releases = Path(app["production_path"]) / "releases"
+        old_release = releases / "20261109220923-abcdef12"
+        current_release = releases / "20261110220923-abcdef12"
+        old_release.mkdir(parents=True)
+        current_release.mkdir()
+        try:
+            (Path(app["production_path"]) / "current").symlink_to(current_release)
+        except OSError:
+            self.skipTest("Symlink creation is not permitted on this host")
+        manager._prune_releases(app)
+        self.assertFalse(old_release.exists())
+        self.assertTrue(current_release.exists())
+
+    def test_deployment_api_exposes_only_the_latest_record(self):
+        app = self.add_app()["app"]
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored["deployments"] = [
+                {"id": "20261108220923-abcdef12", "date": "2026-11-08"},
+                {"id": "20261109220923-abcdef12", "date": "2026-11-09"},
+            ]
+        deployments = manager.get_deployments()["deployments"]
+        self.assertEqual(len(deployments), 1)
+        self.assertEqual(deployments[0]["id"], "20261109220923-abcdef12")
+
+    def test_deployment_log_pruning_keeps_only_the_current_attempt(self):
+        app_id = "demo"
+        previous_id = "20261108220923-abcdef12"
+        current_id = "20261109220923-abcdef12"
+        previous_log = manager._deployment_log_path(app_id, previous_id, create=True)
+        manager._append_deployment_log(previous_log, "previous")
+        current_log = manager._deployment_log_path(app_id, current_id, create=True)
+        manager._prune_deployment_logs(app_id, current_id)
+        self.assertFalse(previous_log.exists())
+        self.assertTrue(current_log.exists())
+
+    def test_abort_marks_active_deployment_and_exposes_aborting_status(self):
+        app = self.add_app()["app"]
+        deployment_id = "20261109220923-abcdef12"
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            manager._record_deployment(stored, {
+                "id": deployment_id,
+                "name": app["name"],
+                "date": "2026-11-09T22:09:23Z",
+                "status": "deploying",
+            })
+        log_path = manager._deployment_log_path(app["id"], deployment_id, create=True)
+        with patch.object(manager, "_require_root"):
+            result = manager.abort_deployment_app(app["id"], deployment_id)
+        self.assertTrue(result["aborting"])
+        self.assertTrue(manager.deployment_logs_app(app["id"])["aborting"])
+        self.assertIn("Abort requested", log_path.read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(ValueError, "no longer active"):
+            with manager._registry_transaction() as registry:
+                manager._find_app(registry, app["id"])["deployments"][0]["status"] = "deployed"
+            manager.abort_deployment_app(app["id"], deployment_id)
+
+    def test_cancellable_command_terminates_its_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cancel_file = Path(temporary) / "cancel"
+            timer = threading.Timer(0.1, cancel_file.touch)
+            timer.start()
+            try:
+                with self.assertRaisesRegex(manager.DeploymentAborted, "aborted by request"):
+                    manager.run_command(
+                        [manager.sys.executable, "-c", "import time; time.sleep(30)"],
+                        timeout=10,
+                        cancel_file=cancel_file,
+                    )
+            finally:
+                timer.cancel()
+
+    def test_deployment_start_detaches_worker_and_returns_identifier(self):
+        app = self.add_app()["app"]
+        with patch.object(manager, "_require_root"), patch.object(
+            manager,
+            "run_command",
+            return_value=subprocess.CompletedProcess(args=["systemd-run"], returncode=0, stdout="", stderr=""),
+        ) as run:
+            result = manager.deployment_start_app(app["id"])
+        self.assertTrue(result["active"])
+        self.assertRegex(result["deployment_id"], r"^\d{14}-[a-f0-9]{8}$")
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "systemd-run")
+        self.assertIn("--property=ProtectSystem=strict", command)
+        self.assertEqual(command[-4:], ["deploy", app["id"], "--deployment-id", result["deployment_id"]])
+        stored = manager.get_registry()["apps"][0]["deployments"]
+        self.assertEqual(len(stored), 1)
+        self.assertIn(f"cockpit-app-manager-deploy-{app['id']}-{result['deployment_id']}.service", stored[0]["systemd_unit"])
+
+    def test_auto_deploy_pulls_and_deploys_only_when_commit_changes(self):
+        app = self.add_app()["app"]
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            manager._record_deployment(stored, {
+                "id": "20261109220923-abcdef12",
+                "name": app["name"],
+                "date": "2026-11-09T22:09:23Z",
+                "commit": "a" * 40,
+                "status": "deployed",
+            })
+        pulled = {"app": dict(app, latest_commit="b" * 40)}
+        deployed = {"deployment": {"commit": "b" * 40}}
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "pull_app", return_value=pulled
+        ) as pull, patch.object(manager, "deploy_app", return_value=deployed) as deploy:
+            result = manager.auto_deploy_apps()
+        self.assertEqual(result["results"][0]["status"], "deployed")
+        pull.assert_called_once_with(app["id"])
+        deploy.assert_called_once_with(app["id"])
 
     def test_plugin_update_check_compares_installed_and_remote_revisions(self):
         version_path = Path(manager.DEFAULT_PLUGIN_VERSION_PATH)
@@ -1287,26 +1410,30 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("globalThis.cockpit", frontend)
         self.assertIn("Cockpit API is unavailable.", frontend)
         self.assertIn('const BACKEND = "/usr/libexec/cockpit/app-manager/app-manager";', frontend)
-        for action in ("deploy", "pull", "edit", "health", "environment", "restart", "stop", "start", "logs", "remove", "rollback"):
+        for action in ("deploy", "pull", "edit", "health", "environment", "restart", "stop", "start", "logs", "remove"):
             self.assertIn(f'data-action="{action}"', frontend)
         for endpoint in (
             'callBackend("add", [JSON.stringify(payload)])',
             'callBackend("edit", [app.id, JSON.stringify(payload)])',
             'callBackend("logs", [appId, "--lines", "200"])',
             'callBackend("health", [appId])',
-            'callBackend("rollback", [appId, releaseId])',
             'callBackend("remove", [appId])',
             '() => callBackend(action, [appId])',
-            'callBackend("deployment-logs", [appId])',
+            'callBackend("deployment-logs", args)',
+            'callBackend("deployment-start", [appId])',
+            'callBackend("deployment-abort", [',
             'callBackend("plugin-update-check")',
             'callBackend("plugin-update")',
             'callBackend("env-get", [app.id])',
             'callBackendInput("env-save", [app.id], content)',
         ):
             self.assertIn(endpoint, frontend)
-        self.assertIn('accept=".env,text/plain"', frontend)
+        self.assertIn('accept=".env,.env.*,.txt,text/plain"', frontend)
         self.assertIn('download = ".env"', frontend)
-        self.assertIn("Maximum size: 64 KiB.", frontend)
+        self.assertIn("one KEY=value assignment per line", frontend)
+        self.assertIn("function serializeEnvironmentRows(rows)", frontend)
+        self.assertIn("data-env-remove", frontend)
+        self.assertIn("am-log-line--${level}", frontend)
         self.assertIn('id="checkUpdateButton"', html)
         self.assertIn('function deployWithLiveLog(appId)', frontend)
         self.assertIn('class="am-log-output"', frontend)
@@ -1963,6 +2090,10 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('if [[ "$BACKEND_DEST" == "/usr/libexec/cockpit" ]]', uninstaller)
         self.assertIn("dpkg --compare-versions", installer)
         self.assertIn("Python 3.9 or newer is required", installer)
+        self.assertIn('systemd-run; do', installer)
+        self.assertIn('cockpit-app-manager-auto-deploy.timer', installer)
+        self.assertIn("systemctl enable --now cockpit-app-manager-auto-deploy.timer", installer)
+        self.assertIn("remove_auto_deploy_units", uninstaller)
         self.assertIn('python3 "$BACKEND_DEST/app-manager" --help', installer)
         self.assertIn('"$STATE_ROOT/apps.json" "$STATE_ROOT/config.json"', installer)
         self.assertIn('chmod 0600 "$STATE_ROOT/apps.json" "$STATE_ROOT/config.json"', installer)

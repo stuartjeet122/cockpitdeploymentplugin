@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import stat
@@ -89,7 +90,7 @@ def _default_config() -> Dict[str, Any]:
         "registry_path": DEFAULT_REGISTRY_PATH,
         "allowed_source_dirs": ["/opt", "/home/stuserver", "/srv", DEFAULT_SOURCE_ROOT],
         "default_branch": "main",
-        "release_retention": 5,
+        "release_retention": 1,
         "build_timeout_seconds": 900,
         "health_timeout_seconds": 30,
         "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
@@ -177,6 +178,7 @@ def get_config() -> Dict[str, Any]:
         raise ValueError("Configuration must contain a JSON object")
     config = _default_config()
     config.update(loaded)
+    config["release_retention"] = 1
     # Registry location is fixed so configuration cannot redirect privileged writes.
     config["registry_path"] = DEFAULT_REGISTRY_PATH
     configured_roots = (
@@ -207,9 +209,6 @@ def get_config() -> Dict[str, Any]:
         value = config[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{key} must be a positive integer")
-    retention = config["release_retention"]
-    if isinstance(retention, bool) or not isinstance(retention, int) or retention < 0:
-        raise ValueError("release_retention must be a non-negative integer")
     return config
 
 
@@ -573,6 +572,77 @@ def _clear_expired_port_reservations(registry: Dict[str, Any]) -> None:
             del reservations[port]
 
 
+class DeploymentAborted(RuntimeError):
+    pass
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        if process.poll() is None:
+            process.wait()
+    elif process.poll() is None:  # pragma: no cover - deployment cancellation is used on Ubuntu
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def _run_cancellable_command(
+    args: Sequence[str],
+    cwd: Optional[Path],
+    timeout: int,
+    env: Optional[Dict[str, str]],
+    cancel_file: Path,
+) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        list(args),
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=os.name != "nt",
+    )
+    deadline = time.monotonic() + max(1, int(timeout))
+    while True:
+        if cancel_file.exists():
+            _terminate_process(process)
+            raise DeploymentAborted("Deployment aborted by request")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process(process)
+            stdout, stderr = process.communicate()
+            raise RuntimeError(
+                f"Command timed out after {timeout} seconds: {args[0]}"
+                + (f"\nstdout:\n{stdout.decode('utf-8', errors='replace').rstrip()}" if stdout else "")
+                + (f"\nstderr:\n{stderr.decode('utf-8', errors='replace').rstrip()}" if stderr else "")
+            )
+        try:
+            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            return subprocess.CompletedProcess(
+                list(args),
+                process.returncode,
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
+            )
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_command(
     args: Sequence[str],
     cwd: Optional[Path] = None,
@@ -580,6 +650,7 @@ def run_command(
     env: Optional[Dict[str, str]] = None,
     live_log_path: Optional[Path] = None,
     redact_values: Optional[Sequence[str]] = None,
+    cancel_file: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     if not args or not all(isinstance(arg, str) and "\0" not in arg for arg in args):
         raise ValueError("Subprocess arguments must be a non-empty list of strings")
@@ -588,7 +659,20 @@ def run_command(
             values = list(redact_values or ())
             if env:
                 values.extend(env.values())
-            return _run_command_with_live_log(args, cwd, timeout, env, live_log_path, values)
+            return _run_command_with_live_log(
+                args, cwd, timeout, env, live_log_path, values, cancel_file
+            )
+        if cancel_file is not None:
+            result = _run_cancellable_command(args, cwd, timeout, env, cancel_file)
+            values = list(redact_values or ())
+            if env:
+                values.extend(env.values())
+            return subprocess.CompletedProcess(
+                result.args,
+                result.returncode,
+                _redact_text(result.stdout or "", values),
+                _redact_text(result.stderr or "", values),
+            )
         result = subprocess.run(
             list(args),
             cwd=str(cwd) if cwd is not None else None,
@@ -633,6 +717,7 @@ def _run_command_with_live_log(
     env: Optional[Dict[str, str]],
     live_log_path: Path,
     redact_values: Optional[Sequence[str]] = None,
+    cancel_file: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     live_log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if live_log_path.is_symlink() or (live_log_path.exists() and not live_log_path.is_file()):
@@ -671,6 +756,7 @@ def _run_command_with_live_log(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         close_fds=True,
+        start_new_session=os.name != "nt",
     )
 
     def consume(channel: str, stream: Any) -> None:
@@ -732,11 +818,23 @@ def _run_command_with_live_log(
     for thread in threads:
         thread.start()
     timed_out = False
+    cancelled = False
+    deadline = time.monotonic() + max(1, int(timeout))
     try:
-        returncode = process.wait(timeout=max(1, int(timeout)))
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        process.kill()
+        while process.poll() is None:
+            if cancel_file is not None and cancel_file.exists():
+                cancelled = True
+                _terminate_process(process)
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _terminate_process(process)
+                break
+            try:
+                process.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
         returncode = process.wait()
     finally:
         for thread in threads:
@@ -759,6 +857,8 @@ def _run_command_with_live_log(
             f"Command timed out after {timeout} seconds: {args[0]}"
             + (f"\n{detail}" if detail else "")
         )
+    if cancelled:
+        raise DeploymentAborted("Deployment aborted by request")
     if reader_errors:
         raise RuntimeError(f"Could not write live deployment output: {reader_errors[0]}")
     return subprocess.CompletedProcess(list(args), returncode, stdout, stderr)
@@ -879,6 +979,7 @@ def _run_as_user(
     timeout: int = COMMAND_TIMEOUT_SECONDS,
     environment: Optional[Dict[str, str]] = None,
     live_log_path: Optional[Path] = None,
+    cancel_file: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     _require_root()
     if os.name == "nt":
@@ -901,6 +1002,7 @@ def _run_as_user(
         timeout=timeout,
         live_log_path=live_log_path,
         redact_values=list((environment or {}).values()),
+        cancel_file=cancel_file,
     )
 
 
@@ -922,13 +1024,14 @@ def _git(
     username: Optional[str],
     args: Sequence[str],
     timeout: int,
+    cancel_file: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     command = ["git", "-C", str(repo_path), *args]
     if username is None:
         if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
             raise PermissionError("Git must run as the application's unprivileged service account")
-        return run_command(command, timeout=timeout)
-    return _run_as_user(username, command, timeout=timeout)
+        return run_command(command, timeout=timeout, cancel_file=cancel_file)
+    return _run_as_user(username, command, timeout=timeout, cancel_file=cancel_file)
 
 
 def clone_or_update_repo(
@@ -937,6 +1040,7 @@ def clone_or_update_repo(
     branch: str,
     username: Optional[str] = None,
     timeout: Optional[int] = None,
+    cancel_file: Optional[Path] = None,
 ) -> Dict[str, Any]:
     if not validate_git_url(repo_url):
         raise ValueError("Repository URL must be a valid HTTPS or SSH Git remote")
@@ -951,19 +1055,19 @@ def clone_or_update_repo(
     if repo_path.exists() and not (repo_path.is_dir() and not any(repo_path.iterdir())):
         if not repo_path.is_dir():
             raise ValueError("Repository path exists and is not a directory")
-        top_level = _git(repo_path, username, ["rev-parse", "--show-toplevel"], command_timeout)
+        top_level = _git(repo_path, username, ["rev-parse", "--show-toplevel"], command_timeout, cancel_file)
         _command_error(top_level, "Checking the source repository")
         if _resolved_path(Path(top_level.stdout.strip())) != repo_path:
             raise ValueError("Source path is not the root of its Git repository")
-        status = _git(repo_path, username, ["status", "--porcelain", "--untracked-files=all"], command_timeout)
+        status = _git(repo_path, username, ["status", "--porcelain", "--untracked-files=all"], command_timeout, cancel_file)
         _command_error(status, "Checking source changes")
         if status.stdout.strip():
             raise RuntimeError("Repository has local changes; refusing to update it")
-        remote = _git(repo_path, username, ["remote", "get-url", "origin"], command_timeout)
+        remote = _git(repo_path, username, ["remote", "get-url", "origin"], command_timeout, cancel_file)
         _command_error(remote, "Checking the source remote")
         if remote.stdout.strip() != repo_url:
             raise RuntimeError("Repository origin differs from the configured Git URL; refusing to change it")
-        current_branch = _git(repo_path, username, ["symbolic-ref", "--short", "HEAD"], command_timeout)
+        current_branch = _git(repo_path, username, ["symbolic-ref", "--short", "HEAD"], command_timeout, cancel_file)
         _command_error(current_branch, "Checking the current Git branch")
         if current_branch.stdout.strip() != branch:
             raise RuntimeError(
@@ -974,9 +1078,10 @@ def clone_or_update_repo(
             username,
             ["fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
             command_timeout,
+            cancel_file,
         )
         _command_error(fetch, "Fetching Git updates")
-        merge = _git(repo_path, username, ["merge", "--ff-only", f"refs/remotes/origin/{branch}"], command_timeout)
+        merge = _git(repo_path, username, ["merge", "--ff-only", f"refs/remotes/origin/{branch}"], command_timeout, cancel_file)
         _command_error(merge, "Fast-forwarding the source repository")
         return {"status": "updated", "branch": branch, "commit": git_output(repo_path, "rev-parse", "HEAD", username=username, timeout=command_timeout)}
 
@@ -991,9 +1096,9 @@ def clone_or_update_repo(
         if username is None:
             if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
                 raise PermissionError("Git must run as the application's unprivileged service account")
-            result = run_command(clone_args, timeout=command_timeout)
+            result = run_command(clone_args, timeout=command_timeout, cancel_file=cancel_file)
         else:
-            result = _run_as_user(username, clone_args, timeout=command_timeout)
+            result = _run_as_user(username, clone_args, timeout=command_timeout, cancel_file=cancel_file)
     except Exception:
         shutil.rmtree(repo_path, ignore_errors=True)
         raise
@@ -1451,7 +1556,8 @@ def overview() -> Dict[str, Any]:
 def get_deployments() -> Dict[str, Any]:
     deployments = []
     for app in get_registry()["apps"]:
-        deployments.extend(dict(item, app_id=app["id"]) for item in app.get("deployments", []))
+        latest = app.get("deployments", [])[-1:] if app.get("deployments") else []
+        deployments.extend(dict(item, app_id=app["id"]) for item in latest)
     return {"deployments": sorted(deployments, key=lambda item: item.get("date", ""), reverse=True)}
 
 
@@ -1654,6 +1760,11 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         ):
             raise ValueError("Configured port range must stay within 8100-8999")
         update["port_range"] = {"start": start, "end": end, "reserved": sorted(set(RESERVED_PORTS) | set(port_range.get("reserved", [])))}
+    if "release_retention" in update:
+        retention = update["release_retention"]
+        if isinstance(retention, bool) or not isinstance(retention, int) or retention != 1:
+            raise ValueError("App Manager retains only the current deployment release")
+        update.pop("release_retention")
     merged = config.copy()
     merged.update(update)
     path = Path(DEFAULT_CONFIG_PATH)
@@ -2366,19 +2477,18 @@ def _release_command_path(command: Sequence[str], release_dir: Path, current_pat
 
 
 def _record_deployment(app: Dict[str, Any], record: Dict[str, Any]) -> None:
-    app.setdefault("deployments", []).append(record)
+    app["deployments"] = [dict(record)]
     app["updated_at"] = now_iso()
 
 
-def _prune_releases(app: Dict[str, Any], keep_count: int) -> None:
+def _prune_releases(app: Dict[str, Any]) -> None:
     production = Path(app["production_path"])
     releases_dir = production / "releases"
     if not releases_dir.exists():
         return
     releases = sorted((path for path in releases_dir.iterdir() if path.is_dir()), key=lambda path: path.name)
     current = (production / "current").resolve(strict=False)
-    retained = set(releases[-max(0, keep_count):]) if keep_count else set()
-    retained.add(current)
+    retained = {current} if current.exists() else set()
     for release in releases:
         if release not in retained:
             shutil.rmtree(release)
@@ -2416,6 +2526,31 @@ def _deployment_log_path(app_id: str, deployment_id: str, *, create: bool = Fals
         finally:
             os.close(descriptor)
     return path
+
+
+def _deployment_cancel_path(app_id: str, deployment_id: str) -> Path:
+    _deployment_log_path(app_id, deployment_id)
+    return Path(DEFAULT_STATE_ROOT) / "deployment-logs" / f"{app_id}-{deployment_id}.cancel"
+
+
+def _prune_deployment_logs(app_id: str, keep_deployment_id: str) -> None:
+    app_id = validate_app_id(app_id)
+    _deployment_log_path(app_id, keep_deployment_id)
+    log_root = Path(DEFAULT_STATE_ROOT) / "deployment-logs"
+    prefix = f"{app_id}-"
+    pattern = re.compile(r"^" + re.escape(prefix) + r"(\d{14}-[a-f0-9]{8})(?:\.log|\.cancel)$")
+    for path in log_root.iterdir():
+        match = pattern.fullmatch(path.name)
+        if match is None or match.group(1) == keep_deployment_id:
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Refusing to remove non-regular deployment log entry: {path.name}")
+        path.unlink()
+
+
+def _raise_if_deployment_cancelled(cancel_file: Path) -> None:
+    if cancel_file.exists():
+        raise DeploymentAborted("Deployment aborted by request")
 
 
 def _append_deployment_log(path: Path, message: str) -> None:
@@ -2496,31 +2631,197 @@ def pull_app(app_id: str) -> Dict[str, Any]:
         return {"ok": True, "result": result, "app": app}
 
 
-def deploy_app(app_id: str) -> Dict[str, Any]:
+def auto_deploy_apps() -> Dict[str, Any]:
+    _require_root()
+    app_ids = [app["id"] for app in get_registry()["apps"]]
+    outcomes = []
+    errors = []
+    for app_id in app_ids:
+        try:
+            app = _find_app(get_registry(), app_id)
+            latest = app.get("deployments", [])[-1] if app.get("deployments") else None
+            if isinstance(latest, dict) and latest.get("status") == "deploying":
+                outcomes.append({"app_id": app_id, "status": "deployment-in-progress"})
+                continue
+            if latest is None:
+                outcomes.append({"app_id": app_id, "status": "awaiting-first-deployment"})
+                continue
+            pulled = pull_app(app_id)
+            current = _find_app(get_registry(), app_id)
+            deployment = current.get("deployments", [])[-1] if current.get("deployments") else None
+            commit = pulled["app"].get("latest_commit")
+            if deployment is None or deployment.get("commit") != commit:
+                result = deploy_app(app_id)
+                outcomes.append({
+                    "app_id": app_id,
+                    "status": "deployed",
+                    "commit": result["deployment"].get("commit"),
+                })
+            else:
+                outcomes.append({"app_id": app_id, "status": "up-to-date", "commit": commit})
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f"{app_id}: {exc}")
+            outcomes.append({"app_id": app_id, "status": "failed", "error": str(exc)})
+    if errors:
+        raise RuntimeError("Automatic deployment errors: " + "; ".join(errors))
+    return {"ok": True, "results": outcomes}
+
+
+def deployment_start_app(app_id: str) -> Dict[str, Any]:
+    _require_root()
+    app_id = validate_app_id(app_id)
+    release_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    started_at = now_iso()
+    with _registry_transaction() as registry:
+        app = _find_app(registry, app_id)
+        current = app.get("deployments", [])[-1] if app.get("deployments") else None
+        if isinstance(current, dict) and current.get("status") == "deploying":
+            return {
+                "ok": True,
+                "app_id": app_id,
+                "deployment_id": current.get("id"),
+                "active": True,
+            }
+        record = {
+            "id": release_id,
+            "name": app["name"],
+            "date": started_at,
+            "commit": None,
+            "release": None,
+            "release_available": False,
+            "framework": app.get("framework", "auto"),
+            "build_status": "pending",
+            "status": "deploying",
+            "abortable": True,
+            "error": None,
+        }
+        app["status"] = "deploying"
+        _record_deployment(app, record)
+
+    cancel_file = _deployment_cancel_path(app_id, release_id)
+    with contextlib.suppress(FileNotFoundError):
+        cancel_file.unlink()
+    log_path = None
+    unit_name = f"cockpit-app-manager-deploy-{app_id}-{release_id}.service"
+    try:
+        log_path = _deployment_log_path(app_id, release_id, create=True)
+        _prune_deployment_logs(app_id, release_id)
+        _append_deployment_log(log_path, "Deployment queued")
+        command = [
+            "systemd-run",
+            "--quiet",
+            f"--unit={unit_name}",
+            "--collect",
+            "--property=NoNewPrivileges=true",
+            "--property=ProtectSystem=strict",
+            "--property=ProtectHome=true",
+            "--property=ProtectKernelTunables=true",
+            "--property=ProtectKernelModules=true",
+            "--property=ProtectControlGroups=true",
+            "--property=PrivateTmp=true",
+            "--property=PrivateDevices=true",
+            "--property=LockPersonality=true",
+            "--property=RestrictRealtime=true",
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "--property=CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_KILL",
+            "--property=UMask=0027",
+            f"--property=ReadWritePaths={DEFAULT_STATE_ROOT} {DEFAULT_PRODUCTION_ROOT} {DEFAULT_LOG_ROOT} /etc/systemd/system /etc/nginx /etc/passwd /etc/shadow /etc/group /etc/gshadow",
+            "--property=StandardOutput=null",
+            "--property=StandardError=journal",
+            "--",
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "deploy",
+            app_id,
+            "--deployment-id",
+            release_id,
+        ]
+        result = run_command(command, timeout=COMMAND_TIMEOUT_SECONDS)
+        _command_error(result, "Starting the detached deployment service")
+    except (OSError, RuntimeError) as exc:
+        with _registry_transaction() as registry:
+            app = _find_app(registry, app_id)
+            record = app["deployments"][0]
+            record.update({"status": "failed", "error": str(exc)})
+            app["status"] = "failed"
+        if log_path is not None:
+            _append_deployment_log(log_path, f"Could not start deployment: {exc}")
+        raise RuntimeError(f"Could not start deployment: {exc}") from exc
+    with _registry_transaction() as registry:
+        app = _find_app(registry, app_id)
+        if app["deployments"][0].get("id") == release_id:
+            app["deployments"][0]["systemd_unit"] = unit_name
+    return {
+        "ok": True,
+        "app_id": app_id,
+        "deployment_id": release_id,
+        "active": True,
+    }
+
+
+def abort_deployment_app(app_id: str, deployment_id: str) -> Dict[str, Any]:
+    _require_root()
+    app_id = validate_app_id(app_id)
+    if not isinstance(deployment_id, str) or not re.fullmatch(r"\d{14}-[a-f0-9]{8}", deployment_id):
+        raise ValueError("Invalid deployment identifier")
+    with _registry_transaction() as registry:
+        app = _find_app(registry, app_id)
+        latest = app.get("deployments", [])[-1] if app.get("deployments") else None
+        if (
+            not isinstance(latest, dict)
+            or latest.get("id") != deployment_id
+            or latest.get("status") != "deploying"
+            or latest.get("abortable", True) is False
+        ):
+            raise ValueError("That deployment is no longer active or abortable")
+        cancel_file = _deployment_cancel_path(app_id, deployment_id)
+        if not cancel_file.exists():
+            try:
+                descriptor = os.open(
+                    str(cancel_file),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            except FileExistsError:
+                pass
+            else:
+                os.close(descriptor)
+    log_path = _deployment_log_path(app_id, deployment_id)
+    _append_deployment_log(log_path, "Abort requested")
+    return {"ok": True, "app_id": app_id, "deployment_id": deployment_id, "aborting": True}
+
+
+def deploy_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, Any]:
     _require_root()
     config = get_config()
     with _app_lock(app_id):
-        release_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
-        started_at = now_iso()
+        release_id = deployment_id or f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        cancel_file = _deployment_cancel_path(app_id, release_id)
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
             app_snapshot = dict(app)
-        record = {
+            existing = next(
+                (item for item in app.get("deployments", []) if item.get("id") == release_id),
+                None,
+            )
+        record = dict(existing) if existing else {
             "id": release_id,
             "name": app_snapshot["name"],
-            "date": started_at,
+            "date": now_iso(),
             "commit": None,
             "release": None,
             "release_available": False,
             "framework": app_snapshot.get("framework", "auto"),
             "build_status": "pending",
             "status": "deploying",
+            "abortable": True,
             "error": None,
         }
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
             app["status"] = "deploying"
-            _record_deployment(app, record)
+            if not any(item.get("id") == release_id for item in app.get("deployments", [])):
+                _record_deployment(app, record)
 
         paths: Optional[Dict[str, Path]] = None
         release_dir: Optional[Path] = None
@@ -2532,7 +2833,9 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
         activation_attempted = False
         try:
             deployment_log = _deployment_log_path(app_id, release_id, create=True)
+            _prune_deployment_logs(app_id, release_id)
             _append_deployment_log(deployment_log, "Deployment started")
+            _raise_if_deployment_cancelled(cancel_file)
             username = ensure_app_user(app_id)
             paths = _setup_app_directories(app_snapshot, username, config)
             current_release = paths["current"].resolve(strict=False) if paths["current"].exists() or paths["current"].is_symlink() else None
@@ -2544,7 +2847,9 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                 app_snapshot["branch"],
                 username,
                 int(config["command_timeout_seconds"]),
+                cancel_file,
             )
+            _raise_if_deployment_cancelled(cancel_file)
             framework = app_snapshot.get("framework", "auto")
             if framework == "auto":
                 framework = detect_framework(source_path, app_snapshot.get("build_config", {}))
@@ -2580,12 +2885,14 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                     timeout,
                     environment=build_environment,
                     live_log_path=deployment_log,
+                    cancel_file=cancel_file,
                 ),
                 timeout=int(config["build_timeout_seconds"]),
                 group_id=release_group,
                 log=lambda message: _append_deployment_log(deployment_log, message),
             )
             _append_deployment_log(deployment_log, "Build completed; activating the release")
+            _raise_if_deployment_cancelled(cancel_file)
             _seal_release(release_dir, release_group, public=framework == "static")
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
             working_directory = None
@@ -2608,18 +2915,44 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
             activation_attempted = True
             _systemctl("enable", service_path.name)
             _systemctl("restart", service_path.name)
+            _raise_if_deployment_cancelled(cancel_file)
             _append_deployment_log(deployment_log, "Waiting for the application health check")
             if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
                 raise RuntimeError("Application did not pass its health check before the timeout")
+            _raise_if_deployment_cancelled(cancel_file)
             _append_deployment_log(deployment_log, "Generating and activating the application Nginx route")
+            with _registry_transaction() as registry:
+                _raise_if_deployment_cancelled(cancel_file)
+                latest = _find_app(registry, app_id)["deployments"][0]
+                latest["abortable"] = False
             hosting_result = _activate_nginx_config(app_snapshot, framework, config)
             record["hosting"] = hosting_result
+            record["abortable"] = False
             _append_deployment_log(deployment_log, hosting_result["message"])
             _append_deployment_log(deployment_log, "Deployment completed successfully")
+            record.update({"build_status": "success", "status": "deployed"})
+            with _registry_transaction() as registry:
+                app = _find_app(registry, app_id)
+                app["framework"] = framework
+                app["status"] = "running"
+                app["hosting_active"] = (
+                    True if hosting_result["active"] else bool(app_snapshot.get("hosting_active", False))
+                )
+                if hosting_result["active"]:
+                    app["active_route"] = app_snapshot["route"]
+                app["public_url"] = _public_url_for_route(
+                    app.get("active_route") or app["route"]
+                )
+                app["last_deploy"] = record["date"]
+                app["latest_commit"] = commit or app.get("latest_commit")
+                stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
+                stored_record.update(record)
+                app["updated_at"] = now_iso()
         except Exception as exc:
             if deployment_log is not None:
                 with contextlib.suppress(OSError):
-                    _append_deployment_log(deployment_log, f"Deployment failed: {exc}")
+                    message = "Deployment aborted" if isinstance(exc, DeploymentAborted) else f"Deployment failed: {exc}"
+                    _append_deployment_log(deployment_log, message)
             rollback_error = None
             try:
                 if unit_written and service_path is not None:
@@ -2645,8 +2978,8 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                 with contextlib.suppress(Exception):
                     _systemctl("disable", "--now", service_path.name)
             record.update({
-                "build_status": "failed",
-                "status": "failed",
+                "build_status": "aborted" if isinstance(exc, DeploymentAborted) else "failed",
+                "status": "aborted" if isinstance(exc, DeploymentAborted) else "failed",
                 "release_available": bool(release_dir and release_dir.is_dir()),
                 "error": str(exc),
             })
@@ -2664,30 +2997,26 @@ def deploy_app(app_id: str) -> Dict[str, Any]:
                 app["updated_at"] = now_iso()
                 app["status"] = (
                     "failed" if rollback_error
-                    else app_snapshot.get("status", "stopped") if current_release
+                    else app_snapshot.get("status", "stopped") if current_release or isinstance(exc, DeploymentAborted)
                     else "failed"
                 )
+            with contextlib.suppress(FileNotFoundError):
+                cancel_file.unlink()
             raise
 
-        record.update({"build_status": "success", "status": "deployed"})
-        with _registry_transaction() as registry:
-            app = _find_app(registry, app_id)
-            app["framework"] = framework
-            app["status"] = "running"
-            app["hosting_active"] = (
-                True if hosting_result["active"] else bool(app_snapshot.get("hosting_active", False))
+        try:
+            _prune_releases(app)
+        except OSError as exc:
+            record["cleanup_error"] = str(exc)
+            _append_deployment_log(
+                _deployment_log_path(app_id, release_id),
+                f"Could not remove previous releases: {exc}",
             )
-            if hosting_result["active"]:
-                app["active_route"] = app_snapshot["route"]
-            app["public_url"] = _public_url_for_route(
-                app.get("active_route") or app["route"]
-            )
-            app["last_deploy"] = record["date"]
-            app["latest_commit"] = commit or app.get("latest_commit")
-            stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
-            stored_record.update(record)
-            app["updated_at"] = now_iso()
-            _prune_releases(app, int(config["release_retention"]))
+            with _registry_transaction() as registry:
+                stored = _find_app(registry, app_id)
+                stored["deployments"][0]["cleanup_error"] = str(exc)
+        with contextlib.suppress(FileNotFoundError):
+            cancel_file.unlink()
         app_snapshot.update({"status": "running", "framework": framework, "latest_commit": commit or app_snapshot.get("latest_commit")})
         return {
             "ok": True,
@@ -2842,7 +3171,7 @@ def logs_app(app_id: str, lines: int = 100) -> Dict[str, Any]:
     }
 
 
-def deployment_logs_app(app_id: str) -> Dict[str, Any]:
+def deployment_logs_app(app_id: str, deployment_id: Optional[str] = None) -> Dict[str, Any]:
     app_id = validate_app_id(app_id)
     app = _find_app(get_registry(), app_id)
     latest = next(
@@ -2851,17 +3180,21 @@ def deployment_logs_app(app_id: str) -> Dict[str, Any]:
             if isinstance(item, dict)
             and isinstance(item.get("id"), str)
             and re.fullmatch(r"\d{14}-[a-f0-9]{8}", item["id"])
+            and (deployment_id is None or item.get("id") == deployment_id)
         ),
         None,
     )
     if latest is None:
         return {"ok": True, "app_id": app_id, "active": False, "status": None, "logs": ""}
     log_path = _deployment_log_path(app_id, latest["id"])
+    cancel_file = _deployment_cancel_path(app_id, latest["id"])
     return {
         "ok": True,
         "app_id": app_id,
         "deployment_id": latest["id"],
         "active": latest.get("status") == "deploying",
+        "aborting": latest.get("status") == "deploying" and cancel_file.exists(),
+        "abortable": latest.get("abortable", True) is not False,
         "status": latest.get("status"),
         "logs": _tail_log(log_path, 1000, max_bytes=1024 * 1024),
     }
@@ -2967,12 +3300,22 @@ def _build_parser() -> argparse.ArgumentParser:
     commands.add_parser("plugin-update")
     deployment_logs = commands.add_parser("deployment-logs")
     deployment_logs.add_argument("app_id")
+    deployment_logs.add_argument("deployment_id", nargs="?")
+    deployment_abort = commands.add_parser("deployment-abort")
+    deployment_abort.add_argument("app_id")
+    deployment_abort.add_argument("deployment_id")
+    commands.add_parser("auto-deploy")
+    deployment_start = commands.add_parser("deployment-start")
+    deployment_start.add_argument("app_id")
     add = commands.add_parser("add")
     add.add_argument("payload")
     edit = commands.add_parser("edit")
     edit.add_argument("app_id")
     edit.add_argument("payload")
-    for name in ("deploy", "pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "open"):
+    deploy = commands.add_parser("deploy")
+    deploy.add_argument("app_id")
+    deploy.add_argument("--deployment-id")
+    for name in ("pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "open"):
         command = commands.add_parser(name)
         command.add_argument("app_id")
     logs = commands.add_parser("logs")
@@ -2999,7 +3342,15 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
     if args.command == "deployments":
         return get_deployments()
     if args.command == "deployment-logs":
-        return deployment_logs_app(args.app_id)
+        return deployment_logs_app(args.app_id, args.deployment_id)
+    if args.command == "deployment-abort":
+        return abort_deployment_app(args.app_id, args.deployment_id)
+    if args.command == "deployment-start":
+        return deployment_start_app(args.app_id)
+    if args.command == "auto-deploy":
+        return auto_deploy_apps()
+    if args.command == "deploy":
+        return deploy_app(args.app_id, args.deployment_id)
     if args.command == "plugin-update-check":
         return plugin_update_check()
     if args.command == "plugin-update":

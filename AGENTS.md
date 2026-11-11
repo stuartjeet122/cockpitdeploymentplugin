@@ -57,6 +57,8 @@ If detection is uncertain or the app uses a nonstandard startup pattern, the ope
 - Sources live under `/var/lib/cockpit/app-manager/sources/<app-id>/`.
 - Production releases live under `/opt/webapps/<app-id>/releases/`.
 - The active release is symlinked at `/opt/webapps/<app-id>/current`.
+- Retain only the current release and the latest deployment record for each app; an in-progress deployment is separately abortable.
+- A systemd timer checks configured repository branches every five minutes and deploys new commits using the same safe fast-forward workflow.
 - Each app gets its own service account, systemd unit, logs, config directory, and loopback-bound runtime port.
 - Dynamic apps run on `127.0.0.1` only, never on a public interface.
 - Static apps should use direct Nginx path routing with the minimum runtime footprint. Do not spin up an unnecessary Python HTTP server unless a deployment explicitly requires it.
@@ -78,6 +80,8 @@ If detection is uncertain or the app uses a nonstandard startup pattern, the ope
 ├── scripts/
 │   └── install.sh
 ├── templates/
+│   ├── auto-deploy.service
+│   ├── auto-deploy.timer
 │   ├── nginx.conf.tpl
 │   └── app.service.tpl
 ├── tests/
@@ -92,7 +96,7 @@ If detection is uncertain or the app uses a nonstandard startup pattern, the ope
 
 - Run the Python unit suite with `python -m unittest discover -s tests -q`.
 - Preserve compatibility with Ubuntu Server and Cockpit.
-- Validate JSON behavior, registry safety, locking, port allocation, Git update safety, and framework detection.
+- Validate JSON behavior, registry safety, locking, port allocation, Git update safety, automatic deployment, deployment cancellation, and framework detection.
 - Test on a disposable Ubuntu host for live systemd and deployment behaviors before production use.
 
 ## Installation restrictions

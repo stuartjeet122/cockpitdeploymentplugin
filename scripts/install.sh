@@ -9,6 +9,7 @@ STATE_ROOT="${APP_MANAGER_STATE_ROOT:-/var/lib/cockpit/app-manager}"
 SOURCE_ROOT="${APP_MANAGER_SOURCE_ROOT:-${STATE_ROOT}/sources}"
 PRODUCTION_ROOT="${APP_MANAGER_PRODUCTION_ROOT:-/opt/webapps}"
 LOG_ROOT="${APP_MANAGER_LOG_ROOT:-/var/log/cockpit-app-manager}"
+SYSTEMD_DEST="${APP_MANAGER_SYSTEMD_DIR:-/etc/systemd/system}"
 
 fail() {
   printf 'Installation failed: %s\n' "$*" >&2
@@ -44,7 +45,7 @@ preflight() {
   [[ "${ID:-}" == "ubuntu" ]] || fail "Ubuntu Server is required; found ${ID:-unknown}."
 
   local required_command
-  for required_command in install python3 dpkg-query dpkg cockpit-bridge systemctl; do
+  for required_command in install python3 dpkg-query dpkg cockpit-bridge systemctl systemd-run; do
     command -v "$required_command" >/dev/null 2>&1 || fail "Required command is missing: $required_command"
   done
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' ||
@@ -63,7 +64,8 @@ preflight() {
   [[ -f "$APP_DIR/backend/app_manager.py" && -f "$APP_DIR/backend/adapters.py" ]] ||
     fail "Required backend modules are missing."
   [[ -f "$APP_DIR/config/defaults.json" ]] || fail "Default configuration is missing."
-  [[ -f "$APP_DIR/templates/nginx.conf.tpl" && -f "$APP_DIR/templates/app.service.tpl" ]] ||
+  [[ -f "$APP_DIR/templates/nginx.conf.tpl" && -f "$APP_DIR/templates/app.service.tpl" &&
+    -f "$APP_DIR/templates/auto-deploy.service" && -f "$APP_DIR/templates/auto-deploy.timer" ]] ||
     fail "Deployment templates are missing."
   python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import app_manager, adapters' "$APP_DIR/backend" ||
     fail "Backend modules cannot be imported from the project."
@@ -75,6 +77,7 @@ preflight() {
   require_directory_path "$SOURCE_ROOT"
   require_directory_path "$PRODUCTION_ROOT"
   require_directory_path "$LOG_ROOT"
+  require_directory_path "$SYSTEMD_DEST"
 }
 
 install_files() {
@@ -83,6 +86,7 @@ install_files() {
   # dedicated subdirectory and never change shared directory ownership.
   mkdir -p -- "$BACKEND_DEST"
   install -d -o root -g root -m 0755 "$CONFIG_DEST" "$CONFIG_DEST/templates"
+  install -d -o root -g root -m 0755 "$SYSTEMD_DEST"
 
   # State is traversable by dedicated app users but not listable. Registry and
   # configuration remain root-readable only.
@@ -101,6 +105,8 @@ install_files() {
   install -o root -g root -m 0644 "$APP_DIR/config/defaults.json" "$CONFIG_DEST/defaults.json"
   install -o root -g root -m 0644 "$APP_DIR/templates/nginx.conf.tpl" "$CONFIG_DEST/templates/nginx.conf.tpl"
   install -o root -g root -m 0644 "$APP_DIR/templates/app.service.tpl" "$CONFIG_DEST/templates/app.service.tpl"
+  install -o root -g root -m 0644 "$APP_DIR/templates/auto-deploy.service" "$SYSTEMD_DEST/cockpit-app-manager-auto-deploy.service"
+  install -o root -g root -m 0644 "$APP_DIR/templates/auto-deploy.timer" "$SYSTEMD_DEST/cockpit-app-manager-auto-deploy.timer"
 
   if [[ -L "$STATE_ROOT/apps.json" || -L "$STATE_ROOT/config.json" ]]; then
     fail "Registry and configuration files must not be symlinks."
@@ -121,6 +127,8 @@ install_files() {
     fail "The installed backend or one of its imports failed."
   [[ -r "$BACKEND_DEST/adapters.py" && -x "$BACKEND_DEST/app-manager" ]] ||
     fail "Installed backend files have incorrect permissions."
+  systemctl daemon-reload
+  systemctl enable --now cockpit-app-manager-auto-deploy.timer
 
   local plugin_commit=""
   if command -v git >/dev/null 2>&1; then
