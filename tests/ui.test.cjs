@@ -435,13 +435,15 @@ test("manual health checks reload observations and report public failures", asyn
 
 test("plugin updates announce automatic Cockpit restart", async () => {
   const ui = await loadUi({
-    "plugin-update-check": { available: true, current_commit: "a".repeat(40), latest_commit: "b".repeat(40) },
+    "plugin-update-check": { available: true, branch: "main", current_commit: "a".repeat(40), latest_commit: "b".repeat(40) },
     "plugin-update": { updated: true, commit: "b".repeat(40), restart_scheduled: true, restart_delay_seconds: 5 },
   });
   try {
     ui.document.querySelector("#checkUpdateButton").click();
     await settle(ui.window);
     assert.match(ui.document.querySelector("#appManagerDialog").textContent, /Cockpit will restart/);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /Updates from GitHub main are installed as root/);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /main/);
     ui.document.querySelector(".am-dialog-form").dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     assert.equal(ui.calls.filter((record) => record.command === "plugin-update").length, 1);

@@ -1003,13 +1003,13 @@
     let installed = null;
     const latest = String(result.latest_commit || "");
     const body = `
-      <p class="am-dialog-intro">A new App Manager update is available.</p>
+      <p class="am-dialog-intro">A new App Manager update from the main branch is available.</p>
       <dl class="am-settings-paths">
         <div><dt>Installed</dt><dd>${escapeHtml(result.current_commit || "Unknown")}</dd></div>
         <div><dt>Available</dt><dd>${escapeHtml(latest || "Unknown")}</dd></div>
-        <div><dt>Release</dt><dd>${escapeHtml(result.version || "Unknown")}</dd></div>
+        <div><dt>Branch</dt><dd>${escapeHtml(result.branch || "main")}</dd></div>
       </dl>
-      ${/^v\d+\.\d+\.\d+$/.test(result.version || "") ? `<p><a href="https://github.com/stuartjeet122/cockpitdeploymentplugin/releases/tag/${escapeHtml(result.version)}" target="_blank" rel="noopener noreferrer">Release notes</a></p>` : ""}
+      <p class="am-update-warning">${icon("circle-alert")} Updates from GitHub main are installed as root. Use this only if you trust the repository and its branch protections.</p>
       <p class="am-update-warning">${icon("circle-alert")} Cockpit will restart after installation. Running applications are not restarted.</p>
     `;
     openDialog("Update App Manager", body, "Install update and restart Cockpit", async () => {

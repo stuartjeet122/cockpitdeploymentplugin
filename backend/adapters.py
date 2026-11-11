@@ -425,15 +425,51 @@ def _next_config_present(directory: Path) -> bool:
     return any((directory / name).is_file() for name in _NEXT_CONFIG_NAMES)
 
 
-def _configure_next_public_route(project_dir: Path) -> None:
+def _set_next_config_permissions(path: Path, group_id: int) -> None:
+    if isinstance(group_id, bool) or not isinstance(group_id, int) or group_id < 0:
+        raise ValueError("Build release group ID is invalid")
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Next.js config is not a regular file: {path}")
+    metadata = path.stat(follow_symlinks=False)
+    mode = stat.S_IMODE(metadata.st_mode)
+    permissions = (mode & 0o700) | 0o060 | (0o010 if mode & 0o100 else 0)
+    if os.name == "nt":
+        os.chmod(str(path), permissions)
+    else:
+        os.chown(str(path), -1, group_id, follow_symlinks=False)
+        os.chmod(str(path), permissions, follow_symlinks=False)
+
+
+def _write_next_config(path: Path, contents: str, group_id: Optional[int]) -> None:
+    path.write_text(contents, encoding="utf-8")
+    if group_id is not None:
+        _set_next_config_permissions(path, group_id)
+
+
+def _next_route_config_paths(project_dir: Path) -> List[Path]:
+    config_paths = [project_dir / name for name in _NEXT_CONFIG_NAMES]
+    config_paths.extend(project_dir.glob("next.config.app-manager-original.*"))
+    return config_paths
+
+
+def _prepare_next_config_permissions(project_dir: Path, group_id: Optional[int]) -> None:
+    if group_id is None:
+        return
+    for path in _next_route_config_paths(project_dir):
+        if path.exists() or path.is_symlink():
+            _set_next_config_permissions(path, group_id)
+
+
+def _configure_next_public_route(project_dir: Path, group_id: Optional[int] = None) -> None:
     config_path = next(
         (project_dir / name for name in _NEXT_CONFIG_NAMES if (project_dir / name).is_file()),
         None,
     )
     if config_path is None:
-        (project_dir / "next.config.mjs").write_text(
+        _write_next_config(
+            project_dir / "next.config.mjs",
             'export default { basePath: process.env.APP_BASE_PATH || "", trailingSlash: true };\n',
-            encoding="utf-8",
+            group_id,
         )
         return
 
@@ -476,7 +512,7 @@ def _configure_next_public_route(project_dir: Path) -> None:
             "  return { ...config, basePath: process.env.APP_BASE_PATH || '', trailingSlash: true };\n"
             "}\n"
         )
-        (project_dir / "next.config.mjs").write_text(wrapper, encoding="utf-8")
+        _write_next_config(project_dir / "next.config.mjs", wrapper, group_id)
         return
 
     package_path = project_dir / "package.json"
@@ -507,7 +543,7 @@ def _configure_next_public_route(project_dir: Path) -> None:
             "  return { ...config, basePath: process.env.APP_BASE_PATH || '', trailingSlash: true };\n"
             "};\n"
         )
-    config_path.write_text(wrapper, encoding="utf-8")
+    _write_next_config(config_path, wrapper, group_id)
 
 
 def _validate_app_directory(repo_path: Path, configured: Any) -> Path:
@@ -711,7 +747,7 @@ class NextJSAdapter(FrameworkAdapter):
         route = app.get("route")
         static_export = False
         if route:
-            _configure_next_public_route(project_dir)
+            _configure_next_public_route(project_dir, group_id)
         manager, lockfile = _detect_js_package_manager(package_dir)
         if manager == "npm":
             source_lockfile = source_package_dir / lockfile.name if lockfile is not None else None
@@ -734,6 +770,14 @@ class NextJSAdapter(FrameworkAdapter):
             log,
         )
         if route:
+            _prepare_next_config_permissions(project_dir, group_id)
+            if log is not None and group_id is not None:
+                for path in _next_route_config_paths(project_dir):
+                    if path.exists() or path.is_symlink():
+                        log(
+                            "Next.js route config permissions: "
+                            + _file_diagnostics(path, group_id=group_id)
+                        )
             config_check = (
                 "const load = require('next/dist/server/config').default;"
                 "const { PHASE_PRODUCTION_BUILD } = require('next/constants');"

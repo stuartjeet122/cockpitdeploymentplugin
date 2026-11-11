@@ -161,25 +161,3 @@ class UbuntuIntegrationTests(unittest.TestCase):
                 self.assertEqual(self.nginx_hashes(), self.original_nginx)
                 self.assertEqual(self.command(["systemctl", "show", "stuserver-websites", "--property=ActiveState", "--value"], check=False).stdout, self.legacy_state)
                 manager.remove_app(app_id)
-
-    def test_real_ssh_release_signature_verification(self):
-        workspace = self.state / "signature-test"
-        workspace.mkdir()
-        key = workspace / "release-key"
-        self.command(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)])
-        trust = workspace / "trusted-signers"
-        trust.write_text("release " + key.with_suffix(".pub").read_text(), encoding="utf-8")
-        trust.chmod(0o600)
-        self.command(["git", "init", str(workspace / "repository")])
-        checkout = workspace / "repository"
-        for setting, value in (("user.name", "Integration"), ("user.email", "integration@example.invalid"),
-                               ("gpg.format", "ssh"), ("user.signingkey", str(key))):
-            self.command(["git", "-C", str(checkout), "config", setting, value])
-        self.command(["git", "-C", str(checkout), "commit", "--allow-empty", "-m", "Release fixture"])
-        self.command(["git", "-C", str(checkout), "tag", "-s", "v1.0.0", "-m", "Signed release"])
-        self.command(["git", "-C", str(checkout), "tag", "-a", "v2.0.0", "-m", "Unsigned release"])
-        with patch.object(manager, "PLUGIN_TRUSTED_SIGNERS", str(trust)):
-            manager._verify_plugin_release(checkout, "v1.0.0")
-            with self.assertRaises(RuntimeError):
-                manager._verify_plugin_release(checkout, "v2.0.0")
-        self.assertEqual(self.nginx_hashes(), self.original_nginx)

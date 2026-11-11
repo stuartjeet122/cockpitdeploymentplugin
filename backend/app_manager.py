@@ -67,7 +67,6 @@ DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
 PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
 PLUGIN_REPOSITORY_BRANCH = "main"
 PLUGIN_UPDATE_USER = "nobody"
-PLUGIN_TRUSTED_SIGNERS = "/etc/cockpit/app-manager/trusted-signers"
 PORT_START = 8100
 PORT_END = 8999
 RESERVED_PORTS = {8080}
@@ -1755,61 +1754,39 @@ def _plugin_git(args: Sequence[str], timeout: int = 120) -> subprocess.Completed
     )
 
 
-def _plugin_remote_release() -> Dict[str, str]:
+def _plugin_remote_commit() -> Dict[str, str]:
     result = _plugin_git(
         [
             "git",
             "ls-remote",
             "--exit-code",
             PLUGIN_REPOSITORY_URL,
-            "refs/tags/v*",
+            f"refs/heads/{PLUGIN_REPOSITORY_BRANCH}",
         ]
     )
     if result.returncode == 2:
         raise RuntimeError(
-            "No versioned App Manager release tags were found on GitHub. "
-            "The update checker requires an annotated, signed vMAJOR.MINOR.PATCH tag."
+            f"The App Manager update branch {PLUGIN_REPOSITORY_BRANCH!r} was not found on GitHub."
         )
     _command_error(result, "Checking for App Manager updates")
-    releases = {}
-    for line in (result.stdout or "").splitlines():
-        match = re.fullmatch(r"([0-9a-f]{40,64})\trefs/tags/(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\^\{\}", line)
-        if match:
-            releases[tuple(int(part) for part in match.groups()[2:])] = {
-                "version": match.group(2), "commit": match.group(1),
-            }
-    if not releases:
-        raise RuntimeError("No annotated versioned App Manager release is available")
-    return releases[max(releases)]
+    match = re.fullmatch(
+        rf"([0-9a-f]{{40,64}})\trefs/heads/{re.escape(PLUGIN_REPOSITORY_BRANCH)}",
+        (result.stdout or "").strip(),
+    )
+    if not match:
+        raise RuntimeError("GitHub returned an invalid App Manager branch revision")
+    return {"branch": PLUGIN_REPOSITORY_BRANCH, "commit": match.group(1)}
 
 
-def _verify_plugin_release(checkout: Path, version: str) -> None:
-    trust = Path(PLUGIN_TRUSTED_SIGNERS)
-    _assert_no_symlink_components(trust)
-    if not trust.is_file():
-        raise RuntimeError("Provision a trusted release signing key in " + str(trust))
-    metadata = trust.stat()
-    if metadata.st_uid != 0 or metadata.st_mode & 0o022:
-        raise RuntimeError("Trusted release signers must be root-owned and not group/world writable")
-    result = run_command([
-        "git", "-c", f"safe.directory={checkout}",
-        "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-        "-c", "gpg.format=ssh", "-c", "gpg.ssh.program=/usr/bin/ssh-keygen",
-        "-c", f"gpg.ssh.allowedSignersFile={trust}",
-        "-C", str(checkout), "verify-tag", version,
-    ], timeout=30, env=_plugin_update_environment(), redact_values=[])
-    _command_error(result, "Verifying the trusted App Manager release signature")
-
-
-def _verify_plugin_checkout(checkout: Path, version: str, commit: str) -> None:
+def _verify_plugin_checkout(checkout: Path, commit: str) -> None:
     prefix = ["git", "-c", f"safe.directory={checkout}", "-c", "core.fsmonitor=false",
               "-c", "core.hooksPath=/dev/null", "-C", str(checkout)]
-    revision = run_command([*prefix, "rev-parse", f"{version}^{{commit}}"], timeout=30, env=_plugin_update_environment(), redact_values=[])
-    _command_error(revision, "Resolving the signed release commit")
+    revision = run_command([*prefix, "rev-parse", "HEAD"], timeout=30, env=_plugin_update_environment(), redact_values=[])
+    _command_error(revision, "Resolving the selected main branch commit")
     if (revision.stdout or "").strip() != commit:
-        raise RuntimeError("The signed release tag does not match the selected commit")
+        raise RuntimeError("The checked-out main branch does not match the selected commit")
     listing = run_command([*prefix, "ls-tree", "-r", "-z", "--full-tree", commit], timeout=30, env=_plugin_update_environment(), redact_values=[])
-    _command_error(listing, "Reading the signed release file manifest")
+    _command_error(listing, "Reading the selected main branch file manifest")
     expected = set()
     for entry in (listing.stdout or "").split("\0"):
         if not entry:
@@ -1817,9 +1794,9 @@ def _verify_plugin_checkout(checkout: Path, version: str, commit: str) -> None:
         metadata, separator, name = entry.partition("\t")
         fields = metadata.split()
         if not separator or len(fields) != 3 or fields[0] not in {"100644", "100755"} or fields[1] != "blob":
-            raise RuntimeError("Unsupported entry in the signed release manifest")
+            raise RuntimeError("Unsupported entry in the selected main branch manifest")
         if not name or Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name or name.split("/")[0] == ".git":
-            raise RuntimeError("Unsafe path in the signed release manifest")
+            raise RuntimeError("Unsafe path in the selected main branch manifest")
         path = checkout / name
         if path.is_symlink() or not path.is_file():
             raise RuntimeError("Missing or unsafe file in the release checkout")
@@ -1828,7 +1805,7 @@ def _verify_plugin_checkout(checkout: Path, version: str, commit: str) -> None:
         digest.update(f"blob {len(blob)}\0".encode("ascii"))
         digest.update(blob)
         if digest.hexdigest() != fields[2]:
-            raise RuntimeError("Release checkout differs from the signed tree: " + name)
+            raise RuntimeError("Update checkout differs from the selected Git tree: " + name)
         expected.add(name)
     actual = set()
     for root, directories, filenames in os.walk(checkout, followlinks=False):
@@ -1837,7 +1814,23 @@ def _verify_plugin_checkout(checkout: Path, version: str, commit: str) -> None:
         for name in filenames:
             actual.add((Path(root) / name).relative_to(checkout).as_posix())
     if not expected or actual != expected:
-        raise RuntimeError("Release checkout contains unexpected files or an empty manifest")
+        raise RuntimeError("Update checkout contains unexpected files or an empty manifest")
+
+
+def _verify_plugin_update_is_fast_forward(
+    checkout: Path,
+    current_commit: Optional[str],
+    latest_commit: str,
+) -> None:
+    if current_commit is None or current_commit == latest_commit:
+        return
+    result = _plugin_git([
+        "git", "-C", str(checkout), "merge-base", "--is-ancestor",
+        current_commit, latest_commit,
+    ])
+    if result.returncode == 1:
+        raise RuntimeError("Refusing a main branch update that is not a fast-forward from the installed commit")
+    _command_error(result, "Checking that the main branch update is a fast-forward")
 
 
 def _installed_plugin_commit() -> Optional[str]:
@@ -1860,24 +1853,14 @@ def _installed_plugin_commit() -> Optional[str]:
 
 def plugin_update_check() -> Dict[str, Any]:
     current_commit = _installed_plugin_commit()
-    release = _plugin_remote_release()
-    latest_commit = release["commit"]
-    installed = load_json(Path(DEFAULT_PLUGIN_VERSION_PATH), {})
-    installed_version = installed.get("version") if isinstance(installed, dict) else None
-    if installed_version is not None:
-        if not isinstance(installed_version, str) or not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", installed_version):
-            raise RuntimeError("Installed plugin release version is invalid")
-        current_version = tuple(int(part) for part in installed_version[1:].split("."))
-        remote_version = tuple(int(part) for part in release["version"][1:].split("."))
-        if remote_version < current_version or (remote_version == current_version and current_commit != latest_commit):
-            raise RuntimeError("Refusing an older or rewritten plugin release")
+    branch = _plugin_remote_commit()
+    latest_commit = branch["commit"]
     return {
         "ok": True,
         "available": current_commit != latest_commit,
         "current_commit": current_commit,
         "latest_commit": latest_commit,
-        "version": release["version"],
-        "release_notes_url": "https://github.com/stuartjeet122/cockpitdeploymentplugin/releases/tag/" + release["version"],
+        "branch": branch["branch"],
     }
 
 
@@ -1919,10 +1902,8 @@ def plugin_update() -> Dict[str, Any]:
             [
                 "git",
                 "clone",
-                "--depth",
-                "1",
                 "--branch",
-                check["version"],
+                check["branch"],
                 "--single-branch",
                 PLUGIN_REPOSITORY_URL,
                 str(checkout),
@@ -1938,15 +1919,19 @@ def plugin_update() -> Dict[str, Any]:
         if not match:
             raise RuntimeError("The downloaded App Manager update has an invalid Git revision")
         if match.group(0) != check["latest_commit"]:
-            raise RuntimeError("The release changed after the update check; check again")
+            raise RuntimeError("The main branch changed after the update check; check again")
+        _verify_plugin_update_is_fast_forward(
+            checkout,
+            check.get("current_commit"),
+            match.group(0),
+        )
         verified_root = Path(tempfile.mkdtemp(prefix="app-manager-verified-", dir=str(update_parent)))
         os.chmod(str(verified_root), 0o700)
         verified_checkout = verified_root / "checkout"
         shutil.copytree(checkout, verified_checkout, symlinks=True)
         checkout = verified_checkout
         _seal_plugin_update_checkout(checkout, verified_root)
-        _verify_plugin_release(checkout, check["version"])
-        _verify_plugin_checkout(checkout, check["version"], check["latest_commit"])
+        _verify_plugin_checkout(checkout, check["latest_commit"])
         installer = checkout / "scripts" / "install.sh"
         if installer.is_symlink() or not installer.is_file():
             raise RuntimeError("The App Manager update does not contain a regular installer")
@@ -1954,7 +1939,7 @@ def plugin_update() -> Dict[str, Any]:
             ["bash", str(installer)],
             cwd=checkout,
             timeout=300,
-            env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"], "APP_MANAGER_RELEASE_VERSION": check["version"]},
+            env={"HOME": "/root", "PATH": _plugin_update_environment()["PATH"]},
         )
         _command_error(install_result, "Reinstalling the App Manager plugin")
         result = {"ok": True, "updated": True, "commit": match.group(0)}

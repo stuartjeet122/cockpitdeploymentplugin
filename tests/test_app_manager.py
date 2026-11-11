@@ -1154,22 +1154,25 @@ class AppManagerTests(unittest.TestCase):
     def test_plugin_update_check_compares_installed_and_remote_revisions(self):
         version_path = Path(manager.DEFAULT_PLUGIN_VERSION_PATH)
         version_path.parent.mkdir(parents=True)
-        version_path.write_text(json.dumps({"commit": "a" * 40}), encoding="utf-8")
-        with patch.object(manager, "_plugin_remote_release", return_value={"commit": "b" * 40, "version": "v1.1.0"}):
+        version_path.write_text(
+            json.dumps({"commit": "a" * 40, "version": "v99.0.0"}),
+            encoding="utf-8",
+        )
+        with patch.object(manager, "_plugin_remote_commit", return_value={"commit": "b" * 40, "branch": "main"}):
             result = manager.plugin_update_check()
 
         self.assertTrue(result["available"])
         self.assertEqual(result["current_commit"], "a" * 40)
         self.assertEqual(result["latest_commit"], "b" * 40)
+        self.assertEqual(result["branch"], "main")
 
-    def test_plugin_update_rejects_downgrade_and_rewritten_release(self):
-        version_path = Path(manager.DEFAULT_PLUGIN_VERSION_PATH)
-        version_path.parent.mkdir(parents=True)
-        version_path.write_text(json.dumps({"commit": "a" * 40, "version": "v2.0.0"}), encoding="utf-8")
-        for version in ("v1.9.9", "v2.0.0"):
-            with patch.object(manager, "_plugin_remote_release", return_value={"commit": "b" * 40, "version": version}):
-                with self.assertRaisesRegex(RuntimeError, "older or rewritten"):
-                    manager.plugin_update_check()
+    def test_plugin_update_rejects_non_fast_forward_branch(self):
+        failure = subprocess.CompletedProcess(["git", "merge-base"], 1, stdout="", stderr="")
+        with patch.object(manager, "_plugin_git", return_value=failure):
+            with self.assertRaisesRegex(RuntimeError, "not a fast-forward"):
+                manager._verify_plugin_update_is_fast_forward(
+                    Path(self.temp_dir.name), "a" * 40, "b" * 40
+                )
 
     def test_plugin_update_downloads_fixed_upstream_and_runs_its_installer(self):
         commit = "b" * 40
@@ -1182,11 +1185,11 @@ class AppManagerTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
             return subprocess.CompletedProcess(args, 0, stdout=commit + "\n", stderr="")
 
-        with patch.object(manager, "plugin_update_check", return_value={"available": True, "version": "v1.1.0", "latest_commit": commit}), patch.object(
+        with patch.object(manager, "plugin_update_check", return_value={"available": True, "branch": "main", "current_commit": "a" * 40, "latest_commit": commit}), patch.object(
             manager, "_account_ids", return_value=(65534, 65534)
         ), patch.object(manager, "_plugin_git", side_effect=fake_git) as plugin_git, patch.object(
             manager, "_seal_plugin_update_checkout"
-        ), patch.object(manager, "_verify_plugin_release") as verify, patch.object(manager, "_verify_plugin_checkout"), patch.object(
+        ), patch.object(manager, "_verify_plugin_checkout") as verify_checkout, patch.object(
             manager, "_require_root"
         ), patch.object(manager.os, "chown", create=True), patch.object(
             manager.os, "chmod"
@@ -1196,22 +1199,25 @@ class AppManagerTests(unittest.TestCase):
             result = manager.plugin_update()
 
         self.assertTrue(result["updated"])
-        verify.assert_called_once()
+        verify_checkout.assert_called_once()
         self.assertEqual(result["commit"], commit)
         clone_command = plugin_git.call_args_list[0].args[0]
         self.assertIn(manager.PLUGIN_REPOSITORY_URL, clone_command)
         self.assertIn("--branch", clone_command)
-        self.assertNotEqual(Path(clone_command[-1]), verify.call_args.args[0])
+        self.assertIn("main", clone_command)
+        self.assertNotIn("--depth", clone_command)
+        self.assertNotEqual(Path(clone_command[-1]), verify_checkout.call_args.args[0])
         self.assertEqual(install.call_args_list[0].args[0][0], "bash")
         installer_path = install.call_args_list[0].args[0][1].replace("\\", "/")
         self.assertTrue(installer_path.endswith("scripts/install.sh"))
+        self.assertNotIn("APP_MANAGER_RELEASE_VERSION", install.call_args_list[0].kwargs["env"])
         self.assertTrue(result["restart_scheduled"])
         restart_command = install.call_args_list[1].args[0]
         self.assertEqual(restart_command[0], "systemd-run")
         self.assertIn("--on-active=5s", restart_command)
         self.assertEqual(restart_command[-3:], ["systemctl", "restart", "cockpit.service"])
 
-    def test_plugin_update_never_installs_a_moved_or_untrusted_release(self):
+    def test_plugin_update_never_installs_a_moved_or_non_fast_forward_branch(self):
         commit = "b" * 40
         def fake_git(args, timeout=120):
             if "clone" in args:
@@ -1219,21 +1225,33 @@ class AppManagerTests(unittest.TestCase):
                 (checkout / "scripts").mkdir(parents=True)
                 (checkout / "scripts" / "install.sh").write_bytes(b"#!/bin/sh\n")
                 return subprocess.CompletedProcess(args, 0, "", "")
-            return subprocess.CompletedProcess(args, 0, commit + "\n", "")
-        for moved in (True, False):
-            with self.subTest(moved=moved), patch.object(manager, "plugin_update_check", return_value={
-                "available": True, "version": "v1.1.0", "latest_commit": "a" * 40 if moved else commit,
-            }), patch.object(manager, "_account_ids", return_value=(65534, 65534)), patch.object(
-                manager, "_plugin_git", side_effect=fake_git
-            ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(
-                manager, "_verify_plugin_release", side_effect=RuntimeError("Untrusted signature")
-            ), patch.object(manager.os, "chown", create=True), patch.object(manager.os, "chmod"), patch.object(
-                manager, "run_command"
-            ) as install:
-                with self.assertRaisesRegex(RuntimeError, "changed|Untrusted"):
-                    manager.plugin_update()
-                install.assert_not_called()
-                self.assertFalse(list((Path(manager.DEFAULT_STATE_ROOT) / "plugin-updates").iterdir()))
+            if "rev-parse" in args:
+                return subprocess.CompletedProcess(args, 0, commit + "\n", "")
+            return subprocess.CompletedProcess(args, 1, "", "")
+
+        with patch.object(manager, "plugin_update_check", return_value={
+            "available": True, "branch": "main", "current_commit": "a" * 40, "latest_commit": commit,
+        }), patch.object(manager, "_account_ids", return_value=(65534, 65534)), patch.object(
+            manager, "_plugin_git", side_effect=fake_git
+        ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(
+            manager.os, "chown", create=True
+        ), patch.object(manager.os, "chmod"), patch.object(manager, "run_command") as install:
+            with self.assertRaisesRegex(RuntimeError, "not a fast-forward"):
+                manager.plugin_update()
+            install.assert_not_called()
+            self.assertFalse(list((Path(manager.DEFAULT_STATE_ROOT) / "plugin-updates").iterdir()))
+
+        with patch.object(manager, "plugin_update_check", return_value={
+            "available": True, "branch": "main", "current_commit": "a" * 40, "latest_commit": "c" * 40,
+        }), patch.object(manager, "_account_ids", return_value=(65534, 65534)), patch.object(
+            manager, "_plugin_git", side_effect=fake_git
+        ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(
+            manager.os, "chown", create=True
+        ), patch.object(manager.os, "chmod"), patch.object(manager, "run_command") as install:
+            with self.assertRaisesRegex(RuntimeError, "branch changed"):
+                manager.plugin_update()
+            install.assert_not_called()
+            self.assertFalse(list((Path(manager.DEFAULT_STATE_ROOT) / "plugin-updates").iterdir()))
 
     def test_plugin_update_does_not_restart_when_already_current(self):
         with patch.object(manager, "plugin_update_check", return_value={
@@ -1258,10 +1276,10 @@ class AppManagerTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 1, stdout="", stderr="restart scheduler unavailable"),
             ]
             with self.subTest(install_succeeds=install_succeeds), patch.object(
-                manager, "plugin_update_check", return_value={"available": True, "version": "v1.1.0", "latest_commit": "b" * 40}
+                manager, "plugin_update_check", return_value={"available": True, "branch": "main", "current_commit": None, "latest_commit": "b" * 40}
             ), patch.object(manager, "_account_ids", return_value=(65534, 65534)), patch.object(
                 manager, "_plugin_git", side_effect=fake_git
-            ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(manager, "_verify_plugin_release"), patch.object(manager, "_verify_plugin_checkout"), patch.object(
+            ), patch.object(manager, "_seal_plugin_update_checkout"), patch.object(manager, "_verify_plugin_checkout"), patch.object(
                 manager.os, "chown", create=True
             ), patch.object(manager.os, "chmod"), patch.object(manager, "run_command", side_effect=commands) as run:
                 if install_succeeds:
@@ -1275,16 +1293,13 @@ class AppManagerTests(unittest.TestCase):
                 self.assertEqual(run.call_count, 2 if install_succeeds else 1)
                 self.assertFalse(list((Path(manager.DEFAULT_STATE_ROOT) / "plugin-updates").iterdir()))
 
-    def test_plugin_release_selection_requires_annotated_semantic_versions(self):
-        output = "\n".join([
-            "a" * 40 + "\trefs/tags/v1.9.0^{}",
-            "b" * 40 + "\trefs/tags/v1.10.0^{}",
-            "c" * 40 + "\trefs/tags/v99.0.0",
-        ])
-        with patch.object(manager, "_plugin_git", return_value=subprocess.CompletedProcess([], 0, output, "")):
-            self.assertEqual(manager._plugin_remote_release(), {"version": "v1.10.0", "commit": "b" * 40})
+    def test_plugin_update_selects_latest_main_branch_commit(self):
+        output = "b" * 40 + "\trefs/heads/main\n"
+        with patch.object(manager, "_plugin_git", return_value=subprocess.CompletedProcess([], 0, output, "")) as run:
+            self.assertEqual(manager._plugin_remote_commit(), {"branch": "main", "commit": "b" * 40})
+        self.assertEqual(run.call_args.args[0][-2:], [manager.PLUGIN_REPOSITORY_URL, "refs/heads/main"])
 
-    def test_plugin_update_check_explains_when_repository_has_no_release_tags(self):
+    def test_plugin_update_reports_when_main_branch_is_missing(self):
         with patch.object(
             manager,
             "_plugin_git",
@@ -1292,9 +1307,9 @@ class AppManagerTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                "No versioned App Manager release tags.*annotated, signed",
+                "update branch 'main' was not found",
             ):
-                manager._plugin_remote_release()
+                manager._plugin_remote_commit()
 
     def test_plugin_tree_rejects_modified_and_unexpected_files(self):
         import hashlib
@@ -1307,7 +1322,7 @@ class AppManagerTests(unittest.TestCase):
         responses = [subprocess.CompletedProcess([], 0, commit + "\n", ""),
                      subprocess.CompletedProcess([], 0, f"100644 blob {digest}\tinstall.sh\0", "")]
         with patch.object(manager, "run_command", side_effect=responses):
-            manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
+            manager._verify_plugin_checkout(checkout, commit)
         for modified in (True, False):
             if modified:
                 installer.write_bytes(b"tampered")
@@ -1315,13 +1330,8 @@ class AppManagerTests(unittest.TestCase):
                 installer.write_bytes(b"trusted")
                 (checkout / "json.py").write_bytes(b"injected")
             with patch.object(manager, "run_command", side_effect=responses):
-                with self.assertRaisesRegex(RuntimeError, "signed tree|unexpected files"):
-                    manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
-
-    def test_plugin_signature_requires_provisioned_trust(self):
-        with patch.object(manager, "PLUGIN_TRUSTED_SIGNERS", str(Path(self.temp_dir.name) / "missing")):
-            with self.assertRaisesRegex(RuntimeError, "Provision"):
-                manager._verify_plugin_release(Path(self.temp_dir.name), "v1.0.0")
+                with self.assertRaisesRegex(RuntimeError, "selected Git tree|unexpected files"):
+                    manager._verify_plugin_checkout(checkout, commit)
 
     @unittest.skipUnless(shutil.which("git"), "requires Git")
     def test_plugin_tree_uses_real_git_and_rejects_replacement_refs(self):
@@ -1336,22 +1346,21 @@ class AppManagerTests(unittest.TestCase):
             return result.stdout.decode("utf-8").strip()
         git("init", "-q")
         original = b"trusted installer\n"
-        blob = git("hash-object", "-w", "--stdin", content=original)
-        tree = git("mktree", content=f"100644 blob {blob}\tinstall.sh\n".encode("ascii"))
-        commit = git("commit-tree", tree, content=b"Trusted release\n")
-        git("tag", "-a", "v1.0.0", commit, "-m", "Release")
         installer = checkout / "install.sh"
         installer.write_bytes(original)
-        manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
+        git("add", "install.sh")
+        git("commit", "-m", "Initial main commit")
+        commit = git("rev-parse", "HEAD")
+        manager._verify_plugin_checkout(checkout, commit)
         changed = b"untrusted installer\n"
         blob = git("hash-object", "-w", "--stdin", content=changed)
         tree = git("mktree", content=f"100644 blob {blob}\tinstall.sh\n".encode("ascii"))
         replacement = git("commit-tree", tree, content=b"Replacement\n")
         git("replace", commit, replacement)
-        manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
+        manager._verify_plugin_checkout(checkout, commit)
         installer.write_bytes(changed)
-        with self.assertRaisesRegex(RuntimeError, "differs from the signed tree"):
-            manager._verify_plugin_checkout(checkout, "v1.0.0", commit)
+        with self.assertRaisesRegex(RuntimeError, "differs from the selected Git tree"):
+            manager._verify_plugin_checkout(checkout, commit)
 
     def test_git_clone_failure_is_reported_and_partial_directory_removed(self):
         source = Path(manager.DEFAULT_SOURCE_ROOT) / "example-site"
@@ -2184,6 +2193,38 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         self.assertEqual(repo.joinpath("package.json").stat().st_mode & 0o777, 0o600)
         preflight = next(message for message in messages if "Next.js npm preflight" in message)
         self.assertIn("app_group_readable: True", preflight)
+
+    def test_nextjs_route_config_permissions_are_reapplied_after_dependency_install(self):
+        events = []
+        original_chmod = os.chmod
+
+        def runner(args, cwd, timeout):
+            config_path = cwd / "next.config.mjs"
+            events.append(("command", args[0]))
+            if args[0] == "npm":
+                config_path.write_text("export default {};\n", encoding="utf-8")
+                if os.name != "nt":
+                    original_chmod(str(config_path), 0o200)
+            elif args[0] == "node":
+                npm_index = max(
+                    index for index, event in enumerate(events)
+                    if event == ("command", "npm")
+                )
+                restored = [
+                    event[2] for event in events[npm_index + 1:]
+                    if event[0] == "chmod" and event[1] == config_path
+                ]
+                self.assertTrue(restored)
+                self.assertEqual(restored[-1] & 0o060, 0o060)
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        def record_chmod(path, mode, **kwargs):
+            events.append(("chmod", Path(path), mode))
+
+        with patch("backend.adapters._prepare_build_copy_permissions"), patch(
+            "backend.adapters.os.chown", create=True
+        ), patch("backend.adapters.os.chmod", side_effect=record_chmod):
+            self.build_project({}, runner, group_id=1234, app_route="/demo/")
 
     def test_explicit_application_directory_is_used_by_the_build_adapter(self):
         runner = self.successful_runner()
