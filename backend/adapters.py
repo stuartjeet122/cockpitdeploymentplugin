@@ -108,7 +108,7 @@ def _run_build(
     cwd: Path,
     timeout: int,
     description: str,
-) -> None:
+) -> subprocess.CompletedProcess:
     if runner is None:
         raise RuntimeError("Build commands require an unprivileged application command runner")
     try:
@@ -123,6 +123,7 @@ def _run_build(
             output.append(f"stderr:\n{result.stderr.rstrip()}")
         detail = "\n".join(output)
         raise RuntimeError(f"{description} failed (exit {result.returncode})" + (f"\n{detail}" if detail else ""))
+    return result
 
 
 def _detect_js_package_manager(project_dir: Path) -> tuple[str, Optional[Path]]:
@@ -417,6 +418,91 @@ def _next_config_present(directory: Path) -> bool:
     return any((directory / name).is_file() for name in _NEXT_CONFIG_NAMES)
 
 
+def _configure_next_public_route(project_dir: Path) -> None:
+    config_path = next(
+        (project_dir / name for name in _NEXT_CONFIG_NAMES if (project_dir / name).is_file()),
+        None,
+    )
+    if config_path is None:
+        (project_dir / "next.config.mjs").write_text(
+            'export default { basePath: process.env.APP_BASE_PATH || "", trailingSlash: true };\n',
+            encoding="utf-8",
+        )
+        return
+
+    original_path = config_path.with_name(
+        f"next.config.app-manager-original{config_path.suffix}"
+    )
+    if original_path.exists() or original_path.is_symlink():
+        raise ValueError(f"Reserved Next.js config backup path already exists: {original_path}")
+    config_path.rename(original_path)
+
+    import_path = "./" + original_path.name
+    if config_path.suffix == ".ts":
+        wrapper = (
+            "import { createRequire } from 'node:module';\n"
+            "import { dirname } from 'node:path';\n"
+            "import { fileURLToPath } from 'node:url';\n"
+            "const require = createRequire(import.meta.url);\n"
+            "const nextRequire = createRequire(require.resolve('next'));\n"
+            "const { transform } = nextRequire('@swc/core');\n"
+            "const Module = require('node:module');\n"
+            "const fs = require('node:fs');\n"
+            f"const originalPath = fileURLToPath(new URL({json.dumps(import_path)}, import.meta.url));\n"
+            "export default async function appManagerConfig(phase, context) {\n"
+            "  const compiled = await transform(fs.readFileSync(originalPath, 'utf8'), {\n"
+            "    filename: originalPath,\n"
+            "    jsc: { parser: { syntax: 'typescript' }, target: 'es2022' },\n"
+            "    module: { type: 'commonjs' },\n"
+            "  });\n"
+            "  const originalModule = new Module(originalPath, module);\n"
+            "  originalModule.filename = originalPath;\n"
+            "  originalModule.paths = Module._nodeModulePaths(dirname(originalPath));\n"
+            "  originalModule._compile(compiled.code, originalPath);\n"
+            "  const exported = originalModule.exports;\n"
+            "  const originalConfig = exported && exported.default !== undefined\n"
+            "    ? exported.default\n"
+            "    : exported;\n"
+            "  const config = typeof originalConfig === 'function'\n"
+            "    ? await originalConfig(phase, context)\n"
+            "    : originalConfig;\n"
+            "  return { ...config, basePath: process.env.APP_BASE_PATH || '', trailingSlash: true };\n"
+            "}\n"
+        )
+        (project_dir / "next.config.mjs").write_text(wrapper, encoding="utf-8")
+        return
+
+    package_path = project_dir / "package.json"
+    try:
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read Next.js package manifest {package_path}: {exc}") from exc
+    uses_esm = config_path.suffix in {".mjs", ".ts"} or (
+        config_path.suffix == ".js" and package.get("type") == "module"
+    )
+    if uses_esm:
+        wrapper = (
+            f"import originalConfig from {json.dumps(import_path)};\n"
+            "export default async function appManagerConfig(phase, context) {\n"
+            "  const config = typeof originalConfig === 'function'\n"
+            "    ? await originalConfig(phase, context)\n"
+            "    : originalConfig;\n"
+            "  return { ...config, basePath: process.env.APP_BASE_PATH || '', trailingSlash: true };\n"
+            "}\n"
+        )
+    else:
+        wrapper = (
+            f"const originalConfig = require({json.dumps(import_path)});\n"
+            "module.exports = async function appManagerConfig(phase, context) {\n"
+            "  const config = typeof originalConfig === 'function'\n"
+            "    ? await originalConfig(phase, context)\n"
+            "    : originalConfig;\n"
+            "  return { ...config, basePath: process.env.APP_BASE_PATH || '', trailingSlash: true };\n"
+            "};\n"
+        )
+    config_path.write_text(wrapper, encoding="utf-8")
+
+
 def _validate_app_directory(repo_path: Path, configured: Any) -> Path:
     if not isinstance(configured, str) or not configured or "\\" in configured or "\0" in configured:
         raise ValueError("build_config.app_directory must be a non-empty relative POSIX path")
@@ -616,11 +702,9 @@ class NextJSAdapter(FrameworkAdapter):
         if not isinstance(scripts, dict) or not scripts.get("build"):
             raise ValueError(f"Next.js package.json must define a build script: {project_dir / 'package.json'}")
         route = app.get("route")
-        if route and not _next_config_present(project_dir):
-            (project_dir / "next.config.mjs").write_text(
-                'export default { basePath: process.env.APP_BASE_PATH || "", trailingSlash: true };\n',
-                encoding="utf-8",
-            )
+        static_export = False
+        if route:
+            _configure_next_public_route(project_dir)
         manager, lockfile = _detect_js_package_manager(package_dir)
         if manager == "npm":
             source_lockfile = source_package_dir / lockfile.name if lockfile is not None else None
@@ -648,18 +732,16 @@ class NextJSAdapter(FrameworkAdapter):
                 "const { PHASE_PRODUCTION_BUILD } = require('next/constants');"
                 "load(PHASE_PRODUCTION_BUILD, process.cwd()).then(config => {"
                 "if (config.basePath !== process.argv[1] || config.trailingSlash !== true) {"
-                "throw new Error('Set basePath: process.env.APP_BASE_PATH and trailingSlash: true in next.config. "
-                "The public route must match the built Next.js asset and API paths.');"
+                "throw new Error('Next.js basePath/trailingSlash could not be configured for the public route.');"
                 "}"
-                "if (config.output === 'export') {"
-                "throw new Error('Next.js output: export needs static hosting, not next start.');"
-                "}"
+                "if (config.output === 'export') process.stdout.write('APP_MANAGER_NEXT_STATIC_EXPORT');"
                 "}).catch(error => { console.error(error.message); process.exit(1); });"
             )
-            _run_build(
+            config_result = _run_build(
                 runner, ["node", "--eval", config_check, route.rstrip("/")],
                 project_dir, timeout, "Checking Next.js public route configuration",
             )
+            static_export = (config_result.stdout or "").strip() == "APP_MANAGER_NEXT_STATIC_EXPORT"
         _run_build(
             runner,
             _js_build_command(manager),
@@ -667,6 +749,36 @@ class NextJSAdapter(FrameworkAdapter):
             timeout,
             "Building Next.js application",
         )
+        if static_export:
+            export_dir = project_dir / "out"
+            if export_dir.is_symlink() or not export_dir.is_dir():
+                raise RuntimeError(f"Next.js static export did not create an output directory: {export_dir}")
+            try:
+                export_root = export_dir.resolve(strict=True)
+                export_root.relative_to(app_dir.resolve(strict=True))
+            except ValueError as exc:
+                raise RuntimeError("Next.js static export output escapes the isolated release copy") from exc
+            for current, directories, filenames in os.walk(export_dir, followlinks=False):
+                for name in directories + filenames:
+                    path = Path(current) / name
+                    if path.is_symlink():
+                        try:
+                            path.resolve(strict=False).relative_to(export_root)
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                f"Next.js static export symlink escapes its output directory: {path}"
+                            ) from exc
+            index_path = export_dir / "index.html"
+            if index_path.is_symlink() or not index_path.is_file():
+                raise RuntimeError(f"Next.js static export is missing a regular index.html: {index_path}")
+            return {
+                "status": "success",
+                "release_dir": str(release_dir),
+                "start_command": [],
+                "runtime_required": False,
+                "static_root": export_dir.relative_to(app_dir).as_posix(),
+                "working_directory": str(project_dir),
+            }
         _install_js_production_dependencies(manager, project_dir, runner, timeout, "Next.js", package_dir, log)
         start = _next_start_command(manager, app["port"])
         start = _configured_start(app, start)

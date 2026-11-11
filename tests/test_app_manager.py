@@ -1578,6 +1578,54 @@ class AppManagerTests(unittest.TestCase):
         self.assertFalse(paths["source"].exists())
         self.assertTrue((Path(result["deployment"]["release"]) / "app" / "index.html").is_file())
 
+    def test_nextjs_export_deploys_as_static_without_changing_framework_detection(self):
+        app = self.add_app("Next export", framework="nextjs")["app"]
+        paths = manager._app_paths(app["id"], manager.get_config())
+        paths["source"].mkdir(parents=True)
+        paths["releases"].mkdir(parents=True)
+        activation = {"active": True, "route": app["route"], "message": "Static route active"}
+
+        def build_export(app_snapshot, source, release, *args, **kwargs):
+            output = release / "app" / "apps" / "web" / "out"
+            output.mkdir(parents=True)
+            (output / "index.html").write_text("<h1>Exported</h1>", encoding="utf-8")
+            return {
+                "start_command": [],
+                "runtime_required": False,
+                "static_root": "apps/web/out",
+            }
+
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "ensure_app_user", return_value=app["service_user"]
+        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
+            manager, "clone_or_update_repo"
+        ), patch.object(manager, "git_output", return_value="a" * 40), patch.object(
+            manager, "_prepare_release_directory", side_effect=lambda path, user: path.mkdir()
+        ), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
+            manager, "_service_path", return_value=Path(self.temp_dir.name) / "next-export.service"
+        ), patch.object(manager, "_environment_values_app", return_value={}), patch.object(
+            manager, "_build_release", side_effect=build_export
+        ), patch.object(manager, "_seal_release") as seal_release, patch.object(
+            manager, "_write_service"
+        ) as write_service, patch.object(manager, "_retire_legacy_root_service"), patch.object(
+            manager, "_atomic_symlink"
+        ), patch.object(manager, "_systemctl") as systemctl, patch.object(
+            manager, "_activate_nginx_config", return_value=activation
+        ) as activate_nginx, patch.object(manager, "_prune_releases"), patch(
+            "backend.adapters._prepare_build_copy_permissions"
+        ):
+            result = manager.deploy_app(app["id"])
+
+        write_service.assert_not_called()
+        systemctl.assert_not_called()
+        seal_release.assert_called_once()
+        self.assertTrue(seal_release.call_args.kwargs["public"])
+        self.assertEqual(activate_nginx.call_args.args[1], "static")
+        self.assertEqual(result["app"]["framework"], "nextjs")
+        self.assertTrue(result["app"]["static_export"])
+        self.assertEqual(result["app"]["static_root"], "apps/web/out")
+        self.assertTrue(result["deployment"]["static_export"])
+
     def test_staged_deployment_checks_candidate_before_switch_and_keeps_old_on_failure(self):
         for health_passes in (True, False):
             with self.subTest(health_passes=health_passes):
@@ -1824,6 +1872,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         restrictive_permissions=False,
         app_route=None,
         next_config=None,
+        next_config_name="next.config.mjs",
     ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -1841,7 +1890,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         }
         (package_dir / "package.json").write_text(json.dumps(package_data), encoding="utf-8")
         if next_config is not None:
-            (package_dir / "next.config.mjs").write_text(next_config, encoding="utf-8")
+            (package_dir / next_config_name).write_text(next_config, encoding="utf-8")
         (repo / "app").mkdir(exist_ok=True)
         (repo / "app" / "page.tsx").write_text("export default function Page() { return null; }\n", encoding="utf-8")
         if root_package is not None:
@@ -1910,8 +1959,60 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
         repo, release, _, _ = self.build_project({}, runner, app_route="/custom/", next_config=config)
         self.assertEqual((repo / "next.config.mjs").read_text(encoding="utf-8"), config)
-        self.assertEqual((release / "app" / "next.config.mjs").read_text(encoding="utf-8"), config)
+        release_config = release / "app" / "next.config.mjs"
+        self.assertIn("process.env.APP_BASE_PATH", release_config.read_text(encoding="utf-8"))
+        original_config = release / "app" / "next.config.app-manager-original.mjs"
+        self.assertEqual(original_config.read_text(encoding="utf-8"), config)
         self.assertEqual(runner.call_args_list[1].args[0][-1], "/custom")
+
+    def test_nextjs_typescript_config_is_wrapped_and_preserved_for_route_adjustment(self):
+        config = "import type { NextConfig } from 'next';\nconst config: NextConfig = {};\nexport default config;\n"
+        runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+        repo, release, _, _ = self.build_project(
+            {}, runner, app_route="/demo/", next_config=config, next_config_name="next.config.ts"
+        )
+
+        self.assertEqual((repo / "next.config.ts").read_text(encoding="utf-8"), config)
+        release_app = release / "app"
+        wrapper = (release_app / "next.config.mjs").read_text(encoding="utf-8")
+        self.assertIn("nextRequire('@swc/core')", wrapper)
+        self.assertIn("process.env.APP_BASE_PATH", wrapper)
+        self.assertEqual(
+            (release_app / "next.config.app-manager-original.ts").read_text(encoding="utf-8"),
+            config,
+        )
+
+    def test_nextjs_static_export_uses_exported_files_without_a_runtime_service(self):
+        commands = []
+
+        def runner(command, cwd, timeout):
+            commands.append(command)
+            if command[:2] == ["node", "--eval"]:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="APP_MANAGER_NEXT_STATIC_EXPORT", stderr=""
+                )
+            if command == ["npm", "run", "build"]:
+                output = cwd / "out"
+                output.mkdir()
+                (output / "index.html").write_text("<h1>Exported</h1>", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        repo, release, result, _ = self.build_project(
+            {},
+            runner,
+            app_route="/demo/",
+            next_config="module.exports = { output: 'export' };\n",
+            next_config_name="next.config.js",
+        )
+
+        self.assertEqual(result["runtime_required"], False)
+        self.assertEqual(result["static_root"], "out")
+        self.assertEqual(result["start_command"], [])
+        self.assertEqual(
+            (release / "app" / "out" / "index.html").read_text(encoding="utf-8"),
+            "<h1>Exported</h1>",
+        )
+        self.assertNotIn(["npm", "prune", "--omit=dev", "--no-fund", "--no-audit"], commands)
 
     def test_npm_shrinkwrap_is_used_as_npm_lockfile(self):
         shrinkwrap = json.dumps({"lockfileVersion": 3, "packages": {}})
@@ -2748,6 +2849,15 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             self.assertEqual(expected_file, mapped_file)
         self.assertNotIn("proxy_pass", static)
         self.assertNotIn("rewrite ", static)
+        exported = manager._render_nginx_config(
+            app_id, 8123, template, "static", config=config, static_root="apps/web/out"
+        )
+        exported_root = static_root / "apps" / "web" / "out"
+        self.assertIn(f"alias {manager._nginx_quote(str(exported_root) + os.sep)};", exported)
+        with self.assertRaises(ValueError):
+            manager._render_nginx_config(
+                app_id, 8123, template, "static", config=config, static_root="../outside"
+            )
         self.assertNotIn("proxy_pass http://127.0.0.1:8123/;", nextjs)
         with self.assertRaises(ValueError):
             manager._render_nginx_config("../outside", 8123, template, "nextjs")

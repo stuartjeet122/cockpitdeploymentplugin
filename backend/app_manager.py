@@ -1193,11 +1193,40 @@ def _routed_health_path(app: Dict[str, Any]) -> str:
     return route + health.lstrip("/")
 
 
+def _is_static_app(app: Dict[str, Any]) -> bool:
+    if app.get("static_export") is True:
+        return True
+    return app.get("framework") == "static" and not app.get("build_config", {}).get("start_command")
+
+
+def _static_root_relative_path(value: Any) -> Path:
+    if value in (None, ""):
+        return Path(".")
+    if not isinstance(value, str) or "\\" in value or "\0" in value or value.startswith("/"):
+        raise ValueError("Static output directory must be a relative POSIX path")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("Static output directory contains an invalid path component")
+    return Path(*parts)
+
+
+def _static_content_root(app: Dict[str, Any], config: Dict[str, Any]) -> Path:
+    app_root = _app_paths(app["id"], config)["current"] / "app"
+    content_root = app_root / _static_root_relative_path(app.get("static_root"))
+    try:
+        content_root.resolve(strict=True).relative_to(app_root.resolve(strict=True))
+    except FileNotFoundError:
+        return content_root
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Static output directory is missing or escapes the application release") from exc
+    return content_root
+
+
 def app_health_url(app: Dict[str, Any]) -> str:
     health = app.get("health_check_url") or "/"
     if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
         raise ValueError("Health-check URL must be a local path")
-    if app.get("framework") == "static" and not app.get("build_config", {}).get("start_command"):
+    if _is_static_app(app):
         return DEFAULT_PUBLIC_ORIGIN + _routed_health_path(app)
     if app.get("framework") == "nextjs":
         health = _routed_health_path(dict(app, active_route=app.get("route")))
@@ -1208,8 +1237,8 @@ def app_health_url(app: Dict[str, Any]) -> str:
 
 
 def check_app_health(app: Dict[str, Any], timeout_seconds: int = 30) -> bool:
-    if app.get("framework") == "static" and not app.get("build_config", {}).get("start_command"):
-        index = _app_paths(app["id"], get_config())["current"] / "app" / "index.html"
+    if _is_static_app(app):
+        index = _static_content_root(app, get_config()) / "index.html"
         return bool(app.get("hosting_active") and app.get("status") == "running" and index.is_file())
     request = urllib.request.Request(app_health_url(app), method="GET")
     opener = urllib.request.build_opener(_NoRedirectHandler())
@@ -2235,6 +2264,7 @@ def _render_nginx_config(
     framework: str = "nextjs",
     config: Optional[Dict[str, Any]] = None,
     route: Optional[str] = None,
+    static_root: Optional[str] = None,
 ) -> str:
     app_id = validate_app_id(app_id)
     route = validate_app_route(route, app_id)
@@ -2253,7 +2283,7 @@ def _render_nginx_config(
     proxy_uri = "" if framework == "nextjs" else "/"
     if framework == "static":
         config = config or get_config()
-        app_root = _app_paths(app_id, config)["current"] / "app"
+        app_root = _app_paths(app_id, config)["current"] / "app" / _static_root_relative_path(static_root)
         route_location = (
             f"# Managed by Cockpit App Manager: {app_id}\n"
             f"location ^~ {route} {{\n"
@@ -2633,6 +2663,7 @@ def _activate_nginx_config_locked(
         framework=framework,
         config=config,
         route=app.get("route"),
+        static_root=app.get("static_root"),
     )
     previous_content = _write_nginx_snippet(snippet_path, rendered)
     site_path: Optional[Path] = None
@@ -2928,10 +2959,10 @@ def _setup_app_directories(app: Dict[str, Any], username: str, config: Dict[str,
         _resolved_path(Path(item["release"]))
         for item in app.get("deployments", [])
         if isinstance(item, dict)
-        and item.get("framework") == "static"
+        and (item.get("framework") == "static" or item.get("static_export") is True)
         and isinstance(item.get("release"), str)
     }
-    if app.get("framework") == "static":
+    if _is_static_app(app):
         current = paths["current"].resolve(strict=False)
         if current.exists():
             public_releases.add(current)
@@ -3522,8 +3553,19 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             )
             _append_deployment_log(deployment_log, "Build completed; activating the release")
             _raise_if_deployment_cancelled(cancel_file)
-            _seal_release(release_dir, release_group, public=framework == "static")
             runtime_required = build_result.get("runtime_required", True)
+            static_root = build_result.get("static_root")
+            static_export = bool(static_root)
+            if static_export:
+                _static_root_relative_path(static_root)
+                app_snapshot["static_export"] = True
+                app_snapshot["static_root"] = static_root
+            else:
+                app_snapshot.pop("static_export", None)
+                app_snapshot.pop("static_root", None)
+            hosting_framework = "static" if framework == "static" or static_export else framework
+            record["static_export"] = static_export
+            _seal_release(release_dir, release_group, public=hosting_framework == "static")
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
             working_directory = None
             build_working_directory = build_result.get("working_directory")
@@ -3559,8 +3601,10 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
                     raise RuntimeError("Application did not pass its health check before the timeout")
                 _assert_loopback_binding(app_snapshot, int(config["command_timeout_seconds"]))
-            elif not (release_dir / "app" / "index.html").is_file():
-                raise RuntimeError("Static release is missing index.html")
+            elif hosting_framework == "static":
+                static_release_root = release_dir / "app" / _static_root_relative_path(static_root)
+                if not (static_release_root / "index.html").is_file():
+                    raise RuntimeError("Static release is missing index.html")
             _raise_if_deployment_cancelled(cancel_file)
             if staged:
                 _atomic_symlink(release_dir, paths["current"])
@@ -3569,7 +3613,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 _raise_if_deployment_cancelled(cancel_file)
                 latest = _find_app(registry, app_id)["deployments"][0]
                 latest["abortable"] = False
-            hosting_result = _activate_nginx_config(app_snapshot, framework, config)
+            hosting_result = _activate_nginx_config(app_snapshot, hosting_framework, config)
             route_activated = True
             record["hosting"] = hosting_result
             record["abortable"] = False
@@ -3579,6 +3623,11 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             with _registry_transaction() as registry:
                 app = _find_app(registry, app_id)
                 app["framework"] = framework
+                app["static_export"] = static_export
+                if static_export:
+                    app["static_root"] = static_root
+                else:
+                    app.pop("static_root", None)
                 app["status"] = "running"
                 app["hosting_active"] = (
                     True if hosting_result["active"] else bool(app_snapshot.get("hosting_active", False))
@@ -3614,7 +3663,8 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 if staged:
                     if route_activated:
                         previous_route_app = dict(previous_app, route=previous_app.get("active_route") or previous_app["route"])
-                        _activate_nginx_config(previous_route_app, previous_app["framework"], config)
+                        previous_framework = "static" if _is_static_app(previous_app) else previous_app["framework"]
+                        _activate_nginx_config(previous_route_app, previous_framework, config)
                     if unit_written and service_path is not None:
                         _systemctl("disable", "--now", service_path.name)
                         _restore_service_file(service_path, None)
@@ -3796,12 +3846,12 @@ def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
             app_snapshot = dict(app)
-        if app_snapshot.get("framework") == "static" and not app_snapshot.get("build_config", {}).get("start_command"):
+        if _is_static_app(app_snapshot):
             route = app_snapshot.get("active_route") or app_snapshot["route"]
             if action_name == "stop":
                 _remove_nginx_config(app_id, config)
             else:
-                index = _app_paths(app_id, config)["current"] / "app" / "index.html"
+                index = _static_content_root(app_snapshot, config) / "index.html"
                 if not index.is_file():
                     raise RuntimeError("Static application has no deployed index.html; deploy it first")
                 _activate_nginx_config(dict(app_snapshot, route=route), "static", config)
@@ -3972,7 +4022,7 @@ def metrics_app(app_id: str) -> Dict[str, Any]:
     metrics = {"checked_at": now_iso(), "sample_time": time.monotonic(), "cpu_percent": None,
                "memory_bytes": None, "peak_memory_bytes": None, "tasks": None, "restarts": None,
                "uptime_seconds": None, "service_state": "not-required", "errors": []}
-    if app.get("framework") != "static" or app.get("build_config", {}).get("start_command"):
+    if not _is_static_app(app):
         try:
             result = _systemctl("show", _service_path(app).name,
                                 "--property=ActiveState,CPUUsageNSec,MemoryCurrent,MemoryPeak,TasksCurrent,NRestarts,ActiveEnterTimestampMonotonic,InvocationID", timeout=5)
@@ -4011,7 +4061,7 @@ def health_check_app(app_id: str) -> Dict[str, Any]:
     app = _find_app(get_registry(), app_id)
     app = dict(app, route=app.get("active_route") or app["route"])
     url = app_health_url(app)
-    static = app.get("framework") == "static" and not app.get("build_config", {}).get("start_command")
+    static = _is_static_app(app)
     service_state = "not-required" if static else "unknown"
     service_error = None
     if not static:
