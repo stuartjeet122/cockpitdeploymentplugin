@@ -1273,6 +1273,18 @@ class AppManagerTests(unittest.TestCase):
         with patch.object(manager, "_plugin_git", return_value=subprocess.CompletedProcess([], 0, output, "")):
             self.assertEqual(manager._plugin_remote_release(), {"version": "v1.10.0", "commit": "b" * 40})
 
+    def test_plugin_update_check_explains_when_repository_has_no_release_tags(self):
+        with patch.object(
+            manager,
+            "_plugin_git",
+            return_value=subprocess.CompletedProcess([], 2, "", ""),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "No versioned App Manager release tags.*annotated, signed",
+            ):
+                manager._plugin_remote_release()
+
     def test_plugin_tree_rejects_modified_and_unexpected_files(self):
         import hashlib
         checkout = Path(self.temp_dir.name) / "checkout"

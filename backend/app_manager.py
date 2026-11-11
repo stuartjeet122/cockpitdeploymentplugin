@@ -1765,6 +1765,11 @@ def _plugin_remote_release() -> Dict[str, str]:
             "refs/tags/v*",
         ]
     )
+    if result.returncode == 2:
+        raise RuntimeError(
+            "No versioned App Manager release tags were found on GitHub. "
+            "The update checker requires an annotated, signed vMAJOR.MINOR.PATCH tag."
+        )
     _command_error(result, "Checking for App Manager updates")
     releases = {}
     for line in (result.stdout or "").splitlines():
