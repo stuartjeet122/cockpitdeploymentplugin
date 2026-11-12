@@ -137,6 +137,7 @@ Project conventions and deployment requirements are documented in `AGENTS.md` an
 
 ## Deployment and safety
 
+- Build commands run in uniquely named `cockpit-app-manager-build-*.scope` units. Cancellation and build timeouts terminate that build scope, including detached descendants, without targeting the application's live runtime service. Live output draining remains cancellable after the command launcher exits, so open child-process pipes cannot hide an abort request.
 - Ports are allocated from 8100–8999. Port 8080 is excluded. Registration holds the registry lock while checking existing allocations and listening sockets and recording the new port.
 - Git remotes must use HTTPS or SSH. Retained checkouts reject local changes and branch changes and only merge with `--ff-only`. Fresh checkouts must descend from the recorded deployed commit before activation.
 - Each app uses a dedicated system account named `app-<app-id>`. Git operations, dependency installation, and build commands run as that account, never as root. The generated systemd service also uses that account. Runtime startup must pass a local health check and an actual TCP listener check; public IPv4 or IPv6 bindings on the assigned port are rejected and stopped before the new route is activated.

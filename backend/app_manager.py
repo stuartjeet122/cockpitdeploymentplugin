@@ -638,6 +638,12 @@ class DeploymentAborted(RuntimeError):
 
 def _terminate_process(process: subprocess.Popen) -> None:
     if os.name != "nt":
+        arguments = process.args
+        if isinstance(arguments, (list, tuple)) and arguments and arguments[0] == "systemd-run" and "--scope" in arguments:
+            scope = next((argument.removeprefix("--unit=") for argument in arguments if argument.startswith("--unit=")), "")
+            if re.fullmatch(r"cockpit-app-manager-build-[a-f0-9]{32}\.scope", scope):
+                with contextlib.suppress(OSError, RuntimeError):
+                    run_command(["systemctl", "kill", "--signal=SIGKILL", "--kill-who=all", scope], timeout=5)
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except OSError:
@@ -872,7 +878,7 @@ def _run_command_with_live_log(
     cancelled = False
     deadline = time.monotonic() + max(1, int(timeout))
     try:
-        while process.poll() is None:
+        while process.poll() is None or any(thread.is_alive() for thread in threads):
             if cancel_file is not None and cancel_file.exists():
                 cancelled = True
                 _terminate_process(process)
@@ -886,6 +892,9 @@ def _run_command_with_live_log(
                 process.wait(timeout=min(0.1, remaining))
             except subprocess.TimeoutExpired:
                 continue
+            if process.poll() is not None:
+                for thread in threads:
+                    thread.join(timeout=min(0.05, max(0, deadline - time.monotonic())))
         returncode = process.wait()
     finally:
         for thread in threads:
@@ -1024,6 +1033,22 @@ def _seal_release(release_dir: Path, group_id: int, *, public: bool = False) -> 
                 os.chmod(str(child), permissions)
 
 
+def _identity_switch_diagnostics() -> str:
+    details = [f"interpreter={sys.executable}", f"setpriv={shutil.which('setpriv') or 'not-found'}"]
+    fields = {"Uid", "Gid", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs", "Seccomp"}
+    for name in ("status", "uid_map", "attr/current"):
+        try:
+            with (Path("/proc/self") / name).open(encoding="utf-8", errors="replace") as handle:
+                contents = handle.read(4096)
+            if name == "status":
+                details.extend(line for line in contents.splitlines() if line.partition(":")[0] in fields)
+            else:
+                details.append(f"{name}={contents.strip()}")
+        except OSError:
+            details.append(f"{name}=unavailable")
+    return "Identity-switch parent diagnostics: " + "; ".join(details)
+
+
 def _run_as_user(
     username: str,
     args: Sequence[str],
@@ -1060,12 +1085,13 @@ def _run_as_user(
         limits = _resource_limits(resource_limits)
         command = [
             "systemd-run", "--scope", "--quiet", "--collect",
+            f"--unit=cockpit-app-manager-build-{uuid.uuid4().hex}.scope",
             f"--property=MemoryMax={limits['build_memory_mb']}M",
             f"--property=CPUQuota={limits['build_cpu_percent']}%",
             f"--property=TasksMax={limits['build_tasks_max']}",
             "--", *command,
         ]
-    return run_command(
+    result = run_command(
         command,
         cwd=cwd,
         timeout=timeout,
@@ -1074,6 +1100,10 @@ def _run_as_user(
         cancel_file=cancel_file,
         preserve_stdout=preserve_stdout,
     )
+    if result.returncode != 0 and "setpriv:" in (result.stderr or "") and "setresuid failed" in result.stderr:
+        detail = _redact_text(_identity_switch_diagnostics(), list((environment or {}).values()))
+        result.stderr = (result.stderr or "").rstrip() + "\n" + detail
+    return result
 
 
 def _run_checked_as_user(

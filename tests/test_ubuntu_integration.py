@@ -133,6 +133,32 @@ class UbuntuIntegrationTests(unittest.TestCase):
             self.assertEqual(int(status[key].strip(), 16), 0, key)
         self.assertEqual(status["NoNewPrivs"].strip(), "1")
 
+    def test_build_abort_terminates_detached_scope_children(self):
+        username = manager.ensure_app_user("it-static")
+        home = manager._home_path("it-static")
+        cancel = home / "scope-abort.cancel"
+        child_pid_path = home / "scope-child.pid"
+        script = (
+            "import subprocess,sys; from pathlib import Path; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); "
+            f"Path({str(child_pid_path)!r}).write_text(str(child.pid)); "
+            f"Path({str(cancel)!r}).touch()"
+        )
+        with self.assertRaises(manager.DeploymentAborted):
+            manager._run_as_user(
+                username, ["python3", "-c", script], timeout=15,
+                live_log_path=self.state / "scope-abort.log", cancel_file=cancel,
+                resource_limits={"build_memory_mb": 256},
+            )
+        child_pid = int(child_pid_path.read_text())
+        status_path = Path(f"/proc/{child_pid}/status")
+        try:
+            status = status_path.read_text()
+        except FileNotFoundError:
+            return
+        state = next(line for line in status.splitlines() if line.startswith("State:"))
+        self.assertIn("Z", state, "Detached build child is still running after abort")
+
     def test_real_framework_deployments_and_recovery(self):
         fixtures = {
             "static": {"index.html": "release-one"},

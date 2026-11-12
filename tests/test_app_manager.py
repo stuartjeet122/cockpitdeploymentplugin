@@ -108,6 +108,53 @@ class AppManagerTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["preserve_stdout"])
         self.assertEqual(run.call_args.kwargs["redact_values"], ["private"])
 
+    def test_identity_switch_failure_includes_redacted_parent_diagnostics(self):
+        for returncode, stderr, expected_diagnostics in (
+            (127, "setpriv: setresuid failed: Operation not permitted", True),
+            (1, "git: repository not found", False),
+            (0, "", False),
+        ):
+            with self.subTest(returncode=returncode, stderr=stderr), patch.object(
+                manager, "_require_root"
+            ), patch.object(manager.os, "name", "posix"), patch.object(
+                manager, "_account_exists", return_value=True
+            ), patch.object(manager, "_home_path", return_value="/managed/home"), patch.object(
+                manager, "run_command", return_value=subprocess.CompletedProcess([], returncode, "", stderr)
+            ) as run, patch.object(
+                manager, "_identity_switch_diagnostics", return_value="interpreter=/private/python; CapEff: 04eb"
+            ) as diagnostics:
+                result = manager._run_as_user("app-demo", ["git", "ls-remote"], environment={"SECRET": "private"})
+            self.assertEqual(result.returncode, returncode)
+            run.assert_called_once()
+            if expected_diagnostics:
+                diagnostics.assert_called_once()
+                self.assertIn("CapEff: 04eb", result.stderr)
+                self.assertIn("/[REDACTED]/python", result.stderr)
+                self.assertNotIn("private", result.stderr)
+            else:
+                diagnostics.assert_not_called()
+                self.assertEqual(result.stderr, stderr)
+
+    def test_identity_switch_diagnostics_are_bounded_and_exclude_environment(self):
+        with patch.object(manager.Path, "open") as opened, patch.object(manager.shutil, "which", return_value="/usr/bin/setpriv"):
+            opened.return_value.__enter__.return_value.read.side_effect = [
+                "Uid:\t0\t0\t0\t0\nCapEff:\t00000000000004eb\nSECRET=must-not-appear\n",
+                "0 0 4294967295\n", "unconfined\n",
+            ]
+            detail = manager._identity_switch_diagnostics()
+        self.assertIn("CapEff:\t00000000000004eb", detail)
+        self.assertIn("setpriv=/usr/bin/setpriv", detail)
+        self.assertIn("uid_map=0 0 4294967295", detail)
+        self.assertNotIn("must-not-appear", detail)
+        self.assertEqual(opened.return_value.__enter__.return_value.read.call_args_list, [mock_call(4096)] * 3)
+
+    def test_identity_switch_diagnostics_tolerate_unavailable_proc(self):
+        with patch.object(manager.Path, "open", side_effect=PermissionError("unavailable")):
+            detail = manager._identity_switch_diagnostics()
+        self.assertIn("status=unavailable", detail)
+        self.assertIn("uid_map=unavailable", detail)
+        self.assertIn("attr/current=unavailable", detail)
+
     def test_unsupported_framework_detection_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "Could not detect"):
@@ -749,6 +796,50 @@ class AppManagerTests(unittest.TestCase):
 
         self.assertTrue(aborted)
         self.assertTrue(manager.deployment_logs_app(app["id"], result["deployment_id"])["aborting"])
+
+    def test_live_command_checks_cancellation_after_launcher_exits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cancel_file = Path(temporary) / "cancel"
+            cancel_file.touch()
+            release_readers = threading.Event()
+            process = Mock()
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            process.returncode = 0
+
+            def read_pipe(descriptor, size):
+                release_readers.wait(timeout=2)
+                return b""
+
+            try:
+                with patch.object(manager.subprocess, "Popen", return_value=process), patch.object(
+                    manager.os, "read", side_effect=read_pipe
+                ), patch.object(manager, "_terminate_process", side_effect=lambda command: release_readers.set()) as terminate:
+                    with self.assertRaisesRegex(manager.DeploymentAborted, "aborted by request"):
+                        manager.run_command(
+                            ["launcher"], live_log_path=Path(temporary) / "deployment.log", cancel_file=cancel_file,
+                        )
+                    terminate.assert_called_once_with(process)
+            finally:
+                release_readers.set()
+
+    def test_termination_kills_only_the_managed_build_scope(self):
+        scope = "cockpit-app-manager-build-" + "a" * 32 + ".scope"
+        for unit, should_kill in ((scope, True), ("cockpit-app-scrumtimer.service", False), ("unrelated.scope", False)):
+            with self.subTest(unit=unit):
+                process = Mock()
+                process.args = ["systemd-run", "--scope", f"--unit={unit}", "--", "npm", "install"]
+                process.poll.return_value = 0
+                with patch.object(manager.os, "name", "posix"), patch.object(
+                    manager.os, "killpg", create=True
+                ), patch.object(manager.signal, "SIGKILL", 9, create=True), patch.object(manager, "run_command") as run:
+                    manager._terminate_process(process)
+                if should_kill:
+                    run.assert_called_once_with([
+                        "systemctl", "kill", "--signal=SIGKILL", "--kill-who=all", scope,
+                    ], timeout=5)
+                else:
+                    run.assert_not_called()
 
     def test_cancellable_command_terminates_its_process(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3262,6 +3353,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], "systemd-run")
         self.assertIn("--property=MemoryMax=768M", command)
+        self.assertRegex(next(item for item in command if item.startswith("--unit=")),
+                 r"^--unit=cockpit-app-manager-build-[a-f0-9]{32}\.scope$")
         self.assertIn("setpriv", command)
         self.assertIn("--reuid=app-demo", command)
         self.assertIn("--regid=app-demo", command)
