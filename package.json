@@ -10,6 +10,7 @@
     "lint": "python -m compileall backend tests && node --check cockpit/app-manager.js"
   },
   "devDependencies": {
+    "@babel/parser": "^7.28.5",
     "esbuild": "^0.28.2",
     "jsdom": "^31.0.0",
     "lucide": "^0.554.0"

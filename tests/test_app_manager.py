@@ -2501,6 +2501,12 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         check = runner.call_args_list[1].args[0]
         self.assertEqual(check[:2], ["node", "--eval"])
         self.assertEqual(check[-1], "/demo")
+        preparation = runner.call_args_list[2]
+        self.assertEqual(preparation.args[0], [
+            "node", str(Path(__file__).resolve().parents[1] / "backend" / "prepare_next_assets.cjs"), "/demo",
+        ])
+        self.assertEqual(preparation.args[1], release / "app")
+        self.assertEqual(runner.call_args_list[3].args[0], ["npm", "run", "build"])
 
     def test_nextjs_preserves_existing_config_and_validates_its_route(self):
         config = "export default { basePath: '/custom', trailingSlash: true };\n"
@@ -3706,6 +3712,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         )
         self.assertIn("return 308 /website1/$is_args$args;", nextjs)
         self.assertIn("location ^~ /website1/ {", nextjs)
+        environment_guard = '    if ($uri ~* "(^|/)[.]env([./]|$)") { return 404; }'
+        self.assertIn("location ^~ /website1/ {\n" + environment_guard, nextjs)
         next_proxy_pass = next(line for line in nextjs.splitlines() if "proxy_pass " in line)
         self.assertTrue(next_proxy_pass.endswith("8123;"))
         self.assertIn("proxy_http_version 1.1;", nextjs)
@@ -3732,6 +3740,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
 
         for framework in ("go", "node", "python"):
             stripped_prefix = manager._render_nginx_config(app_id, 8123, template, framework)
+            self.assertIn("location ^~ /website1/ {\n" + environment_guard, stripped_prefix)
             proxy_pass = next(line for line in stripped_prefix.splitlines() if "proxy_pass " in line)
             proxy_uri = proxy_pass.split("8123", 1)[1].rstrip(";")
             self.assertIn("proxy_pass http://127.0.0.1:8123/;", stripped_prefix)
@@ -3755,6 +3764,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         config = manager._default_config()
         config["production_root"] = "/opt/webapps"
         static = manager._render_nginx_config(app_id, 8123, template, "static", config=config)
+        self.assertIn("location ^~ /website1/ {\n" + environment_guard, static)
         static_root = manager._app_paths(app_id, config)["current"] / "app"
         self.assertIn(f"alias {manager._nginx_quote(str(static_root) + os.sep)};", static)
         self.assertIn("try_files $uri $uri/ /website1/index.html;", static)

@@ -2370,12 +2370,14 @@ def _render_nginx_config(
     except OSError as exc:
         raise RuntimeError(f"Could not read Nginx template {template_path}: {exc}") from exc
     proxy_uri = "" if framework == "nextjs" else "/"
+    environment_guard = '    if ($uri ~* "(^|/)[.]env([./]|$)") { return 404; }\n'
     if framework == "static":
         config = config or get_config()
         app_root = _app_paths(app_id, config)["current"] / "app" / _static_root_relative_path(static_root)
         route_location = (
             f"# Managed by Cockpit App Manager: {app_id}\n"
             f"location ^~ {route} {{\n"
+            f"{environment_guard}"
             f"    alias {_nginx_quote(str(app_root) + os.sep)};\n"
             "    index index.html;\n"
             f"    try_files $uri $uri/ {route}index.html;\n"
@@ -2394,6 +2396,7 @@ def _render_nginx_config(
         route_location = (
             f"# Managed by Cockpit App Manager: {app_id}\n"
             f"location ^~ {route} {{\n"
+            f"{environment_guard}"
             f"    proxy_pass http://127.0.0.1:{port}{proxy_uri};\n"
             "    proxy_http_version 1.1;\n"
             "    proxy_set_header Host $host;\n"

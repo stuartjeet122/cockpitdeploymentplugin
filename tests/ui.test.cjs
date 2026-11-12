@@ -5,6 +5,82 @@ const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
 const root = path.resolve(__dirname, "..");
+test("deployment prefixes parsed local asset literals only in the release copy", () => {
+  const os = require("node:os");
+  const { spawnSync } = require("node:child_process");
+  const { parse } = require("@babel/parser");
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "app-manager-assets-"));
+  try {
+    const checkout = path.join(temporary, "checkout");
+    const release = path.join(temporary, "release");
+    fs.mkdirSync(path.join(checkout, "src"), { recursive: true });
+    fs.mkdirSync(path.join(checkout, "public", "icons"), { recursive: true });
+    fs.writeFileSync(path.join(checkout, "package.json"), "{}");
+    fs.writeFileSync(path.join(checkout, "infomil-logo.svg"), "<svg/>");
+    fs.writeFileSync(path.join(checkout, "public", "icons", "logo.svg"), "<svg/>");
+    fs.writeFileSync(path.join(checkout, "public", ".env"), "FIXTURE=private");
+    const source = [
+      'import logo from "/infomil-logo.svg";',
+      '// Keep /infomil-logo.svg in comments.',
+      'const generated: string = "/infomil-logo.svg?version=1#mark";',
+      'const template = `/icons/logo.svg`;',
+      'const dynamic = `/icons/${name}.svg`;',
+      'const logoImage = <img src="/infomil-logo.svg" />;',
+      'const quoted = <img src="/icons/logo.svg?label=&quot;logo&quot;" />;',
+      'const unchanged = ["//cdn.example/logo.svg", "https://cdn.example/logo.svg",',
+      '"/scrumtimer/icons/logo.svg", "/another-app/logo.svg", "/api/team", "/.env",',
+      '"/%2e%2e/infomil-logo.svg", "/icons/../infomil-logo.svg", "/missing.svg"];',
+    ].join("\n");
+    fs.writeFileSync(path.join(checkout, "src", "navbar.tsx"), source);
+    fs.writeFileSync(path.join(checkout, "src", "typed.ts"), 'const mode = <string>"fixture";\n');
+    fs.cpSync(checkout, release, { recursive: true });
+    const outside = path.join(temporary, "outside");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "logo.svg"), "<svg/>");
+    fs.symlinkSync(outside, path.join(release, "public", "linked"),
+      process.platform === "win32" ? "junction" : "dir");
+    fs.writeFileSync(path.join(release, "src", "linked.ts"), 'const logo = "/linked/logo.svg";');
+    const parserBridge = path.join(release, "node_modules", "next", "dist", "compiled", "babel");
+    fs.mkdirSync(parserBridge, { recursive: true });
+    fs.writeFileSync(path.join(parserBridge, "core.js"),
+      `exports.parseSync = (source, options) => require(${JSON.stringify(require.resolve("@babel/parser"))}).parse(source, { ...options.parserOpts, sourceType: options.sourceType });`);
+    const helper = path.join(root, "backend", "prepare_next_assets.cjs");
+    const prepared = spawnSync(process.execPath, [helper, "/scrumtimer"], {
+      cwd: release, encoding: "utf8", timeout: 10000,
+    });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const output = fs.readFileSync(path.join(release, "src", "navbar.tsx"), "utf8");
+    assert.ok(output.includes('const generated: string = "/scrumtimer/infomil-logo.svg?version=1#mark";'));
+    assert.ok(output.includes('const template = "/scrumtimer/icons/logo.svg";'));
+    assert.ok(output.includes('src="/scrumtimer/infomil-logo.svg"'));
+    assert.ok(output.includes('src="/scrumtimer/icons/logo.svg?label=&quot;logo&quot;"'));
+    for (const line of source.split("\n").filter(line => !line.startsWith("const generated") &&
+      !line.startsWith("const template") && !line.startsWith("const logoImage") && !line.startsWith("const quoted"))) {
+      assert.ok(output.includes(line), line);
+    }
+    parse(output, { sourceType: "module", plugins: ["typescript", "jsx"] });
+    assert.equal(fs.readFileSync(path.join(checkout, "src", "navbar.tsx"), "utf8"), source);
+    assert.equal(fs.readFileSync(path.join(release, "public", ".env"), "utf8"), "FIXTURE=private");
+    assert.equal(fs.readFileSync(path.join(release, "src", "linked.ts"), "utf8"), 'const logo = "/linked/logo.svg";');
+    assert.equal(fs.readFileSync(path.join(release, "src", "typed.ts"), "utf8"), 'const mode = <string>"fixture";\n');
+    assert.match(prepared.stdout, /Prepared 4 local asset URL\(s\) in 1 release file/);
+    const repeated = spawnSync(process.execPath, [helper, "/scrumtimer"], {
+      cwd: release, encoding: "utf8", timeout: 10000,
+    });
+    assert.equal(repeated.status, 0, repeated.stderr);
+    assert.match(repeated.stdout, /Prepared 0 local asset/);
+    assert.equal(fs.readFileSync(path.join(release, "src", "navbar.tsx"), "utf8"), output);
+    fs.writeFileSync(path.join(release, "src", "broken.tsx"), "export const invalid = <;");
+    const malformed = spawnSync(process.execPath, [helper, "/scrumtimer"], {
+      cwd: release, encoding: "utf8", timeout: 10000,
+    });
+    assert.notEqual(malformed.status, 0);
+    assert.match(malformed.stderr, /Cannot safely prepare asset URLs in src/);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
 const html = fs.readFileSync(path.join(root, "cockpit/index.html"), "utf8");
 const script = fs.readFileSync(path.join(root, "cockpit/app-manager.js"), "utf8");
 const fixtureApps = [

@@ -787,6 +787,11 @@ class NextJSAdapter(FrameworkAdapter):
                 project_dir, timeout, "Checking Next.js public route configuration",
             )
             static_export = (config_result.stdout or "").strip() == "APP_MANAGER_NEXT_STATIC_EXPORT"
+            _run_build(
+                runner,
+                ["node", str(Path(__file__).with_name("prepare_next_assets.cjs")), route.rstrip("/")],
+                project_dir, timeout, "Preparing Next.js local asset URLs for the public route",
+            )
         _run_build(
             runner,
             _js_build_command(manager),
