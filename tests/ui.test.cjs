@@ -290,6 +290,44 @@ test("live logs preserve scroll, skip unchanged redraws, and poll only status wh
   } finally { ui.dom.window.close(); }
 });
 
+test("an aborting deployment can retry recovery without duplicate requests", async () => {
+  const deployment = {
+    app_id: "portal", deployment_id: "20261112024814-82d96f71",
+    active: true, abortable: true, aborting: true, build_status: "running",
+    status: "deploying", logs: "Abort requested",
+  };
+  let finishAbort;
+  const ui = await loadUi({
+    deployments: { deployments: [{ app_id: "portal", id: deployment.deployment_id, status: "deploying" }] },
+    "deployment-logs": deployment,
+    "deployment-abort": () => new Promise((resolve) => { finishAbort = resolve; }),
+  });
+  try {
+    ui.document.querySelector('[data-action="deployment-log"]').click();
+    await settle(ui.window);
+    const button = ui.document.querySelector("#abortDeploymentButton");
+    assert.equal(button.disabled, false);
+    assert.equal(button.textContent, "Retry abort");
+    assert.equal(ui.document.querySelector("#deploymentLiveStatus").textContent, "Cancellation requested");
+    button.click();
+    button.click();
+    await settle(ui.window);
+    assert.equal(button.disabled, true);
+    assert.equal(ui.calls.filter((record) => record.command === "deployment-abort").length, 1);
+    finishAbort({ aborting: true, aborted: false });
+    await settle(ui.window);
+    assert.equal(button.disabled, false);
+    assert.equal(button.textContent, "Retry abort");
+    button.click();
+    await settle(ui.window);
+    finishAbort({ aborting: false, aborted: true });
+    await settle(ui.window);
+    assert.equal(ui.calls.filter((record) => record.command === "deployment-abort").length, 2);
+    assert.equal(button.hidden, true);
+    assert.equal(ui.document.querySelector("#deploymentLiveStatus").textContent, "Deployment was aborted");
+  } finally { ui.dom.window.close(); }
+});
+
 test("deployment logs can be copied and downloaded as plain text", async () => {
   const deployment = {
     app_id: "portal",

@@ -964,6 +964,7 @@
     if (result.active) {
       status.textContent = result.abortable === false
         ? "Finalizing deployment"
+        : result.aborting ? "Cancellation requested"
         : result.build_status === "queued" ? "Queued · waiting for build capacity"
           : result.build_status === "preflight" ? "Checking requirements"
             : result.build_status === "running" ? "Building application"
@@ -985,8 +986,8 @@
     const abortButton = byId("abortDeploymentButton");
     if (abortButton) {
       abortButton.hidden = !result.active || result.abortable === false;
-      abortButton.disabled = result.aborting === true;
-      abortButton.textContent = result.aborting ? "Aborting…" : "Abort deployment";
+      abortButton.disabled = abortButton.dataset.pending === "true";
+      abortButton.textContent = abortButton.disabled ? "Aborting…" : result.aborting ? "Retry abort" : "Abort deployment";
       abortButton.dataset.deploymentId = result.deployment_id || "";
       abortButton.dataset.appId = result.app_id || "";
     }
@@ -1409,16 +1410,23 @@
       void handleAppAction("metrics", metricsButton.dataset.id).catch(showError);
     }
     const abortButton = event.target instanceof Element ? event.target.closest('[data-action="abort-deployment"]') : null;
-    if (abortButton) {
+    if (abortButton && !abortButton.disabled) {
+      const appId = abortButton.dataset.appId;
+      const deploymentId = abortButton.dataset.deploymentId;
+      abortButton.dataset.pending = "true";
       abortButton.disabled = true;
       abortButton.textContent = "Aborting…";
       void callBackend("deployment-abort", [
-        abortButton.dataset.appId,
-        abortButton.dataset.deploymentId,
-      ]).catch((error) => {
+        appId,
+        deploymentId,
+      ]).then((result) => {
+        if (result.aborted) {
+          renderDeploymentLog({ app_id: appId, deployment_id: deploymentId, active: false, status: "aborted" });
+        }
+      }).catch(showError).finally(() => {
+        delete abortButton.dataset.pending;
         abortButton.disabled = false;
-        abortButton.textContent = "Abort deployment";
-        showError(error);
+        abortButton.textContent = "Retry abort";
       });
     }
     if (event.target === event.currentTarget && !state.busy) event.currentTarget.close();
