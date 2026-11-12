@@ -480,6 +480,7 @@ test("environment content is sent on stdin without terminating the backend proce
     await settle(ui.window);
     assert.equal(ui.calls.find((record) => record.command === "env-save").input, 'API_URL="https://api.example.test"\n');
     assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+    assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Redeploy for build-time changes; restart for runtime-only changes/);
   } finally { ui.dom.window.close(); }
 });
 

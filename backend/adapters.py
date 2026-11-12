@@ -497,7 +497,8 @@ def _configure_next_public_route(project_dir: Path, group_id: Optional[int] = No
             "const { transpileConfig } = nextRequire('next/dist/build/next-config-ts/transpile-config');\n"
             f"const originalPath = fileURLToPath(new URL({json.dumps(import_path)}, import.meta.url));\n"
             "export default async function appManagerConfig(phase, context) {\n"
-            "  const originalConfig = await transpileConfig({ nextConfigPath: originalPath, dir: dirname(originalPath) });\n"
+            "  const importedConfig = await transpileConfig({ nextConfigPath: originalPath, dir: dirname(originalPath) });\n"
+            "  const originalConfig = importedConfig.default ?? importedConfig;\n"
             "  const config = typeof originalConfig === 'function'\n"
             "    ? await originalConfig(phase, context)\n"
             "    : originalConfig;\n"
@@ -527,7 +528,8 @@ def _configure_next_public_route(project_dir: Path, group_id: Optional[int] = No
         )
     else:
         wrapper = (
-            f"const originalConfig = require({json.dumps(import_path)});\n"
+            f"const importedConfig = require({json.dumps(import_path)});\n"
+            "const originalConfig = importedConfig.default ?? importedConfig;\n"
             "module.exports = async function appManagerConfig(phase, context) {\n"
             "  const config = typeof originalConfig === 'function'\n"
             "    ? await originalConfig(phase, context)\n"
@@ -1026,7 +1028,10 @@ class _StaticAssetParser(HTMLParser):
         updated = []
         changed = False
         for name, value in attrs:
-            if tag != "base" and name in {"src", "href", "poster", "data"} and value:
+            if tag == "base" and name == "href" and value == "/":
+                value = self.route
+                changed = True
+            elif tag != "base" and name in {"src", "href", "poster", "data"} and value:
                 parsed = urlsplit(value)
                 if not parsed.scheme and not parsed.netloc and parsed.path.startswith("/") and not parsed.path.startswith(("//", self.route)):
                     asset = self.root / unquote(parsed.path).lstrip("/")

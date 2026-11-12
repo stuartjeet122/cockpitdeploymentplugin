@@ -826,7 +826,7 @@
   async function manageEnvironment(app) {
     const result = await callBackend("env-get", [app.id]);
     const body = `
-      <p class="am-dialog-intro">Manage private runtime variables for ${escapeHtml(app.name)}. Values are stored outside the source checkout.</p>
+      <p class="am-dialog-intro">Private build and runtime environment for ${escapeHtml(app.name)}.</p>
       <div class="am-env-tools">
         <label class="am-button" for="environmentImport">Import .env or text file</label>
         <input id="environmentImport" class="am-visually-hidden" type="file" accept=".env,.env.*,.txt,text/plain">
@@ -835,7 +835,7 @@
       </div>
       <div class="am-env-row am-env-row--heading" aria-hidden="true"><span>Key</span><span>Value</span><span></span></div>
       <div id="environmentRows" class="am-env-rows">${environmentMarkup(parseEnvironmentContent(result.content || ""))}</div>
-      <small class="am-field-hint">Import files with one KEY=value assignment per line. Values are applied when the application next starts or deploys. Maximum size: 64 KiB.</small>
+      <small class="am-field-hint">Import one KEY=value assignment per line. Maximum size: 64 KiB. Build-time changes require redeployment; runtime-only changes require a restart. Static HTML has no runtime environment.</small>
     `;
     openDialog(`Environment: ${app.name}`, body, "Save variables", async (form) => {
       const rows = readEnvironmentRows(form.querySelector("#environmentRows"));
@@ -847,7 +847,7 @@
         async () => {
           const response = await callBackendInput("env-save", [app.id], content);
           showNotice(
-            `${response.key_count} environment ${response.key_count === 1 ? "variable" : "variables"} saved. Restart or deploy the application to apply changes.`,
+            `${response.key_count} environment ${response.key_count === 1 ? "variable" : "variables"} saved. Redeploy for build-time changes; restart for runtime-only changes.`,
           );
         },
         "",

@@ -2570,6 +2570,40 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
                 self.assertTrue(backup.is_file())
                 self.assertIn(expected, wrapper)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to evaluate generated configs")
+    def test_nextjs_preserves_default_exported_environment_and_asset_settings(self):
+        runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+        config = "exports.default = async () => ({ env: { PUBLIC_MODE: 'test' }, images: { unoptimized: true } });\n"
+        for config_name in ("next.config.cjs", "next.config.ts"):
+            with self.subTest(config=config_name):
+                _, release, _, _ = self.build_project(
+                    {}, runner, app_route="/demo/", next_config=config, next_config_name=config_name
+                )
+                release_app = release / "app"
+                if config_name.endswith(".ts"):
+                    next_package = release_app / "node_modules" / "next"
+                    transpiler = next_package / "dist" / "build" / "next-config-ts" / "transpile-config.js"
+                    transpiler.parent.mkdir(parents=True)
+                    (next_package / "index.js").write_text("", encoding="utf-8")
+                    transpiler.write_text(
+                        "exports.transpileConfig = async () => { const exports = {}; "
+                        + config + "return exports; };\n", encoding="utf-8",
+                    )
+                    script = "import('./next.config.mjs').then(module => module.default('phase', {}))"
+                else:
+                    script = "Promise.resolve(require('./next.config.cjs')('phase', {}))"
+                script += ".then(value => process.stdout.write(JSON.stringify(value)));"
+                result = subprocess.run(
+                    [shutil.which("node"), "--eval", script], cwd=release_app,
+                    env={**os.environ, "APP_BASE_PATH": "/demo"}, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                resolved = json.loads(result.stdout)
+                self.assertEqual(resolved["env"], {"PUBLIC_MODE": "test"})
+                self.assertEqual(resolved["images"], {"unoptimized": True})
+                self.assertEqual(resolved["basePath"], "/demo")
+                self.assertNotIn("default", resolved)
+
     def test_nextjs_static_export_uses_exported_files_without_a_runtime_service(self):
         commands = []
 
@@ -3018,10 +3052,11 @@ class FrameworkAdapterTests(unittest.TestCase):
             source.mkdir()
             (source / "assets").mkdir()
             (source / "assets" / "icon.svg").write_text("<svg/>", encoding="utf-8")
-            page = '<!doctype html>\n<link rel="icon" href="/assets/icon.svg?v=1&amp;x=2"><img src="/assets/icon.svg"/><a href="/other-app/">Other</a><script>const url="/assets/icon.svg";</script><img src="//cdn.example/icon.svg"><img src="/docs/assets/icon.svg">'
+            page = '<!doctype html>\n<base href="/"><link rel="icon" href="/assets/icon.svg?v=1&amp;x=2"><img src="/assets/icon.svg"/><a href="/other-app/">Other</a><script>const url="/assets/icon.svg";</script><img src="//cdn.example/icon.svg"><img src="/docs/assets/icon.svg">'
             (source / "index.html").write_text(page, encoding="utf-8")
             result = get_adapter("static").build({"port": 8123, "route": "/docs/"}, source, root / "release")
             output = (Path(result["release_dir"]) / "app" / "index.html").read_text(encoding="utf-8")
+            self.assertIn('<base href="/docs/">', output)
             self.assertIn('href="/docs/assets/icon.svg?v=1&amp;x=2"', output)
             self.assertIn('src="/docs/assets/icon.svg"', output)
             self.assertIn('href="/other-app/"', output)
