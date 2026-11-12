@@ -1052,7 +1052,10 @@ def _run_as_user(
         if not ENV_KEY_RE.fullmatch(key) or not isinstance(value, str) or "\0" in value:
             raise ValueError("Invalid application environment variable")
         env_args.append(f"{key}={value}")
-    command = ["runuser", "--user", username, "--", *env_args, *args]
+    command = [
+        "setpriv", f"--reuid={username}", f"--regid={username}",
+        "--clear-groups", "--no-new-privs", "--", *env_args, *args,
+    ]
     if resource_limits is not None:
         limits = _resource_limits(resource_limits)
         command = [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import configparser
 import hashlib
 import json
 import os
@@ -89,6 +90,48 @@ class UbuntuIntegrationTests(unittest.TestCase):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open("http://127.0.0.1:18080" + route, timeout=10) as response:
             return response.status, response.read().decode()
+
+    def test_auto_deploy_sandbox_can_run_app_commands(self):
+        username = manager.ensure_app_user("it-static")
+        uid, gid = manager._account_ids(username)
+        helper = self.state / "identity-probe"
+        helper.mkdir(mode=0o700)
+        for filename in ("app_manager.py", "adapters.py"):
+            shutil.copyfile(Path(manager.__file__).with_name(filename), helper / filename)
+        probe = (
+            "import json,os; from pathlib import Path; "
+            "print(json.dumps({'uids': os.getresuid(), 'gids': os.getresgid(), "
+            "'groups': os.getgroups(), 'status': Path('/proc/self/status').read_text()}))"
+        )
+        runner = (
+            "import sys; sys.path.insert(0,sys.argv[1]); import app_manager as manager; "
+            "manager.DEFAULT_STATE_ROOT=sys.argv[2]; "
+            "result=manager._run_as_user(sys.argv[3],['python3','-c',sys.argv[4]]); "
+            "sys.stdout.write(result.stdout or ''); sys.stderr.write(result.stderr or ''); "
+            "sys.exit(result.returncode)"
+        )
+        template = configparser.ConfigParser(interpolation=None)
+        template.optionxform = str
+        template.read(Path(__file__).resolve().parent.parent / "templates" / "auto-deploy.service")
+        command = ["systemd-run", "--quiet", "--wait", "--pipe", "--collect"]
+        for key, value in template["Service"].items():
+            if key in ("Type", "ExecStartPre", "ExecStart"):
+                continue
+            if key == "ReadWritePaths":
+                value = value.replace("/var/lib/cockpit/app-manager", str(self.state))
+                value = value.replace("/opt/webapps", str(self.production))
+                value = value.replace("/var/log/cockpit-app-manager", str(self.logs))
+            command.append(f"--property={key}={value}")
+        command.extend(["--", sys.executable, "-c", runner, str(helper), str(self.state), username, probe])
+        result = self.command(command)
+        identity = json.loads(result.stdout)
+        self.assertEqual(identity["uids"], [uid, uid, uid])
+        self.assertEqual(identity["gids"], [gid, gid, gid])
+        self.assertEqual(identity["groups"], [])
+        status = dict(line.split(":", 1) for line in identity["status"].splitlines() if ":" in line)
+        for key in ("CapEff", "CapPrm", "CapInh", "CapAmb"):
+            self.assertEqual(int(status[key].strip(), 16), 0, key)
+        self.assertEqual(status["NoNewPrivs"].strip(), "1")
 
     def test_real_framework_deployments_and_recovery(self):
         fixtures = {

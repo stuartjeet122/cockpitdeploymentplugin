@@ -3212,8 +3212,32 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], "systemd-run")
         self.assertIn("--property=MemoryMax=768M", command)
-        self.assertIn("runuser", command)
-        self.assertIn("app-demo", command)
+        self.assertIn("setpriv", command)
+        self.assertIn("--reuid=app-demo", command)
+        self.assertIn("--regid=app-demo", command)
+        self.assertIn("--clear-groups", command)
+        self.assertIn("--no-new-privs", command)
+
+    def test_repository_checks_switch_user_without_pam(self):
+        revision = "a" * 40
+        with patch.object(manager, "ensure_app_user", return_value="app-demo"), patch.object(
+            manager, "get_config", return_value={"command_timeout_seconds": 30}
+        ), patch.object(manager, "_require_root"), patch.object(manager.os, "name", "posix"), patch.object(
+            manager, "_account_exists", return_value=True
+        ), patch.object(manager, "_home_path", return_value="/managed/home"), patch.object(
+            manager, "run_command", return_value=subprocess.CompletedProcess([], 0, revision + "\trefs/heads/main\n", "")
+        ) as run:
+            commit = manager._remote_app_commit({
+                "id": "demo", "repo_url": "https://github.com/example/demo.git", "branch": "main",
+            })
+        self.assertEqual(commit, revision)
+        self.assertEqual(run.call_args.args[0], [
+            "setpriv", "--reuid=app-demo", "--regid=app-demo", "--clear-groups", "--no-new-privs", "--",
+            "env", "-i", "HOME=/managed/home",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "GIT_TERMINAL_PROMPT=0",
+            "git", "ls-remote", "--exit-code", "https://github.com/example/demo.git", "refs/heads/main",
+        ])
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
     def test_nextjs_service_runs_with_production_node_environment(self):
         config = manager._default_config()
@@ -3786,7 +3810,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('if [[ "$BACKEND_DEST" == "/usr/libexec/cockpit" ]]', uninstaller)
         self.assertIn("dpkg --compare-versions", installer)
         self.assertIn("Python 3.9 or newer is required", installer)
-        for required in ("systemd-run", "ss", "nginx", "git", "runuser"):
+        for required in ("systemd-run", "ss", "nginx", "git", "runuser", "setpriv"):
             self.assertRegex(installer, rf"for required_command in [^;\n]*\b{required}\b[^;\n]*; do")
         self.assertIn('cockpit-app-manager-auto-deploy.timer', installer)
         self.assertIn("systemctl enable --now cockpit-app-manager-auto-deploy.timer", installer)

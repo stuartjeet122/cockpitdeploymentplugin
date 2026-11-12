@@ -45,7 +45,7 @@ preflight() {
   [[ "${ID:-}" == "ubuntu" ]] || fail "Ubuntu Server is required; found ${ID:-unknown}."
 
   local required_command
-  for required_command in install python3 dpkg-query dpkg cockpit-bridge systemctl systemd-run ss nginx git runuser logrotate ssh-keygen; do
+  for required_command in install python3 dpkg-query dpkg cockpit-bridge systemctl systemd-run ss nginx git runuser setpriv logrotate ssh-keygen; do
     command -v "$required_command" >/dev/null 2>&1 || fail "Required command is missing: $required_command"
   done
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' ||
