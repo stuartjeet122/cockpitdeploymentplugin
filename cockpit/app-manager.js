@@ -528,9 +528,10 @@
     let deployAfterSetup = true;
     const collect = (form) => {
       const values = Object.fromEntries(new FormData(form).entries());
-      const { app_directory, start_command, environment, deploy_now, ...payload } = values;
+      const { app_directory, go_package, start_command, environment, deploy_now, ...payload } = values;
       payload.build_config = {};
       if (app_directory.trim()) payload.build_config.app_directory = app_directory.trim();
+      if (go_package.trim()) payload.build_config.go_package = go_package.trim();
       if (start_command.trim()) {
         let command;
         try { command = JSON.parse(start_command); } catch (_error) { throw new Error('Start command must be a JSON array, such as ["node", "server.js"].'); }

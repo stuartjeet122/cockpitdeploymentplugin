@@ -166,6 +166,7 @@
           <summary>Runtime options</summary>
           <div class="am-form-grid">
             <div class="am-form-grid__wide"><label for="appDirectory">Next.js package directory <span class="am-optional">Optional</span></label><input id="appDirectory" name="app_directory" placeholder="apps/web" autocomplete="off" /></div>
+            <div class="am-form-grid__wide"><label for="appGoPackage">Go main package <span class="am-optional">Optional</span></label><input id="appGoPackage" name="go_package" placeholder="./cmd/server" autocomplete="off" pattern="\.(?:/[A-Za-z0-9_\-][A-Za-z0-9_.\-]*)*" /></div>
             <div class="am-form-grid__wide"><label for="appStartCommand">Start command <span class="am-optional">JSON argument array</span></label><textarea id="appStartCommand" name="start_command" rows="2" spellcheck="false" placeholder='["node", "dist/server.js"]'></textarea></div>
           </div>
         </details>

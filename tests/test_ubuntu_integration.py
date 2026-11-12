@@ -99,7 +99,8 @@ class UbuntuIntegrationTests(unittest.TestCase):
             },
             "go": {
                 "go.mod": "module integration.example/app\n\ngo 1.22\n",
-                "main.go": 'package main\nimport("net/http";"os")\nfunc main(){http.HandleFunc("/",func(response http.ResponseWriter,request *http.Request){response.Write([]byte(os.Getenv("FIXTURE_PREFIX")+"release-one"))});http.ListenAndServe("127.0.0.1:"+os.Getenv("PORT"),nil)}\n',
+                "library.go": "package application\n",
+                "cmd/server/main.go": 'package main\nimport("net/http";"os")\nfunc main(){http.HandleFunc("/",func(response http.ResponseWriter,request *http.Request){response.Write([]byte(os.Getenv("FIXTURE_PREFIX")+"release-one"))});http.ListenAndServe("127.0.0.1:"+os.Getenv("PORT"),nil)}\n',
             },
             "python": {
                 "requirements.txt": "",

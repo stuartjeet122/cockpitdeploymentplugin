@@ -830,6 +830,14 @@ class NextJSAdapter(FrameworkAdapter):
         }
 
 
+def validate_go_package(value: Any) -> None:
+    if value is not None and (
+        not isinstance(value, str)
+        or not re.fullmatch(r"\.(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*", value)
+    ):
+        raise ValueError("build_config.go_package must be '.' or a relative package path such as './cmd/server'")
+
+
 class GoAdapter(FrameworkAdapter):
     name = "go"
 
@@ -848,20 +856,55 @@ class GoAdapter(FrameworkAdapter):
         group_id: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        del log
         if not (repo_path / "go.mod").is_file():
             raise FileNotFoundError("go.mod not found for Go application")
         app_dir = _copy_source(repo_path, release_dir, group_id)
         binary_path = release_dir / "server"
-        _run_build(runner, ["go", "build", "-o", str(binary_path), "."], app_dir, timeout, "Building Go application")
+        target_result = _run_build(
+            runner, ["go", "env", "-json", "GOHOSTOS", "GOHOSTARCH", "GOOS", "GOARCH"],
+            app_dir, timeout, "Inspecting Go deployment target",
+        )
+        target = json.loads(target_result.stdout)
+        if not isinstance(target, dict) or target.get("GOHOSTOS") != "linux" or not isinstance(target.get("GOHOSTARCH"), str) or not re.fullmatch(r"[a-z0-9]+", target["GOHOSTARCH"]):
+            raise ValueError("Go deployment requires a Linux host toolchain with a valid GOHOSTARCH")
+        native_go = ["env", "GOOS=linux", "GOARCH=" + target["GOHOSTARCH"], "go"]
+        configured_package = app.get("build_config", {}).get("go_package")
+        validate_go_package(configured_package)
+        listed = _run_build(
+            runner, [*native_go, "list", "-json=Name,Dir", configured_package or "./..."],
+            app_dir, timeout, "Finding Go executable packages",
+        )
+        remaining = listed.stdout.strip()
+        decoder = json.JSONDecoder()
+        packages = []
+        while remaining:
+            package, end = decoder.raw_decode(remaining)
+            remaining = remaining[end:].lstrip()
+            if not isinstance(package, dict) or not isinstance(package.get("Dir"), str):
+                raise ValueError("Go package metadata must include a package directory")
+            relative = Path(package["Dir"]).resolve().relative_to(app_dir.resolve())
+            if package.get("Name") == "main":
+                packages.append("." if not relative.parts else "./" + relative.as_posix())
+        if configured_package is None and "." in packages:
+            selected_package = "."
+        elif len(packages) == 1:
+            selected_package = packages[0]
+        elif not packages:
+            raise ValueError("No executable Go main package found. A library cannot be deployed as a web service.")
+        else:
+            raise ValueError("Multiple Go main packages found: " + ", ".join(packages) + ". Set build_config.go_package to the web server package.")
+        if log is not None:
+            log(f"Go deployment target: linux/{target['GOHOSTARCH']}; configured target={target.get('GOOS')}/{target.get('GOARCH')}; package={selected_package}")
+        _run_build(runner, [*native_go, "build", "-o", str(binary_path), selected_package], app_dir, timeout, "Building Go application")
         if binary_path.is_symlink() or not binary_path.is_file():
             raise RuntimeError("Go build did not create a regular server executable")
         with binary_path.open("rb") as binary:
-            signature = binary.read(4)
-        if signature != b"\x7fELF":
+            signature = binary.read(8)
+        if not signature.startswith(b"\x7fELF"):
+            artifact = "Go library archive" if signature.startswith(b"!<arch>\n") else "non-ELF artifact"
             raise RuntimeError(
-                "Go build output is not a Linux ELF executable. The repository root must be a main package, "
-                "not a library; remove cross-compilation GOOS/GOARCH overrides and rebuild for this Ubuntu host."
+                f"Go build output is not a Linux ELF executable ({artifact}). "
+                "Check GOFLAGS/buildmode settings; deployment requires a native executable, not an archive or cross-platform binary."
             )
         if os.name != "nt" and not binary_path.stat().st_mode & 0o111:
             raise RuntimeError("Go server has no execute permission; check the build umask and release filesystem permissions")
@@ -1096,6 +1139,7 @@ def inspect_project(repo_path: Path, framework: str, build_config: Dict[str, Any
             elif package.get("engines", {}).get("node"):
                 warnings.append("Declared Node engine: " + str(package["engines"]["node"]) + "; configure a minimum runtime version when needed")
         elif framework == "go":
+            validate_go_package(build_config.get("go_package"))
             if not (project / "go.mod").is_file():
                 errors.append("Go requires go.mod")
             tools["go"] = None
@@ -1103,7 +1147,7 @@ def inspect_project(repo_path: Path, framework: str, build_config: Dict[str, Any
                 directive = re.search(r"(?m)^go\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)\s*$", _readable_regular_file(project / "go.mod", "go.mod").decode("utf-8"))
                 if directive:
                     tools["go"] = directive.group(1)
-            warnings.append("The Go compiler verifies the main package and module toolchain during build")
+            warnings.append("Go main packages are discovered before build; deployment targets the Linux host architecture")
         elif framework == "python":
             if not any((project / filename).is_file() for filename in ("requirements.txt", "pyproject.toml")):
                 errors.append("Python requires requirements.txt or pyproject.toml")

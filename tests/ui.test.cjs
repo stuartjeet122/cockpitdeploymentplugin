@@ -455,6 +455,8 @@ test("setup reviews repository, route, and environment before registering once",
     ui.document.querySelector("#setupNext").click();
     assert.equal(form.querySelector('[data-setup-step="1"]').hidden, false);
     assert.equal(form.elements.route.value, "/shop/");
+    form.elements.framework.value = "go";
+    form.elements.go_package.value = "./cmd/server";
     form.elements.environment.value = "API_URL=https://api.example.test";
     ui.document.querySelector("#setupNext").click();
     assert.match(ui.document.querySelector("#setupReview").textContent, /API_URL/);
@@ -464,6 +466,9 @@ test("setup reviews repository, route, and environment before registering once",
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     assert.equal(ui.calls.filter((record) => record.command === "add").length, 1);
+    const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
+    assert.equal(payload.build_config.go_package, "./cmd/server");
+    assert.equal(payload.go_package, undefined);
     assert.equal(ui.calls.find((record) => record.command === "env-save").input, 'API_URL="https://api.example.test"\n');
     assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
   } finally { ui.dom.window.close(); }

@@ -48,9 +48,9 @@ except ImportError:  # pragma: no cover - Windows has no POSIX group database
     grp = None
 
 try:
-    from .adapters import detect_framework, get_adapter, inspect_project
+    from .adapters import detect_framework, get_adapter, inspect_project, validate_go_package
 except ImportError:  # pragma: no cover - direct execution after installation
-    from adapters import detect_framework, get_adapter, inspect_project
+    from adapters import detect_framework, get_adapter, inspect_project, validate_go_package
 
 APP_NAME = "app-manager"
 DEFAULT_STATE_ROOT = "/var/lib/cockpit/app-manager"
@@ -445,6 +445,7 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(build_config, dict):
         raise ValueError("Build configuration must be a JSON object")
     _validate_app_directory_setting(build_config.get("app_directory"))
+    validate_go_package(build_config.get("go_package"))
     if "start_command" in build_config:
         command = build_config["start_command"]
         if not isinstance(command, list) or not command or not all(
@@ -1657,6 +1658,7 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
             raise ValueError(f"Application {app_id!r} has an invalid build configuration")
         try:
             _validate_app_directory_setting(build_config.get("app_directory"))
+            validate_go_package(build_config.get("go_package"))
         except ValueError as exc:
             raise ValueError(f"Application {app_id!r} has an invalid build configuration") from exc
         try:

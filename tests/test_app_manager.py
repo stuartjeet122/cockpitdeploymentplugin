@@ -198,6 +198,11 @@ class AppManagerTests(unittest.TestCase):
         result = manager.open_app(app["id"])
         self.assertEqual(result["url"], f"{manager.DEFAULT_PUBLIC_ORIGIN}/pending-site/")
 
+    def test_build_config_rejects_unsafe_go_package(self):
+        for package in ("", "../outside", "./cmd/../server", "/absolute", "example.com/remote", "./...", ["./cmd/server"]):
+            with self.subTest(package=package), self.assertRaisesRegex(ValueError, "go_package"):
+                self.add_app("Unsafe Go package", framework="go", build_config={"go_package": package})
+
     def test_build_config_rejects_unsafe_application_directory(self):
         for app_directory in ("../outside", "/absolute/path", "apps//web", "apps/./web", "apps\\web"):
             with self.subTest(app_directory=app_directory):
@@ -2676,6 +2681,16 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
 
 
 class FrameworkAdapterTests(unittest.TestCase):
+    @staticmethod
+    def _go_metadata(arguments, cwd):
+        if arguments[:3] == ["go", "env", "-json"]:
+            return subprocess.CompletedProcess(arguments, 0, stdout=json.dumps({
+                "GOHOSTOS": "linux", "GOHOSTARCH": "amd64", "GOOS": "windows", "GOARCH": "arm64",
+            }), stderr="")
+        if "list" in arguments:
+            return subprocess.CompletedProcess(arguments, 0, stdout=json.dumps({"Name": "main", "Dir": str(cwd)}), stderr="")
+        return None
+
     def test_project_inspection_checks_startup_without_executing_repository_code(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2732,6 +2747,9 @@ class FrameworkAdapterTests(unittest.TestCase):
             (source / "icon.svg").write_text("<svg/>", encoding="utf-8")
 
             def build_binary(arguments, cwd, timeout):
+                metadata = self._go_metadata(arguments, cwd)
+                if metadata is not None:
+                    return metadata
                 binary = root / "release" / "server"
                 binary.write_bytes(b"\x7fELF" + b"\0" * 60)
                 binary.chmod(0o750)
@@ -2739,9 +2757,49 @@ class FrameworkAdapterTests(unittest.TestCase):
 
             runner = Mock(side_effect=build_binary)
             result = get_adapter("go").build({"port": 8123}, source, root / "release", runner=runner)
-            runner.assert_called_once_with(["go", "build", "-o", str(root / "release" / "server"), "."], root / "release" / "app", 900)
+            self.assertEqual(runner.call_count, 3)
+            runner.assert_called_with(["env", "GOOS=linux", "GOARCH=amd64", "go", "build", "-o", str(root / "release" / "server"), "."], root / "release" / "app", 900)
             self.assertEqual(result["start_command"], [str(root / "release" / "server")])
             self.assertTrue((root / "release" / "app" / "icon.svg").is_file())
+
+    def test_go_selects_main_packages_without_guessing_between_servers(self):
+        cases = (
+            ([("library", "."), ("main", "cmd/server")], None, "./cmd/server", None),
+            ([("main", "."), ("main", "cmd/tool")], None, ".", None),
+            ([("main", "cmd/api"), ("main", "cmd/worker")], None, None, "Multiple Go main packages"),
+            ([("library", ".")], None, None, "No executable Go main package"),
+            ([("main", "cmd/api")], "./cmd/api", "./cmd/api", None),
+        )
+        for packages, configured, expected, error in cases:
+            with self.subTest(packages=packages, configured=configured), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source"
+                source.mkdir()
+                (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
+
+                def runner(arguments, cwd, timeout):
+                    if "list" in arguments:
+                        self.assertEqual(arguments[-1], configured or "./...")
+                        output = "\n".join(json.dumps({"Name": name, "Dir": str(cwd / directory)}) for name, directory in packages)
+                        return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+                    metadata = self._go_metadata(arguments, cwd)
+                    if metadata is not None:
+                        return metadata
+                    self.assertEqual(arguments[-1], expected)
+                    binary = root / "release" / "server"
+                    binary.write_bytes(b"\x7fELF" + b"\0" * 60)
+                    binary.chmod(0o750)
+                    return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+                build_config = {} if configured is None else {"go_package": configured}
+                log = Mock()
+                if error:
+                    with self.assertRaisesRegex(ValueError, error):
+                        get_adapter("go").build({"port": 8123, "build_config": build_config}, source, root / "release", runner=runner)
+                else:
+                    get_adapter("go").build({"port": 8123, "build_config": build_config}, source, root / "release", runner=runner, log=log)
+                    self.assertIn("linux/amd64", log.call_args.args[0])
+                    self.assertIn("package=" + expected, log.call_args.args[0])
 
     def test_go_rejects_successful_builds_without_a_linux_executable(self):
         for contents in (None, b"!<arch>\nGo library archive", b"MZWindows executable", b"\xcf\xfa\xed\xfeMach-O"):
@@ -2752,6 +2810,9 @@ class FrameworkAdapterTests(unittest.TestCase):
                 (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
 
                 def runner(arguments, cwd, timeout):
+                    metadata = self._go_metadata(arguments, cwd)
+                    if metadata is not None:
+                        return metadata
                     if contents is not None:
                         (root / "release" / "server").write_bytes(contents)
                     return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
@@ -2768,6 +2829,9 @@ class FrameworkAdapterTests(unittest.TestCase):
             (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
 
             def runner(arguments, cwd, timeout):
+                metadata = self._go_metadata(arguments, cwd)
+                if metadata is not None:
+                    return metadata
                 binary = root / "release" / "server"
                 binary.write_bytes(b"\x7fELF" + b"\0" * 60)
                 binary.chmod(0o640)
