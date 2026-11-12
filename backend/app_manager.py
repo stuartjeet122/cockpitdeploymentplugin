@@ -1278,7 +1278,7 @@ def _wait_for_health(app: Dict[str, Any], timeout_seconds: int) -> bool:
         time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
 
-def _startup_failure(app: Dict[str, Any], config: Dict[str, Any]) -> str:
+def _startup_failure(app: Dict[str, Any], config: Dict[str, Any], executable: Optional[Path] = None) -> str:
     message = (
         f"Application did not pass its health check before the timeout: {app_health_url(app)}. "
         f"The {app.get('framework', 'application')} runtime must listen on HOST=127.0.0.1 and "
@@ -1287,9 +1287,36 @@ def _startup_failure(app: Dict[str, Any], config: Dict[str, Any]) -> str:
     )
     try:
         values = list(_environment_values_app(app["id"]).values())
-        result = _systemctl("show", "--property=ActiveState,SubState,Result,ExecMainStatus", _service_path(app).name, timeout=5)
+        unit = _service_path(app).name
+        result = _systemctl("show", "--property=ActiveState,SubState,Result,ExecMainStatus", unit, timeout=5)
+        status = (getattr(result, "stdout", "") or "").strip()
+        properties = dict(line.split("=", 1) for line in status.splitlines() if "=" in line)
+        execution_details = []
+        if properties.get("ExecMainStatus") == "203":
+            message = (
+                f"systemd could not execute the application (203/EXEC): {unit}. "
+                "The process failed before HTTP health checks. Check the executable path, file and parent-directory "
+                "permissions, noexec mount options, binary architecture, and any required interpreter/dynamic loader."
+            )
+            if executable is not None and executable.is_absolute():
+                for label, arguments in (
+                    ("Executable path permissions", ["namei", "-l", "--", str(executable)]),
+                    ("Executable filesystem", ["findmnt", "--noheadings", "--output", "TARGET,FSTYPE,OPTIONS", "--target", str(executable)]),
+                ):
+                    with contextlib.suppress(OSError, RuntimeError, ValueError):
+                        observation = run_command(arguments, timeout=5, redact_values=values)
+                        if observation is not None and observation.returncode == 0 and observation.stdout:
+                            execution_details.append(label + ":\n" + observation.stdout[-8192:].strip())
         errors = _tail_log(_app_paths(app["id"], config)["logs"] / "stderr.log", 20, max_bytes=8192)
-        details = "\n".join(part for part in ((getattr(result, "stdout", "") or "").strip(), errors.strip()) if part)
+        journal = ""
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            recent = run_command([
+                "journalctl", "--unit", unit, "--lines", "20", "--no-pager",
+                "--output=short-iso", "--since", "-2 minutes",
+            ], timeout=5, redact_values=values)
+            if recent is not None and recent.returncode == 0:
+                journal = (recent.stdout or "")[-8192:].strip()
+        details = "\n".join(part for part in (status, *execution_details, errors.strip(), journal) if part)
         if details:
             message += "\nRuntime diagnostics:\n" + _redact_text(details, values)
     except (OSError, RuntimeError, ValueError):
@@ -2238,7 +2265,7 @@ def _render_service(
         f"Group={app['service_user']}\n"
         f"WorkingDirectory={working_directory}\n"
         f"ExecStart={exec_start}\n"
-        f"EnvironmentFile=-{_systemd_quote(str(paths['environment']))}\n"
+        f"EnvironmentFile=-{str(paths['environment']).replace('%', '%%')}\n"
         f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
         f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
         f"{node_environment}"
@@ -2250,7 +2277,6 @@ def _render_service(
         f"Environment={_systemd_quote('HOME=' + str(paths['home']))}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
-        "CPUAccounting=true\n"
         "MemoryAccounting=true\n"
         "TasksAccounting=true\n"
         f"MemoryMax={limits['memory_mb']}M\n"
@@ -3769,7 +3795,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 _raise_if_deployment_cancelled(cancel_file)
                 _append_deployment_log(deployment_log, "Waiting for the application health check")
                 if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
-                    raise RuntimeError(_startup_failure(app_snapshot, config))
+                    raise RuntimeError(_startup_failure(app_snapshot, config, Path(build_result["start_command"][0])))
                 _assert_loopback_binding(app_snapshot, int(config["command_timeout_seconds"]))
             elif hosting_framework == "static":
                 static_release_root = release_dir / "app" / _static_root_relative_path(static_root)

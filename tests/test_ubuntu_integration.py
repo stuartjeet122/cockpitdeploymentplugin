@@ -99,7 +99,7 @@ class UbuntuIntegrationTests(unittest.TestCase):
             },
             "go": {
                 "go.mod": "module integration.example/app\n\ngo 1.22\n",
-                "main.go": 'package main\nimport("net/http";"os")\nfunc main(){http.HandleFunc("/",func(response http.ResponseWriter,request *http.Request){response.Write([]byte("release-one"))});http.ListenAndServe("127.0.0.1:"+os.Getenv("PORT"),nil)}\n',
+                "main.go": 'package main\nimport("net/http";"os")\nfunc main(){http.HandleFunc("/",func(response http.ResponseWriter,request *http.Request){response.Write([]byte(os.Getenv("FIXTURE_PREFIX")+"release-one"))});http.ListenAndServe("127.0.0.1:"+os.Getenv("PORT"),nil)}\n',
             },
             "python": {
                 "requirements.txt": "",
@@ -116,6 +116,9 @@ class UbuntuIntegrationTests(unittest.TestCase):
                 app = manager.add_app({"id": app_id, "name": "Integration " + framework,
                                        "repo_url": "https://github.com/example/integration.git", "framework": framework,
                                        "resource_limits": {"build_memory_mb": 4096}})["app"]
+                if framework == "go":
+                    manager.ensure_app_user(app_id)
+                    manager.save_environment_app(app_id, "FIXTURE_PREFIX=environment-loaded:\n")
                 def copy_fixture(repo_url, source, branch, username, *args):
                     for filename, contents in files.items():
                         target = source / filename
@@ -127,6 +130,8 @@ class UbuntuIntegrationTests(unittest.TestCase):
                     first = manager.deploy_app(app_id)
                 self.assertEqual(self.fetch(app["route"])[0], 200)
                 self.assertIn("release-one", self.fetch(app["route"])[1])
+                if framework == "go":
+                    self.assertIn("environment-loaded:release-one", self.fetch(app["route"])[1])
                 self.assertFalse(Path(app["source_path"]).exists())
                 self.assertTrue(manager.health_check_app(app_id)["public_healthy"])
                 persistent = manager._app_paths(app_id, manager.get_config())["storage"] / "data" / "saved.txt"

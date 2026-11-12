@@ -19,7 +19,6 @@ Environment=APP_STORAGE_DIR={{ app_root }}/shared
 ExecStart={{ start_command }}
 Restart=on-failure
 RestartSec=5
-CPUAccounting=true
 MemoryAccounting=true
 TasksAccounting=true
 MemoryMax={{ memory_mb }}M

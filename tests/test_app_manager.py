@@ -1615,13 +1615,67 @@ class AppManagerTests(unittest.TestCase):
         app = self.add_app("Go diagnostics", framework="go")["app"]
         with patch.object(manager, "_environment_values_app", return_value={"TOKEN": "private-token"}), patch.object(
             manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, stdout="ExecMainStatus=1", stderr="")
-        ), patch.object(manager, "_tail_log", return_value="permission denied private-token"):
+        ), patch.object(manager, "_tail_log", return_value="permission denied private-token"), patch.object(
+            manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="journal private-token", stderr="")
+        ):
             message = manager._startup_failure(app, manager.get_config())
         self.assertIn(f"PORT={app['port']}", message)
         self.assertIn("APP_DATA_DIR", message)
         self.assertIn("ExecMainStatus=1", message)
         self.assertIn("permission denied [REDACTED]", message)
+        self.assertIn("journal [REDACTED]", message)
         self.assertNotIn("private-token", message)
+
+    def test_startup_failure_explains_systemd_exec_errors_and_includes_journal(self):
+        app = self.add_app("Go exec failure", framework="go")["app"]
+        with patch.object(manager, "_environment_values_app", return_value={}), patch.object(
+            manager, "_systemctl", return_value=subprocess.CompletedProcess(
+                [], 0, stdout="ActiveState=activating\nResult=exit-code\nExecMainStatus=203", stderr=""
+            )
+        ), patch.object(manager, "_tail_log", return_value=""), patch.object(
+            manager, "run_command", return_value=subprocess.CompletedProcess(
+                [], 0, stdout="Failed at step EXEC spawning server: Permission denied", stderr=""
+            )
+        ) as journal:
+            message = manager._startup_failure(app, manager.get_config())
+        self.assertIn("203/EXEC", message)
+        self.assertIn("before HTTP health checks", message)
+        self.assertIn("noexec", message)
+        self.assertIn("Failed at step EXEC spawning server: Permission denied", message)
+        self.assertNotIn("runtime must listen", message)
+        self.assertEqual(journal.call_args.args[0][:3], ["journalctl", "--unit", manager._service_path(app).name])
+        self.assertEqual(journal.call_args.kwargs["timeout"], 5)
+
+    def test_exec_failure_captures_permissions_and_mount_before_release_cleanup(self):
+        app = self.add_app("Go mount failure", framework="go")["app"]
+        config = manager.get_config()
+        executable = manager._app_paths(app["id"], config)["releases"] / "candidate" / "server"
+        with patch.object(manager, "_environment_values_app", return_value={"TOKEN": "secret-token"}), patch.object(
+            manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, stdout="ExecMainStatus=203", stderr="")
+        ), patch.object(manager, "_tail_log", return_value=""), patch.object(manager, "run_command", side_effect=[
+            subprocess.CompletedProcess([], 0, stdout="-r-xr-x--- root app-demo server secret-token", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="/opt ext4 rw,noexec", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="Failed at step EXEC: Permission denied", stderr=""),
+        ]) as commands:
+            message = manager._startup_failure(app, config, executable)
+        self.assertIn("Executable path permissions:", message)
+        self.assertIn("Executable filesystem:\n/opt ext4 rw,noexec", message)
+        self.assertIn("server [REDACTED]", message)
+        self.assertNotIn("secret-token", message)
+        self.assertEqual(commands.call_args_list[0].args[0], ["namei", "-l", "--", str(executable)])
+        self.assertEqual(commands.call_args_list[1].args[0][-2:], ["--target", str(executable)])
+        self.assertTrue(all(call.kwargs["timeout"] == 5 for call in commands.call_args_list))
+
+    def test_startup_failure_keeps_service_status_when_journal_is_unavailable(self):
+        app = self.add_app("No journal", framework="go")["app"]
+        with patch.object(manager, "_environment_values_app", return_value={}), patch.object(
+            manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, stdout="ExecMainStatus=203", stderr="")
+        ), patch.object(manager, "_tail_log", return_value=""), patch.object(
+            manager, "run_command", side_effect=RuntimeError("journal unavailable")
+        ):
+            message = manager._startup_failure(app, manager.get_config())
+        self.assertIn("203/EXEC", message)
+        self.assertIn("ExecMainStatus=203", message)
 
     def test_runtime_listener_must_be_loopback_only(self):
         app = {"port": 8123}
@@ -2676,11 +2730,51 @@ class FrameworkAdapterTests(unittest.TestCase):
             source.mkdir()
             (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
             (source / "icon.svg").write_text("<svg/>", encoding="utf-8")
-            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+
+            def build_binary(arguments, cwd, timeout):
+                binary = root / "release" / "server"
+                binary.write_bytes(b"\x7fELF" + b"\0" * 60)
+                binary.chmod(0o750)
+                return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+            runner = Mock(side_effect=build_binary)
             result = get_adapter("go").build({"port": 8123}, source, root / "release", runner=runner)
             runner.assert_called_once_with(["go", "build", "-o", str(root / "release" / "server"), "."], root / "release" / "app", 900)
             self.assertEqual(result["start_command"], [str(root / "release" / "server")])
             self.assertTrue((root / "release" / "app" / "icon.svg").is_file())
+
+    def test_go_rejects_successful_builds_without_a_linux_executable(self):
+        for contents in (None, b"!<arch>\nGo library archive", b"MZWindows executable", b"\xcf\xfa\xed\xfeMach-O"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source"
+                source.mkdir()
+                (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
+
+                def runner(arguments, cwd, timeout):
+                    if contents is not None:
+                        (root / "release" / "server").write_bytes(contents)
+                    return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+                with self.assertRaisesRegex(RuntimeError, "regular server executable|Linux ELF executable"):
+                    get_adapter("go").build({"port": 8123}, source, root / "release", runner=runner)
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX executable permission bits")
+    def test_go_rejects_a_binary_without_execute_permission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
+
+            def runner(arguments, cwd, timeout):
+                binary = root / "release" / "server"
+                binary.write_bytes(b"\x7fELF" + b"\0" * 60)
+                binary.chmod(0o640)
+                return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+            with self.assertRaisesRegex(RuntimeError, "no execute permission"):
+                get_adapter("go").build({"port": 8123}, source, root / "release", runner=runner)
 
     def test_python_uses_release_venv_and_loopback_gunicorn(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2844,7 +2938,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('class="am-log-output"', frontend)
         self.assertIn('if (result.available)', frontend)
         backend = (project / "backend" / "app_manager.py").read_text(encoding="utf-8")
-        self.assertIn('EnvironmentFile=-{_systemd_quote(str(paths[\'environment\']))}', backend)
+        self.assertIn('EnvironmentFile=-{str(paths[\'environment\']).replace(\'%\', \'%%\')}', backend)
         self.assertIn("def get_environment_app(", backend)
         self.assertIn("def save_environment_app(", backend)
         self.assertIn('PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"', backend)
@@ -2911,15 +3005,18 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", service)
         self.assertIn("Environment=\"APP_BASE_PATH=/demo\"", service)
         self.assertIn(
-            f"EnvironmentFile=-{manager._systemd_quote(str(paths['environment']))}",
+            f"EnvironmentFile=-{paths['environment']}",
             service,
         )
+        self.assertNotIn('EnvironmentFile=-"', service)
+        self.assertNotIn("CPUAccounting=", service)
         self.assertIn(f"ReadOnlyPaths={manager._systemd_quote(str(paths['releases']))}", service)
         template = (Path(__file__).resolve().parent.parent / "templates" / "app.service.tpl").read_text(
             encoding="utf-8"
         )
         self.assertIn("ReadOnlyPaths={{ app_root }}/releases", template)
         self.assertIn("EnvironmentFile=-{{ app_env_file }}", template)
+        self.assertNotIn("CPUAccounting=", template)
         self.assertIn("CapabilityBoundingSet=", template)
         self.assertNotIn("CAP_NET_BIND_SERVICE", service)
         self.assertNotIn("AmbientCapabilities=", service)
@@ -2937,6 +3034,19 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         read_write_paths = next(line for line in service.splitlines() if line.startswith("ReadWritePaths="))
         self.assertNotIn(manager._systemd_quote(str(paths["current"] / "app")), read_write_paths)
         self.assertNotIn(manager._systemd_quote(str(paths["releases"])), read_write_paths)
+
+    def test_environment_file_directive_is_unquoted_and_escapes_systemd_specifiers(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            manager, "DEFAULT_STATE_ROOT", str(Path(temporary) / "state 100%")
+        ):
+            config = manager._default_config()
+            app = {"id": "demo", "service_user": "app-demo", "port": 8100}
+            path = manager._app_paths("demo", config)["environment"]
+            service = manager._render_service(app, ["/usr/bin/true"], config)
+        directive = next(line for line in service.splitlines() if line.startswith("EnvironmentFile="))
+        self.assertEqual(directive, "EnvironmentFile=-" + str(path).replace("%", "%%"))
+        self.assertNotIn('"', directive)
+        self.assertIn("state 100%%", directive)
 
     def test_auto_deploy_service_can_write_nginx_log_directory(self):
         template = (Path(__file__).resolve().parent.parent / "templates" / "auto-deploy.service").read_text(

@@ -854,6 +854,17 @@ class GoAdapter(FrameworkAdapter):
         app_dir = _copy_source(repo_path, release_dir, group_id)
         binary_path = release_dir / "server"
         _run_build(runner, ["go", "build", "-o", str(binary_path), "."], app_dir, timeout, "Building Go application")
+        if binary_path.is_symlink() or not binary_path.is_file():
+            raise RuntimeError("Go build did not create a regular server executable")
+        with binary_path.open("rb") as binary:
+            signature = binary.read(4)
+        if signature != b"\x7fELF":
+            raise RuntimeError(
+                "Go build output is not a Linux ELF executable. The repository root must be a main package, "
+                "not a library; remove cross-compilation GOOS/GOARCH overrides and rebuild for this Ubuntu host."
+            )
+        if os.name != "nt" and not binary_path.stat().st_mode & 0o111:
+            raise RuntimeError("Go server has no execute permission; check the build umask and release filesystem permissions")
         start = _configured_start(app, [str(binary_path)])
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
