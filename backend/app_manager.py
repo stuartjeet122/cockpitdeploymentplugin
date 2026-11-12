@@ -711,6 +711,7 @@ def run_command(
     live_log_path: Optional[Path] = None,
     redact_values: Optional[Sequence[str]] = None,
     cancel_file: Optional[Path] = None,
+    preserve_stdout: bool = False,
 ) -> subprocess.CompletedProcess:
     if not args or not all(isinstance(arg, str) and "\0" not in arg for arg in args):
         raise ValueError("Subprocess arguments must be a non-empty list of strings")
@@ -718,14 +719,14 @@ def run_command(
     try:
         if live_log_path is not None:
             return _run_command_with_live_log(
-                args, cwd, timeout, env, live_log_path, values, cancel_file
+                args, cwd, timeout, env, live_log_path, values, cancel_file, preserve_stdout
             )
         if cancel_file is not None:
             result = _run_cancellable_command(args, cwd, timeout, env, cancel_file)
             return subprocess.CompletedProcess(
                 result.args,
                 result.returncode,
-                _redact_text(result.stdout or "", values),
+                result.stdout if preserve_stdout and result.returncode == 0 else _redact_text(result.stdout or "", values),
                 _redact_text(result.stderr or "", values),
             )
         result = subprocess.run(
@@ -740,7 +741,7 @@ def run_command(
         return subprocess.CompletedProcess(
             result.args,
             result.returncode,
-            _redact_text(result.stdout or "", values),
+            result.stdout if preserve_stdout and result.returncode == 0 else _redact_text(result.stdout or "", values),
             _redact_text(result.stderr or "", values),
         )
     except subprocess.TimeoutExpired as exc:
@@ -767,6 +768,7 @@ def _run_command_with_live_log(
     live_log_path: Path,
     redact_values: Optional[Sequence[str]] = None,
     cancel_file: Optional[Path] = None,
+    preserve_stdout: bool = False,
 ) -> subprocess.CompletedProcess:
     live_log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if live_log_path.is_symlink() or (live_log_path.exists() and not live_log_path.is_file()):
@@ -910,7 +912,8 @@ def _run_command_with_live_log(
         raise DeploymentAborted("Deployment aborted by request")
     if reader_errors:
         raise RuntimeError(f"Could not write live deployment output: {reader_errors[0]}")
-    return subprocess.CompletedProcess(list(args), returncode, stdout, stderr)
+    captured_stdout = output["stdout"].decode("utf-8", errors="replace") if preserve_stdout and returncode == 0 else stdout
+    return subprocess.CompletedProcess(list(args), returncode, captured_stdout, stderr)
 
 
 def _redact_text(text: str, values: Sequence[str]) -> str:
@@ -1030,6 +1033,7 @@ def _run_as_user(
     live_log_path: Optional[Path] = None,
     cancel_file: Optional[Path] = None,
     resource_limits: Optional[Dict[str, int]] = None,
+    preserve_stdout: bool = False,
 ) -> subprocess.CompletedProcess:
     _require_root()
     if os.name == "nt":
@@ -1065,6 +1069,7 @@ def _run_as_user(
         live_log_path=live_log_path,
         redact_values=list((environment or {}).values()),
         cancel_file=cancel_file,
+        preserve_stdout=preserve_stdout,
     )
 
 
@@ -3735,7 +3740,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 release_id,
                 cancel_file,
                 deployment_log,
-                runner=lambda args, cwd, timeout: _run_as_user(
+                runner=lambda args, cwd, timeout, preserve_stdout=False: _run_as_user(
                     username,
                     args,
                     cwd,
@@ -3744,6 +3749,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                     live_log_path=deployment_log,
                     cancel_file=cancel_file,
                     resource_limits=app_snapshot.get("resource_limits", {}),
+                    preserve_stdout=preserve_stdout,
                 ),
                 timeout=int(config["build_timeout_seconds"]),
                 group_id=release_group,

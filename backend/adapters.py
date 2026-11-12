@@ -12,11 +12,12 @@ from abc import ABC, abstractmethod
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 
-CommandRunner = Callable[[Sequence[str], Path, int], subprocess.CompletedProcess]
+class CommandRunner(Protocol):
+    def __call__(self, command: Sequence[str], cwd: Path, timeout: int, *, preserve_stdout: bool = False) -> subprocess.CompletedProcess: ...
 
 
 def _copy_source(repo_path: Path, release_dir: Path, group_id: Optional[int] = None) -> Path:
@@ -111,11 +112,13 @@ def _run_build(
     cwd: Path,
     timeout: int,
     description: str,
+    *,
+    preserve_stdout: bool = False,
 ) -> subprocess.CompletedProcess:
     if runner is None:
         raise RuntimeError("Build commands require an unprivileged application command runner")
     try:
-        result = runner(command, cwd, timeout)
+        result = runner(command, cwd, timeout, preserve_stdout=True) if preserve_stdout else runner(command, cwd, timeout)
     except Exception as exc:
         raise RuntimeError(f"{description} failed: {exc}") from exc
     if result.returncode != 0:
@@ -863,6 +866,7 @@ class GoAdapter(FrameworkAdapter):
         target_result = _run_build(
             runner, ["go", "env", "-json", "GOHOSTOS", "GOHOSTARCH", "GOOS", "GOARCH"],
             app_dir, timeout, "Inspecting Go deployment target",
+            preserve_stdout=True,
         )
         target = json.loads(target_result.stdout)
         if not isinstance(target, dict) or target.get("GOHOSTOS") != "linux" or not isinstance(target.get("GOHOSTARCH"), str) or not re.fullmatch(r"[a-z0-9]+", target["GOHOSTARCH"]):
@@ -873,6 +877,7 @@ class GoAdapter(FrameworkAdapter):
         listed = _run_build(
             runner, [*native_go, "list", "-json=Name,Dir", configured_package or "./..."],
             app_dir, timeout, "Finding Go executable packages",
+            preserve_stdout=True,
         )
         remaining = listed.stdout.strip()
         decoder = json.JSONDecoder()

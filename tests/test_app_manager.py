@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -479,6 +480,39 @@ class AppManagerTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["config"]["registry_path"], manager.DEFAULT_REGISTRY_PATH)
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_machine_stdout_is_preserved_without_leaking_to_logs_or_stderr(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "build.log"
+            metadata = '{"Dir":"/opt/webapps/website-list/app","Name":"main"}'
+            for live in (False, True):
+                for cancellable in (False, True):
+                    for exit_code in (0, 1):
+                        with self.subTest(live=live, cancellable=cancellable, exit_code=exit_code):
+                            command = [sys.executable, "-c", "import sys; print(sys.argv[1]); print(sys.argv[1], file=sys.stderr); sys.exit(int(sys.argv[2]))", metadata, str(exit_code)]
+                            result = manager.run_command(
+                                command, live_log_path=log if live else None, redact_values=["/website-list"],
+                                cancel_file=Path(temporary) / "cancel" if cancellable else None, preserve_stdout=True,
+                            )
+                            self.assertEqual(result.returncode, exit_code)
+                            if exit_code == 0:
+                                self.assertEqual(json.loads(result.stdout)["Dir"], "/opt/webapps/website-list/app")
+                            else:
+                                self.assertNotIn("/website-list", result.stdout)
+                                self.assertIn("[REDACTED]", result.stdout)
+                            self.assertNotIn("/website-list", result.stderr)
+                            if live:
+                                self.assertNotIn("/website-list", log.read_text(encoding="utf-8"))
+                                self.assertIn("[REDACTED]", log.read_text(encoding="utf-8"))
+
+    def test_machine_stdout_timeout_errors_remain_redacted(self):
+        with patch.object(manager.subprocess, "run", side_effect=subprocess.TimeoutExpired(
+            "metadata", 1, output="secret-metadata", stderr="secret-metadata"
+        )):
+            with self.assertRaises(RuntimeError) as failure:
+                manager.run_command(["metadata"], redact_values=["secret-metadata"], preserve_stdout=True)
+        self.assertNotIn("secret-metadata", str(failure.exception))
+        self.assertIn("[REDACTED]", str(failure.exception))
 
     def test_run_command_reports_timeout_and_missing_executable(self):
         with patch.object(manager.subprocess, "run", side_effect=subprocess.TimeoutExpired("sleep", 1)):
@@ -2746,7 +2780,7 @@ class FrameworkAdapterTests(unittest.TestCase):
             (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
             (source / "icon.svg").write_text("<svg/>", encoding="utf-8")
 
-            def build_binary(arguments, cwd, timeout):
+            def build_binary(arguments, cwd, timeout, *, preserve_stdout=False):
                 metadata = self._go_metadata(arguments, cwd)
                 if metadata is not None:
                     return metadata
@@ -2777,7 +2811,7 @@ class FrameworkAdapterTests(unittest.TestCase):
                 source.mkdir()
                 (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
 
-                def runner(arguments, cwd, timeout):
+                def runner(arguments, cwd, timeout, *, preserve_stdout=False):
                     if "list" in arguments:
                         self.assertEqual(arguments[-1], configured or "./...")
                         output = "\n".join(json.dumps({"Name": name, "Dir": str(cwd / directory)}) for name, directory in packages)
@@ -2801,6 +2835,41 @@ class FrameworkAdapterTests(unittest.TestCase):
                     self.assertIn("linux/amd64", log.call_args.args[0])
                     self.assertIn("package=" + expected, log.call_args.args[0])
 
+    def test_go_metadata_survives_redaction_collisions_in_the_real_command_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "website-list"
+            source = root / "source"
+            source.mkdir(parents=True)
+            (source / "go.mod").write_text("module example.com/stuserver\n", encoding="utf-8")
+            log = root / "deployment.log"
+
+            def runner(arguments, cwd, timeout, *, preserve_stdout=False):
+                if "build" in arguments:
+                    self.assertEqual(arguments[-1], "./cmd/server")
+                    binary = root / "release" / "server"
+                    binary.write_bytes(b"\x7fELF" + b"\0" * 60)
+                    binary.chmod(0o750)
+                    return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+                if "list" in arguments:
+                    output = "\n".join(json.dumps({"Name": name, "Dir": str(cwd / relative)}) for name, relative in (
+                        ("stuserver", "."), ("main", "cmd/server"), ("config", "internal/config"),
+                    ))
+                else:
+                    output = self._go_metadata(arguments, cwd).stdout
+                return manager.run_command(
+                    [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", output],
+                    timeout=timeout, live_log_path=log, redact_values=["website-list", "amd64", "main"],
+                    preserve_stdout=preserve_stdout,
+                )
+
+            result = get_adapter("go").build({"port": 8123}, source, root / "release", runner=runner)
+            self.assertEqual(result["start_command"], [str(root / "release" / "server")])
+            output = log.read_text(encoding="utf-8")
+            self.assertNotIn("website-list", output)
+            self.assertNotIn("amd64", output)
+            self.assertNotIn('"main"', output)
+            self.assertIn("[REDACTED]", output)
+
     def test_go_rejects_successful_builds_without_a_linux_executable(self):
         for contents in (None, b"!<arch>\nGo library archive", b"MZWindows executable", b"\xcf\xfa\xed\xfeMach-O"):
             with self.subTest(contents=contents), tempfile.TemporaryDirectory() as temporary:
@@ -2809,7 +2878,7 @@ class FrameworkAdapterTests(unittest.TestCase):
                 source.mkdir()
                 (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
 
-                def runner(arguments, cwd, timeout):
+                def runner(arguments, cwd, timeout, *, preserve_stdout=False):
                     metadata = self._go_metadata(arguments, cwd)
                     if metadata is not None:
                         return metadata
@@ -2828,7 +2897,7 @@ class FrameworkAdapterTests(unittest.TestCase):
             source.mkdir()
             (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
 
-            def runner(arguments, cwd, timeout):
+            def runner(arguments, cwd, timeout, *, preserve_stdout=False):
                 metadata = self._go_metadata(arguments, cwd)
                 if metadata is not None:
                     return metadata
