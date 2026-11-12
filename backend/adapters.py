@@ -790,7 +790,7 @@ class NextJSAdapter(FrameworkAdapter):
             _run_build(
                 runner,
                 ["node", str(Path(__file__).with_name("prepare_next_assets.cjs")), route.rstrip("/")],
-                project_dir, timeout, "Preparing Next.js local asset URLs for the public route",
+                project_dir, timeout, "Preparing Next.js local asset/API URLs for the public route",
             )
         _run_build(
             runner,

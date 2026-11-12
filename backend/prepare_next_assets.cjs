@@ -28,6 +28,20 @@ function regularAsset(root, segments) {
   return fs.statSync(current).isFile();
 }
 
+function localApiRoute(segments) {
+  if (segments[0] !== 'api') return false;
+  for (const extension of sourceExtensions) {
+    for (const directory of [['app'], ['src', 'app']]) {
+      if (regularAsset(project, [...directory, ...segments, `route${extension}`])) return true;
+    }
+    for (const directory of [['pages'], ['src', 'pages']]) {
+      if (regularAsset(project, [...directory, ...segments.slice(0, -1), segments.at(-1) + extension]) ||
+          regularAsset(project, [...directory, ...segments, `index${extension}`])) return true;
+    }
+  }
+  return false;
+}
+
 function scopedAsset(value) {
   if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//') ||
       value === prefix || value.startsWith(`${prefix}/`) || value.includes('\\')) return null;
@@ -44,7 +58,7 @@ function scopedAsset(value) {
     regularAsset(publicRoot, segments);
   const generatedMedia = segments.length === 1 && mediaExtensions.has(path.extname(pathname).toLowerCase()) &&
     regularAsset(project, segments);
-  return inPublic || generatedMedia ? prefix + value : null;
+  return inPublic || generatedMedia || localApiRoute(segments) ? prefix + value : null;
 }
 
 let filesChanged = 0;
@@ -121,4 +135,4 @@ function walk(directory) {
 }
 
 walk(project);
-process.stdout.write(`Prepared ${referencesChanged} local asset URL(s) in ${filesChanged} release file(s) for ${prefix}/\n`);
+process.stdout.write(`Prepared ${referencesChanged} local asset/API URL(s) in ${filesChanged} release file(s) for ${prefix}/\n`);

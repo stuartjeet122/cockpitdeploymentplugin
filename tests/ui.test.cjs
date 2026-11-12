@@ -5,7 +5,7 @@ const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
 const root = path.resolve(__dirname, "..");
-test("deployment prefixes parsed local asset literals only in the release copy", () => {
+test("deployment prefixes parsed local asset and API literals only in the release copy", () => {
   const os = require("node:os");
   const { spawnSync } = require("node:child_process");
   const { parse } = require("@babel/parser");
@@ -19,6 +19,14 @@ test("deployment prefixes parsed local asset literals only in the release copy",
     fs.writeFileSync(path.join(checkout, "infomil-logo.svg"), "<svg/>");
     fs.writeFileSync(path.join(checkout, "public", "icons", "logo.svg"), "<svg/>");
     fs.writeFileSync(path.join(checkout, "public", ".env"), "FIXTURE=private");
+    fs.mkdirSync(path.join(checkout, "src", "app", "api", "teams"), { recursive: true });
+    fs.writeFileSync(path.join(checkout, "src", "app", "api", "teams", "route.ts"),
+      'export function GET() { return Response.json({ configured: Boolean(process.env.DATABASE_URL) }); }');
+    fs.mkdirSync(path.join(checkout, "src", "pages", "api"), { recursive: true });
+    fs.writeFileSync(path.join(checkout, "src", "pages", "api", "team.js"),
+      'export default function handler(req, res) { res.json({ configured: Boolean(process.env.DATABASE_URL) }); }');
+    const requests = 'function cloudFetch(input) { return fetch(input); }\ncloudFetch("/api/teams?refresh=1");\nfetch("/api/team");';
+    fs.writeFileSync(path.join(checkout, "src", "cloud.js"), requests);
     const source = [
       'import logo from "/infomil-logo.svg";',
       '// Keep /infomil-logo.svg in comments.',
@@ -28,7 +36,7 @@ test("deployment prefixes parsed local asset literals only in the release copy",
       'const logoImage = <img src="/infomil-logo.svg" />;',
       'const quoted = <img src="/icons/logo.svg?label=&quot;logo&quot;" />;',
       'const unchanged = ["//cdn.example/logo.svg", "https://cdn.example/logo.svg",',
-      '"/scrumtimer/icons/logo.svg", "/another-app/logo.svg", "/api/team", "/.env",',
+      '"/scrumtimer/icons/logo.svg", "/another-app/logo.svg", "/api/unmanaged", "/.env",',
       '"/%2e%2e/infomil-logo.svg", "/icons/../infomil-logo.svg", "/missing.svg"];',
     ].join("\n");
     fs.writeFileSync(path.join(checkout, "src", "navbar.tsx"), source);
@@ -63,12 +71,20 @@ test("deployment prefixes parsed local asset literals only in the release copy",
     assert.equal(fs.readFileSync(path.join(release, "public", ".env"), "utf8"), "FIXTURE=private");
     assert.equal(fs.readFileSync(path.join(release, "src", "linked.ts"), "utf8"), 'const logo = "/linked/logo.svg";');
     assert.equal(fs.readFileSync(path.join(release, "src", "typed.ts"), "utf8"), 'const mode = <string>"fixture";\n');
-    assert.match(prepared.stdout, /Prepared 4 local asset URL\(s\) in 1 release file/);
+    const requestedUrls = [];
+    require("node:vm").runInNewContext(fs.readFileSync(path.join(release, "src", "cloud.js"), "utf8"), {
+      fetch: (url) => { requestedUrls.push(url); },
+    });
+    assert.deepEqual(requestedUrls, ["/scrumtimer/api/teams?refresh=1", "/scrumtimer/api/team"]);
+    assert.equal(fs.readFileSync(path.join(checkout, "src", "cloud.js"), "utf8"), requests);
+    assert.ok(fs.readFileSync(path.join(release, "src", "app", "api", "teams", "route.ts"), "utf8")
+      .includes("process.env.DATABASE_URL"));
+    assert.match(prepared.stdout, /Prepared 6 local asset\/API URL\(s\) in 2 release file/);
     const repeated = spawnSync(process.execPath, [helper, "/scrumtimer"], {
       cwd: release, encoding: "utf8", timeout: 10000,
     });
     assert.equal(repeated.status, 0, repeated.stderr);
-    assert.match(repeated.stdout, /Prepared 0 local asset/);
+    assert.match(repeated.stdout, /Prepared 0 local asset\/API/);
     assert.equal(fs.readFileSync(path.join(release, "src", "navbar.tsx"), "utf8"), output);
     fs.writeFileSync(path.join(release, "src", "broken.tsx"), "export const invalid = <;");
     const malformed = spawnSync(process.execPath, [helper, "/scrumtimer"], {
