@@ -815,10 +815,60 @@ class AppManagerTests(unittest.TestCase):
         app = self.add_app(auto_deploy=False)["app"]
         with patch.object(manager, "_require_root"), patch.object(manager, "_remote_app_commit") as remote:
             self.assertEqual(manager.auto_deploy_apps()["results"][0]["status"], "paused")
+            self.assertEqual(manager.auto_deploy_apps(retry_now=True)["results"][0]["status"], "paused")
             manager.edit_app(app["id"], {"auto_deploy": True, "deployment_window": {"start": "01:00", "end": "02:00"}})
             with patch.object(manager, "_in_deployment_window", return_value=False):
                 self.assertEqual(manager.auto_deploy_apps()["results"][0]["status"], "outside-deployment-window")
+                self.assertEqual(manager.auto_deploy_apps(retry_now=True)["results"][0]["status"], "outside-deployment-window")
             remote.assert_not_called()
+
+    def test_auto_deploy_retry_now_clears_old_error_only_after_success(self):
+        app = self.add_app()["app"]
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            manager._record_deployment(stored, {"id": "first", "status": "deployed", "commit": "a" * 40})
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "_remote_app_commit", side_effect=RuntimeError("identity switch failed")
+        ) as remote:
+            with self.assertRaisesRegex(RuntimeError, "identity switch failed"):
+                manager.auto_deploy_apps()
+            self.assertEqual(manager.auto_deploy_apps()["results"][0]["status"], "retry-backoff")
+            self.assertEqual(remote.call_count, 1)
+            with self.assertRaisesRegex(RuntimeError, "identity switch failed"):
+                manager.auto_deploy_apps(retry_now=True)
+        state = manager.get_registry()["apps"][0]["auto_deploy_state"]
+        self.assertIn("identity switch failed", state["error"])
+        self.assertEqual(state["failures"], 2)
+        self.assertGreater(state["retry_after"], manager.time.time())
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "_remote_app_commit", return_value="a" * 40
+        ) as remote, patch.object(manager, "deploy_app") as deploy:
+            result = manager.auto_deploy_apps(retry_now=True)
+        self.assertEqual(result["results"][0]["status"], "up-to-date")
+        remote.assert_called_once()
+        deploy.assert_not_called()
+        state = manager.get_registry()["apps"][0]["auto_deploy_state"]
+        self.assertIsNone(state["error"])
+        self.assertEqual(state["failures"], 0)
+        self.assertEqual(state["retry_after"], 0)
+
+    def test_auto_deploy_retry_now_preserves_first_and_active_deployment_guards(self):
+        app = self.add_app()["app"]
+        with patch.object(manager, "_require_root"), patch.object(manager, "_remote_app_commit") as remote:
+            result = manager.auto_deploy_apps(retry_now=True)
+            self.assertEqual(result["results"][0]["status"], "awaiting-first-deployment")
+            with manager._registry_transaction() as registry:
+                manager._record_deployment(manager._find_app(registry, app["id"]), {"id": "first", "status": "deploying"})
+            result = manager.auto_deploy_apps(retry_now=True)
+            self.assertEqual(result["results"][0]["status"], "deployment-in-progress")
+            remote.assert_not_called()
+
+    def test_auto_deploy_retry_now_cli_option(self):
+        for options, retry_now in (([], False), (["--retry-now"], True)):
+            with self.subTest(options=options), patch.object(manager, "auto_deploy_apps") as deploy:
+                args = manager._build_parser().parse_args(["auto-deploy", *options])
+                self.assertEqual(manager._dispatch(args), deploy.return_value)
+                deploy.assert_called_once_with(retry_now=retry_now)
 
     def test_remote_revision_check_does_not_require_a_checkout(self):
         app = self.add_app()["app"]

@@ -3263,7 +3263,7 @@ def approve_deployment_app(app_id: str, commit: str) -> Dict[str, Any]:
     return deployment_start_app(app_id, approved_commit=commit)
 
 
-def auto_deploy_apps() -> Dict[str, Any]:
+def auto_deploy_apps(*, retry_now: bool = False) -> Dict[str, Any]:
     _require_root()
     app_ids = [app["id"] for app in get_registry()["apps"]]
     outcomes = []
@@ -3282,7 +3282,7 @@ def auto_deploy_apps() -> Dict[str, Any]:
             if not _in_deployment_window(app.get("deployment_window", {})):
                 outcomes.append({"app_id": app_id, "status": "outside-deployment-window"})
                 continue
-            if app.get("auto_deploy_state", {}).get("retry_after", 0) > time.time():
+            if not retry_now and app.get("auto_deploy_state", {}).get("retry_after", 0) > time.time():
                 outcomes.append({"app_id": app_id, "status": "retry-backoff"})
                 continue
             latest = app.get("deployments", [])[-1] if app.get("deployments") else None
@@ -4413,7 +4413,8 @@ def _build_parser() -> argparse.ArgumentParser:
     deployment_abort = commands.add_parser("deployment-abort")
     deployment_abort.add_argument("app_id")
     deployment_abort.add_argument("deployment_id")
-    commands.add_parser("auto-deploy")
+    auto_deploy = commands.add_parser("auto-deploy")
+    auto_deploy.add_argument("--retry-now", action="store_true", help="Ignore retry backoff; retain deployment policies")
     deployment_start = commands.add_parser("deployment-start")
     deployment_start.add_argument("app_id")
     add = commands.add_parser("add")
@@ -4460,7 +4461,7 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
     if args.command == "deployment-start":
         return deployment_start_app(args.app_id)
     if args.command == "auto-deploy":
-        return auto_deploy_apps()
+        return auto_deploy_apps(retry_now=args.retry_now)
     if args.command == "deploy":
         return deploy_app(args.app_id, args.deployment_id)
     if args.command == "plugin-update-check":

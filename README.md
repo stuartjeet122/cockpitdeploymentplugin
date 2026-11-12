@@ -110,7 +110,7 @@ The executable returns one JSON object on stdout for successful and failed opera
 ```text
 list | overview | add <json> | edit <app-id> <json>
 deploy <app-id> | deployment-start <app-id> | deployment-abort <app-id> <deployment-id>
-deployment-logs <app-id> [deployment-id] [--status-only] | auto-deploy
+deployment-logs <app-id> [deployment-id] [--status-only] | auto-deploy [--retry-now]
 pull <app-id>
 start <app-id> | stop <app-id> | restart <app-id>
 logs <app-id> [--lines N] | health <app-id>
@@ -122,6 +122,14 @@ deployments | settings [<json>]
 plugin-update-check | plugin-update
 action <action> <app-id>
 ```
+
+After fixing an automatic-deployment failure, retry immediately instead of waiting for backoff:
+
+```bash
+sudo /usr/libexec/cockpit/app-manager/app-manager auto-deploy --retry-now
+```
+
+This bypasses only retry backoff. Paused apps, UTC deployment windows, first-deployment requirements, active deployments, and approval policies still apply. New commits can deploy automatically under the existing policy; this is not a read-only check. Stored errors clear only after a successful check, and failed retries retain the error and schedule backoff again. Refreshing the Cockpit dashboard or restarting the timer does not bypass backoff.
 
 Project conventions and deployment requirements are documented in `AGENTS.md` and must be followed for all future changes.
 
