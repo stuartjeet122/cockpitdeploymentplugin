@@ -938,16 +938,58 @@ body { background-image: linear-gradient(180deg, #fff 0, #f6f7f8 22rem); }
   min-height: 1.3em;
 }
 
-.am-log-line--error {
+.am-log-time {
+  display: inline-block;
+  min-width: 6.25rem;
+  margin-right: 0.75rem;
+  color: #82909e;
+  font-variant-numeric: tabular-nums;
+}
+
+.am-log-line--error,
+.am-log-legend__item.am-log-line--error {
   color: #ff8f87;
 }
 
-.am-log-line--success {
+.am-log-line--warning,
+.am-log-legend__item.am-log-line--warning {
+  color: #ffd166;
+}
+
+.am-log-line--success,
+.am-log-legend__item.am-log-line--success {
   color: #8de0a0;
+}
+
+.am-log-line--phase,
+.am-log-legend__item.am-log-line--phase {
+  color: #d3a6ff;
+}
+
+.am-log-line--stdout,
+.am-log-legend__item.am-log-line--stdout {
+  color: #c6d0dc;
+}
+
+.am-log-line--stderr,
+.am-log-legend__item.am-log-line--stderr {
+  color: #ffb86b;
 }
 
 .am-log-line--info {
   color: #8fc7ff;
+}
+
+.am-log-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.9rem;
+  margin: 0 0 0.5rem;
+  font-size: 0.75rem;
+}
+
+.am-log-legend__item {
+  font-weight: 650;
 }
 
 .am-deployment-log-actions {

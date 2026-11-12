@@ -188,7 +188,15 @@ test("approval reviews changes before submitting the exact candidate revision", 
 
 test("live logs preserve scroll, skip unchanged redraws, and poll only status when closed", async () => {
   const ticks = [];
-  let logs = "Build output";
+  let logs = [
+    "2026-11-12T02:48:14Z Build phase: preflight",
+    "2026-11-12T02:48:14Z PASS Environment: Required variable names are present",
+    "2026-11-12T02:48:14Z Preflight warning: Existing route settings are verified during build",
+    "[stdout] Build output",
+    "[stderr] Diagnostic output",
+    "[stderr] npm warn install-scripts",
+    "[stderr] Cannot find module '@swc/core'",
+  ].join("\n");
   let pollingFails = false;
   const deployment = { app_id: "portal", id: "live-build", status: "deploying" };
   const ui = await loadUi({
@@ -212,6 +220,14 @@ test("live logs preserve scroll, skip unchanged redraws, and poll only status wh
     ui.document.querySelector('[data-action="deployment-log"]').click();
     await settle(ui.window);
     const output = ui.document.querySelector("#deploymentLiveLog");
+    assert.ok(output.querySelector(".am-log-line--phase"));
+    assert.ok(output.querySelector(".am-log-line--success"));
+    assert.ok(output.querySelector(".am-log-line--warning"));
+    assert.ok(output.querySelector(".am-log-line--stdout"));
+    assert.ok(output.querySelector(".am-log-line--stderr"));
+    assert.ok(output.querySelector(".am-log-line--error"));
+    assert.equal(output.querySelector(".am-log-time").textContent, "02:48:14");
+    assert.ok(ui.document.querySelector(".am-log-legend"));
     Object.defineProperties(output, { scrollHeight: { value: 1000 }, clientHeight: { value: 200 } });
     output.scrollTop = 300;
     const firstLine = output.firstChild;

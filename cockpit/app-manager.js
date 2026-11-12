@@ -884,6 +884,43 @@
     }, "Logs loaded.", false);
   }
 
+  function renderDeploymentLogLine(line, channelState) {
+    let message = line;
+    let timestamp = "";
+    const timestampMatch = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(.*)$/.exec(message);
+    if (timestampMatch) {
+      timestamp = timestampMatch[1];
+      message = timestampMatch[2];
+      channelState.value = null;
+    }
+
+    const channelMatch = /^\[(stdout|stderr)\]\s*/i.exec(message);
+    if (channelMatch) {
+      channelState.value = channelMatch[1].toLowerCase();
+      message = message.slice(channelMatch[0].length);
+    }
+
+    let level = "info";
+    if (/^(?:FAIL\b|ERROR\b)|\b(error|failed|failure|exception|traceback)\b|cannot find module|exit code [1-9]\d*/i.test(message)) {
+      level = "error";
+    } else if (/\b(?:warn(?:ing)?|aborted|cancelled)\b/i.test(message)) {
+      level = "warning";
+    } else if (/^(?:PASS\b)|\b(?:successfully|completed)\b/i.test(message)) {
+      level = "success";
+    } else if (/^Build phase:/i.test(message)) {
+      level = "phase";
+    } else if (channelState.value === "stderr") {
+      level = "stderr";
+    } else if (channelState.value === "stdout") {
+      level = "stdout";
+    }
+
+    const timeLabel = timestamp
+      ? `<time class="am-log-time" datetime="${timestamp}" title="${timestamp}">${timestamp.slice(11, 19)}</time>`
+      : "";
+    return `<span class="am-log-line am-log-line--${level}" title="${level}">${timeLabel}<span class="am-log-message">${escapeHtml(message)}</span></span>`;
+  }
+
   function renderDeploymentLog(result) {
     const output = byId("deploymentLiveLog");
     const status = byId("deploymentLiveStatus");
@@ -894,16 +931,10 @@
     if (typeof result.logs === "string" && state.logTarget.logs !== text) {
       const previousScroll = output.scrollTop;
       const follow = state.logTarget.logs === undefined || output.scrollHeight - previousScroll - output.clientHeight < 32;
-      output.innerHTML = text.split("\n").map((line) => {
-        const level = /^\[stderr\]/i.test(line) || /\b(error|failed|failure|aborted)\b/i.test(line)
-          ? "error"
-          : /\b(success|completed|deployed)\b/i.test(line)
-            ? "success"
-            : /^\[stdout\]/i.test(line)
-              ? "output"
-              : "info";
-        return `<span class="am-log-line am-log-line--${level}">${escapeHtml(line)}</span>`;
-      }).join("\n");
+      const channelState = { value: null };
+      output.innerHTML = text.split("\n")
+        .map((line) => renderDeploymentLogLine(line, channelState))
+        .join("\n");
       output.scrollTop = follow ? output.scrollHeight : previousScroll;
       state.logTarget.logs = text;
     }
@@ -935,6 +966,14 @@
       `Deployment: ${app?.name || appId}`,
       `<p id="deploymentLiveStatus" class="am-dialog-intro" role="status" aria-live="polite">Starting deployment…</p>
        <div class="am-deployment-log-actions"><button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort deployment</button></div>
+       <div class="am-log-legend" aria-label="Deployment log color key">
+         <span class="am-log-legend__item am-log-line--error">Error</span>
+         <span class="am-log-legend__item am-log-line--warning">Warning</span>
+         <span class="am-log-legend__item am-log-line--success">Passed</span>
+         <span class="am-log-legend__item am-log-line--phase">Phase</span>
+         <span class="am-log-legend__item am-log-line--stdout">Output</span>
+         <span class="am-log-legend__item am-log-line--stderr">Stderr</span>
+       </div>
        <pre id="deploymentLiveLog" class="am-log-output" aria-live="polite">Waiting for deployment output…</pre>`,
     );
      state.logTarget = { appId, deploymentId: null };

@@ -3596,6 +3596,14 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             deployment_log = _deployment_log_path(app_id, release_id, create=True)
             _prune_deployment_logs(app_id, release_id)
             _append_deployment_log(deployment_log, "Deployment started")
+            _append_deployment_log(
+                deployment_log,
+                "Deployment context: "
+                f"branch={app_snapshot['branch']}; "
+                f"configured_framework={app_snapshot.get('framework', 'auto')}; "
+                f"route={validate_app_route(app_snapshot.get('route'), app_id)}; "
+                f"deployment_id={release_id}",
+            )
             _raise_if_deployment_cancelled(cancel_file)
             username = ensure_app_user(app_id)
             paths = _setup_app_directories(app_snapshot, username, config)
@@ -3635,6 +3643,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             if app_snapshot.get("deployment_mode") == "approval" and commit != approved_commit:
                 raise RuntimeError("Repository changed after approval; review and approve the new commit")
             record["commit"] = commit or None
+            _append_deployment_log(deployment_log, f"Source revision: {commit or 'unavailable'}")
             service_path = _service_path(app_snapshot)
             previous_service_content = _verified_service_bytes(app_snapshot, service_path)
             expects_runtime = framework != "static" or bool(app_snapshot.get("build_config", {}).get("start_command"))

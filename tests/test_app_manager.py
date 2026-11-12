@@ -1609,6 +1609,12 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(result["app"]["public_url"], manager.DEFAULT_PUBLIC_ORIGIN + app["route"])
         self.assertFalse(paths["source"].exists())
         self.assertTrue((Path(result["deployment"]["release"]) / "app" / "index.html").is_file())
+        logs = manager.deployment_logs_app(app["id"])["logs"]
+        self.assertIn(f"branch={app['branch']}", logs)
+        self.assertIn(f"route={app['route']}", logs)
+        self.assertIn("configured_framework=static", logs)
+        self.assertIn(f"deployment_id={result['deployment']['id']}", logs)
+        self.assertIn("Source revision: " + "a" * 40, logs)
 
     def test_nextjs_export_deploys_as_static_without_changing_framework_detection(self):
         app = self.add_app("Next export", framework="nextjs")["app"]
@@ -2105,7 +2111,15 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         self.assertEqual((repo / "next.config.ts").read_text(encoding="utf-8"), config)
         release_app = release / "app"
         wrapper = (release_app / "next.config.mjs").read_text(encoding="utf-8")
-        self.assertIn("nextRequire('@swc/core')", wrapper)
+        self.assertIn(
+            "nextRequire('next/dist/build/next-config-ts/transpile-config')",
+            wrapper,
+        )
+        self.assertIn(
+            "transpileConfig({ nextConfigPath: originalPath, dir: dirname(originalPath) })",
+            wrapper,
+        )
+        self.assertNotIn("@swc/core", wrapper)
         self.assertIn("process.env.APP_BASE_PATH", wrapper)
         self.assertEqual(
             (release_app / "next.config.app-manager-original.ts").read_text(encoding="utf-8"),
@@ -2115,8 +2129,18 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
     def test_nextjs_cjs_and_extended_typescript_configs_are_wrapped(self):
         cases = (
             ("next.config.cjs", "module.exports = {};\n", "next.config.cjs", "module.exports"),
-            ("next.config.mts", "export default {};\n", "next.config.mjs", "nextRequire('@swc/core')"),
-            ("next.config.cts", "export = {};\n", "next.config.mjs", "nextRequire('@swc/core')"),
+            (
+                "next.config.mts",
+                "export default {};\n",
+                "next.config.mjs",
+                "next/dist/build/next-config-ts/transpile-config",
+            ),
+            (
+                "next.config.cts",
+                "export = {};\n",
+                "next.config.mjs",
+                "next/dist/build/next-config-ts/transpile-config",
+            ),
         )
         for config_name, contents, wrapper_name, expected in cases:
             with self.subTest(config=config_name):
