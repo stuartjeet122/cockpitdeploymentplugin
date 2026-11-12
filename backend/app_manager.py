@@ -2933,8 +2933,8 @@ def _prune_releases(app: Dict[str, Any]) -> None:
                     deployment["release_available"] = False
 
 
-def _app_lock(app_id: str) -> contextlib.AbstractContextManager:
-    return _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / f"{validate_app_id(app_id)}.lock")
+def _app_lock(app_id: str, *, blocking: bool = True) -> contextlib.AbstractContextManager:
+    return _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / f"{validate_app_id(app_id)}.lock", blocking=blocking)
 
 
 def _deployment_log_path(app_id: str, deployment_id: str, *, create: bool = False) -> Path:
@@ -3480,7 +3480,49 @@ def abort_deployment_app(app_id: str, deployment_id: str) -> Dict[str, Any]:
                 os.close(descriptor)
     log_path = _deployment_log_path(app_id, deployment_id)
     _append_deployment_log(log_path, "Abort requested")
-    return {"ok": True, "app_id": app_id, "deployment_id": deployment_id, "aborting": True}
+    aborted = _abort_interrupted_deployment(app_id, deployment_id)
+    if aborted:
+        _append_deployment_log(log_path, "Interrupted deployment marked aborted; application runtime left unchanged")
+    return {"ok": True, "app_id": app_id, "deployment_id": deployment_id, "aborting": not aborted, "aborted": aborted}
+
+
+def _abort_interrupted_deployment(app_id: str, deployment_id: str) -> bool:
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(_app_lock(app_id, blocking=False))
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        with _registry_transaction() as registry:
+            app = _find_app(registry, app_id)
+            latest = app.get("deployments", [])[-1] if app.get("deployments") else None
+            unit_name = f"cockpit-app-manager-deploy-{app_id}-{deployment_id}.service"
+            if (
+                not isinstance(latest, dict) or latest.get("id") != deployment_id
+                or latest.get("status") != "deploying" or latest.get("abortable", True) is False
+                or latest.get("systemd_unit") != unit_name
+            ):
+                return False
+            result = run_command(
+                ["systemctl", "show", unit_name, "--property=LoadState,ActiveState,SubState,Job"], timeout=5
+            )
+            properties = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
+            if (
+                result.returncode not in {0, 1}
+                or properties.get("LoadState") not in {"loaded", "not-found"}
+                or properties.get("ActiveState") not in {"inactive", "failed"}
+                or properties.get("SubState") not in {"dead", "failed"}
+                or properties.get("Job") not in {"", "0"}
+            ):
+                return False
+            latest.update({
+                "status": "aborted", "build_status": "aborted", "abortable": False,
+                "error": "Deployment worker exited before completing cancellation; application runtime left unchanged",
+            })
+            app["status"] = latest.get("previous_status", "failed")
+            app["updated_at"] = now_iso()
+            return True
 
 
 @contextlib.contextmanager

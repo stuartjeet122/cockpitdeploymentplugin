@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -771,6 +772,80 @@ class AppManagerTests(unittest.TestCase):
             with manager._registry_transaction() as registry:
                 manager._find_app(registry, app["id"])["deployments"][0]["status"] = "deployed"
             manager.abort_deployment_app(app["id"], deployment_id)
+
+    def test_abort_recovers_only_a_confirmed_inactive_deployment_worker(self):
+        app = self.add_app()["app"]
+        deployment_id = "20261109220923-abcdef12"
+        unit = f"cockpit-app-manager-deploy-{app['id']}-{deployment_id}.service"
+        cases = [
+            (0, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nJob=\n", True),
+            (1, "LoadState=not-found\nActiveState=inactive\nSubState=dead\nJob=0\n", True),
+            (0, "LoadState=loaded\nActiveState=failed\nSubState=failed\nJob=\n", True),
+            (0, "LoadState=loaded\nActiveState=active\nSubState=running\nJob=\n", False),
+            (0, "LoadState=loaded\nActiveState=activating\nSubState=start\nJob=\n", False),
+            (0, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nJob=42\n", False),
+            (0, "LoadState=loaded\nActiveState=inactive\nSubState=dead\n", False),
+            (1, "", False),
+            (2, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nJob=\n", False),
+        ]
+        for returncode, output, recovered in cases:
+            with self.subTest(returncode=returncode, output=output):
+                with manager._registry_transaction() as registry:
+                    stored = manager._find_app(registry, app["id"])
+                    stored["status"] = "deploying"
+                    stored["deployed_commit"] = "a" * 40
+                    stored["deployments"] = [{
+                        "id": deployment_id, "status": "deploying", "build_status": "running",
+                        "previous_status": "running", "systemd_unit": unit,
+                    }]
+                with patch.object(manager, "_require_root"), patch.object(
+                    manager, "run_command", return_value=subprocess.CompletedProcess([], returncode, output, "")
+                ) as run, patch.object(manager, "_systemctl") as systemctl, patch.object(
+                    manager, "_prune_releases"
+                ) as prune:
+                    result = manager.abort_deployment_app(app["id"], deployment_id)
+                self.assertEqual(result["aborted"], recovered)
+                self.assertEqual(result["aborting"], not recovered)
+                stored = manager._find_app(manager.get_registry(), app["id"])
+                self.assertEqual(stored["status"], "running" if recovered else "deploying")
+                self.assertEqual(stored["deployments"][0]["status"], "aborted" if recovered else "deploying")
+                self.assertEqual(stored["deployments"][0]["build_status"], "aborted" if recovered else "running")
+                self.assertEqual(manager.deployment_logs_app(app["id"])["active"], not recovered)
+                self.assertEqual(stored["deployed_commit"], "a" * 40)
+                run.assert_called_once_with(
+                    ["systemctl", "show", unit, "--property=LoadState,ActiveState,SubState,Job"], timeout=5
+                )
+                systemctl.assert_not_called()
+                prune.assert_not_called()
+
+    def test_abort_does_not_recover_a_locked_deployment(self):
+        app = self.add_app()["app"]
+        deployment_id = "20261109220923-abcdef12"
+        with manager._registry_transaction() as registry:
+            manager._find_app(registry, app["id"])["deployments"] = [{
+                "id": deployment_id, "status": "deploying",
+                "systemd_unit": f"cockpit-app-manager-deploy-{app['id']}-{deployment_id}.service",
+            }]
+        with patch.object(manager, "_require_root"), patch.object(
+            manager, "_app_lock", side_effect=BlockingIOError(errno.EAGAIN, "Deployment is running")
+        ) as lock, patch.object(manager, "run_command") as run:
+            result = manager.abort_deployment_app(app["id"], deployment_id)
+        self.assertTrue(result["aborting"])
+        lock.assert_called_once_with(app["id"], blocking=False)
+        run.assert_not_called()
+        self.assertEqual(manager.get_registry()["apps"][0]["deployments"][0]["status"], "deploying")
+
+    def test_abort_does_not_probe_an_unexpected_worker_unit(self):
+        app = self.add_app()["app"]
+        deployment_id = "20261109220923-abcdef12"
+        with manager._registry_transaction() as registry:
+            manager._find_app(registry, app["id"])["deployments"] = [{
+                "id": deployment_id, "status": "deploying", "systemd_unit": "stuserver-websites.service",
+            }]
+        with patch.object(manager, "_require_root"), patch.object(manager, "run_command") as run:
+            result = manager.abort_deployment_app(app["id"], deployment_id)
+        self.assertTrue(result["aborting"])
+        run.assert_not_called()
 
     def test_abort_immediately_after_publication_survives_worker_start(self):
         app = self.add_app()["app"]
