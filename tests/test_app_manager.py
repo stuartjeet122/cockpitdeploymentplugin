@@ -3336,6 +3336,21 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("/var/log/nginx", read_write_paths)
         self.assertIn("PrivateUsers=false", template)
 
+    def test_auto_deploy_service_retains_uid_switching_with_seccomp(self):
+        template = (Path(__file__).resolve().parent.parent / "templates" / "auto-deploy.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("User=root\n", template)
+        self.assertIn("NoNewPrivileges=true\n", template)
+        self.assertIn("ProtectKernelTunables=true\n", template)
+        self.assertIn("ProtectKernelModules=true\n", template)
+        self.assertIn("LockPersonality=true\n", template)
+        self.assertIn("RestrictRealtime=true\n", template)
+        ambient = next(line for line in template.splitlines() if line.startswith("AmbientCapabilities="))
+        self.assertEqual(ambient, "AmbientCapabilities=CAP_SETUID")
+        bounding = next(line for line in template.splitlines() if line.startswith("CapabilityBoundingSet="))
+        self.assertIn("CAP_SETUID", bounding.split("=", 1)[1].split())
+
     def test_resource_limits_reject_unsafe_values_and_persist(self):
         for value in ({"memory_mb": True}, {"tasks_max": 0}, {"unknown": 1}, "unlimited"):
             with self.subTest(value=value), self.assertRaises(ValueError):
@@ -3359,6 +3374,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("--reuid=app-demo", command)
         self.assertIn("--regid=app-demo", command)
         self.assertIn("--clear-groups", command)
+        self.assertIn("--inh-caps=-all", command)
+        self.assertIn("--ambient-caps=-all", command)
         self.assertIn("--no-new-privs", command)
 
     def test_repository_checks_switch_user_without_pam(self):
@@ -3375,7 +3392,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             })
         self.assertEqual(commit, revision)
         self.assertEqual(run.call_args.args[0], [
-            "setpriv", "--reuid=app-demo", "--regid=app-demo", "--clear-groups", "--no-new-privs", "--",
+            "setpriv", "--reuid=app-demo", "--regid=app-demo", "--clear-groups",
+            "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", "--",
             "env", "-i", "HOME=/managed/home",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "GIT_TERMINAL_PROMPT=0",
             "git", "ls-remote", "--exit-code", "https://github.com/example/demo.git", "refs/heads/main",

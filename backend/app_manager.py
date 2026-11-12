@@ -1079,7 +1079,8 @@ def _run_as_user(
         env_args.append(f"{key}={value}")
     command = [
         "setpriv", f"--reuid={username}", f"--regid={username}",
-        "--clear-groups", "--no-new-privs", "--", *env_args, *args,
+        "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all",
+        "--no-new-privs", "--", *env_args, *args,
     ]
     if resource_limits is not None:
         limits = _resource_limits(resource_limits)

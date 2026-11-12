@@ -104,8 +104,12 @@ class UbuntuIntegrationTests(unittest.TestCase):
             "'groups': os.getgroups(), 'status': Path('/proc/self/status').read_text()}))"
         )
         runner = (
-            "import sys; sys.path.insert(0,sys.argv[1]); import app_manager as manager; "
+            "import sys; from pathlib import Path; "
+            "sys.path.insert(0,sys.argv[1]); import app_manager as manager; "
             "manager.DEFAULT_STATE_ROOT=sys.argv[2]; "
+            "status=dict(line.split(':',1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line); "
+            "assert all(int(status[key].strip(),16) & (1 << 7) "
+            "for key in ('CapPrm','CapEff','CapInh','CapAmb')), status; "
             "result=manager._run_as_user(sys.argv[3],['python3','-c',sys.argv[4]]); "
             "sys.stdout.write(result.stdout or ''); sys.stderr.write(result.stderr or ''); "
             "sys.exit(result.returncode)"
