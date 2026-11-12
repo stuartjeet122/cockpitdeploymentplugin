@@ -157,14 +157,14 @@
 
   function renderOverview(data) {
     const cards = [
-      ["Applications", data.total_apps],
-      ["Live", data.running_apps],
-      ["Stopped", data.stopped_apps],
-      ["Needs attention", state.apps.filter(needsAttention).length],
+      ["Applications", data.total_apps, "boxes"],
+      ["Live", data.running_apps, "circle-check"],
+      ["Stopped", data.stopped_apps, "pause"],
+      ["Needs attention", state.apps.filter(needsAttention).length, "circle-alert"],
     ];
-    byId("overviewCards").innerHTML = cards.map(([label, value]) => `
+    byId("overviewCards").innerHTML = cards.map(([label, value, symbol]) => `
       <div class="am-metric">
-        <span class="am-metric-label">${escapeHtml(label)}</span>
+        <span class="am-metric-label">${icon(symbol)}${escapeHtml(label)}</span>
         <strong class="am-metric-value">${escapeHtml(value)}</strong>
       </div>
     `).join("");
@@ -267,7 +267,7 @@
           : `<button type="button" class="am-button am-button--primary" data-action="deploy" data-id="${appId}">${icon("arrow-up-right")} ${app.last_deploy ? "Redeploy" : "Deploy"}</button>`;
       const lastFailure = app.deployments?.[0]?.status === "failed";
       return `
-        <article class="am-app-card">
+        <article class="am-app-card" data-status="${escapeHtml(observedStatus(app))}" data-framework="${escapeHtml(app.framework || "auto")}">
           <header class="am-app-card__heading">
             <span class="am-app-avatar" aria-hidden="true">${escapeHtml(appInitial)}</span>
             <div class="am-app-title-wrap">
@@ -284,9 +284,13 @@
             <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
             <div><dt>${app.framework === "static" && !app.build_config?.start_command ? "Hosting" : "Runtime"}</dt><dd>${app.framework === "static" && !app.build_config?.start_command ? "Nginx" : `127.0.0.1:${escapeHtml(app.port)}`}</dd></div>
             <div class="am-meta-wide"><dt>Last deployed</dt><dd>${escapeHtml(formatDate(app.last_deploy))}${app.deployed_commit ? ` <code>${escapeHtml(app.deployed_commit.slice(0, 7))}</code>` : ""}</dd></div>
+            <div><dt>Readiness</dt><dd data-health="${app.health ? (app.health.local_healthy ? "healthy" : "failed") : "unknown"}" title="${escapeHtml(app.health?.local_error || "")}">${app.health ? (app.health.local_healthy ? "Healthy" : "Failed") : "Not checked"}</dd></div>
+            <div><dt>Public route</dt><dd data-health="${app.health?.public_healthy == null ? "unknown" : app.health.public_healthy ? "healthy" : "failed"}" title="${escapeHtml(app.health?.public_error || "")}">${app.health?.public_healthy == null ? "Not checked" : app.health.public_healthy ? "Reachable" : app.health.public_status === 403 ? "Blocked · 403" : "Failed"}</dd></div>
+          </dl>
+          <details class="am-runtime-details">
+            <summary>${icon("activity")} Runtime details ${app.auto_deploy === false ? '<span class="am-runtime-policy">Auto-deploy paused</span>' : ""}${icon("plus")}</summary>
+            <dl class="am-app-meta">
             <div><dt>Service</dt><dd>${escapeHtml(app.health?.service_state || "Not checked")}</dd></div>
-            <div><dt>Readiness</dt><dd title="${escapeHtml(app.health?.local_error || "")}">${app.health ? (app.health.local_healthy ? "Healthy" : "Failed") : "Not checked"}</dd></div>
-            <div><dt>Public route</dt><dd title="${escapeHtml(app.health?.public_error || "")}">${app.health?.public_healthy == null ? "Not checked" : app.health.public_healthy ? "Reachable" : "Failed"}</dd></div>
             <div><dt>Checked</dt><dd>${escapeHtml(app.health?.checked_at ? formatDate(app.health.checked_at) : "Never")}</dd></div>
             <div><dt>Auto-deploy</dt><dd>${app.auto_deploy === false ? "Paused" : "Enabled"}</dd></div>
             <div><dt>Last repository check</dt><dd>${escapeHtml(app.auto_deploy_state?.checked_at ? formatDate(app.auto_deploy_state.checked_at) : "Never")}</dd></div>
@@ -295,7 +299,8 @@
             <div><dt>Metrics sampled</dt><dd>${app.metrics?.checked_at ? escapeHtml(formatDate(app.metrics.checked_at)) : "Never"}</dd></div>
             <div><dt>Build phase</dt><dd>${escapeHtml(deploying ? app.deployments?.[0]?.build_status || "pending" : "Idle")}</dd></div>
             <div><dt>Deployment policy</dt><dd>${app.deployment_mode === "approval" ? "Approval required" : "Automatic"}</dd></div>
-          </dl>
+            </dl>
+          </details>
           ${app.deployment_mode === "approval" && app.pending_update && app.pending_update.commit !== app.deployed_commit ? `<p class="am-route-state">Awaiting approval: <code>${escapeHtml(app.pending_update.commit.slice(0, 7))}</code></p>` : ""}
           ${app.health && (app.health.local_healthy === false || app.health.public_healthy === false || app.health.service_error) ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${escapeHtml(app.health.local_error || app.health.public_error || app.health.service_error)}</span></p>` : ""}
           ${app.auto_deploy_state?.error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Automatic deployment: ${escapeHtml(app.auto_deploy_state.error)}</span></p>` : ""}

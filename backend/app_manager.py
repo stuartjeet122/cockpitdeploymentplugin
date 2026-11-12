@@ -1239,8 +1239,12 @@ def check_app_health(app: Dict[str, Any], timeout_seconds: int = 30) -> bool:
     if _is_static_app(app):
         index = _static_content_root(app, get_config()) / "index.html"
         return bool(app.get("hosting_active") and app.get("status") == "running" and index.is_file())
-    request = urllib.request.Request(app_health_url(app), method="GET")
-    opener = urllib.request.build_opener(_NoRedirectHandler())
+    request = urllib.request.Request(app_health_url(app), headers={
+        "Host": urllib.parse.urlsplit(DEFAULT_PUBLIC_ORIGIN).netloc,
+        "X-Forwarded-Proto": urllib.parse.urlsplit(DEFAULT_PUBLIC_ORIGIN).scheme,
+        "X-Forwarded-Prefix": (app.get("route") or "").rstrip("/"),
+    }, method="GET")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LocalHealthRedirectHandler())
     try:
         with opener.open(request, timeout=max(1, min(int(timeout_seconds), 10))) as response:
             return 200 <= response.status < 300
@@ -1248,6 +1252,15 @@ def check_app_health(app: Dict[str, Any], timeout_seconds: int = 30) -> bool:
         return 200 <= exc.code < 300
     except (urllib.error.URLError, OSError, ValueError):
         return False
+
+
+class _LocalHealthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, new_url):
+        original = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(new_url)
+        if (target.scheme, target.netloc) != (original.scheme, original.netloc):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, new_url)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -1263,6 +1276,25 @@ def _wait_for_health(app: Dict[str, Any], timeout_seconds: int) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+
+def _startup_failure(app: Dict[str, Any], config: Dict[str, Any]) -> str:
+    message = (
+        f"Application did not pass its health check before the timeout: {app_health_url(app)}. "
+        f"The {app.get('framework', 'application')} runtime must listen on HOST=127.0.0.1 and "
+        f"PORT={app['port']}, and the health-check path must return HTTP 2xx. "
+        "Use APP_DATA_DIR for writable data; the release directory is read-only."
+    )
+    try:
+        values = list(_environment_values_app(app["id"]).values())
+        result = _systemctl("show", "--property=ActiveState,SubState,Result,ExecMainStatus", _service_path(app).name, timeout=5)
+        errors = _tail_log(_app_paths(app["id"], config)["logs"] / "stderr.log", 20, max_bytes=8192)
+        details = "\n".join(part for part in ((getattr(result, "stdout", "") or "").strip(), errors.strip()) if part)
+        if details:
+            message += "\nRuntime diagnostics:\n" + _redact_text(details, values)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return message
 
 
 def _assert_loopback_binding(app: Dict[str, Any], timeout: int) -> None:
@@ -3737,7 +3769,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 _raise_if_deployment_cancelled(cancel_file)
                 _append_deployment_log(deployment_log, "Waiting for the application health check")
                 if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
-                    raise RuntimeError("Application did not pass its health check before the timeout")
+                    raise RuntimeError(_startup_failure(app_snapshot, config))
                 _assert_loopback_binding(app_snapshot, int(config["command_timeout_seconds"]))
             elif hosting_framework == "static":
                 static_release_root = release_dir / "app" / _static_root_relative_path(static_root)
@@ -4210,11 +4242,12 @@ def health_check_app(app_id: str) -> Dict[str, Any]:
             service_error = str(exc)
     healthy = check_app_health(app, 3)
     public_healthy = None
+    public_status = None
     public_error = "Route is not active" if not app.get("hosting_active") else None
     if app.get("hosting_active"):
         public_url = DEFAULT_PUBLIC_ORIGIN + _routed_health_path(app)
         try:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LocalHealthRedirectHandler())
             request = urllib.request.Request(
                 public_url,
                 headers={
@@ -4224,20 +4257,29 @@ def health_check_app(app_id: str) -> Dict[str, Any]:
                 method="GET",
             )
             with opener.open(request, timeout=3) as response:
+                public_status = response.status
                 public_healthy = 200 <= response.status < 300
                 if not public_healthy:
                     public_error = f"Public route returned HTTP {response.status}"
         except urllib.error.HTTPError as exc:
             public_healthy = False
+            public_status = exc.code
             public_error = f"Public route returned HTTP {exc.code} {exc.reason}"
             if exc.code == 403:
-                public_error += "; use a health-check path accessible without authentication or an edge-security challenge"
+                edge = exc.headers and (exc.headers.get("cf-mitigated") or exc.headers.get("Server", "").lower() == "cloudflare")
+                public_error += (
+                    "; Cloudflare edge protection may be blocking the probe. Check the matching WAF/Access rule; "
+                    "do not disable protection globally. Use a health-check path accessible without authentication or an edge-security challenge"
+                    if edge else
+                    "; inspect Nginx error logs and application access rules. Static index.html and its parent directories "
+                    "must be readable/traversable by Nginx. Use a health-check path accessible without authentication or an edge-security challenge"
+                )
         except (urllib.error.URLError, OSError, ValueError) as exc:
             public_healthy = False
             public_error = str(exc)
     health = {"checked_at": now_iso(), "service_state": service_state, "service_error": service_error,
               "local_healthy": healthy, "local_error": None if healthy else "Local readiness check failed",
-              "public_healthy": public_healthy, "public_error": public_error}
+              "public_healthy": public_healthy, "public_status": public_status, "public_error": public_error}
     with _registry_transaction() as registry:
         stored = _find_app(registry, app_id)
         if stored.get("status") == app.get("status") and stored.get("updated_at") == app.get("updated_at"):

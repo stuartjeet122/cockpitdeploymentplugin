@@ -2,9 +2,9 @@ import { build } from "esbuild";
 
 const icons = [
   "Activity", "ArrowLeft", "ArrowRight", "ArrowUpRight", "Boxes", "Check", "CircleAlert",
-  "CircleCheck", "Clock", "Download", "Ellipsis", "ExternalLink", "Eye", "EyeOff", "FileText",
+  "CircleCheck", "Clock", "Copy", "Download", "Ellipsis", "ExternalLink", "Eye", "EyeOff", "FileText",
   "GitBranch", "Globe", "KeyRound", "LayoutGrid", "LoaderCircle", "Pause", "Play", "Plus",
-  "RefreshCw", "Search", "Settings2", "ShieldCheck", "SquareTerminal", "Trash2", "Upload", "X",
+  "RefreshCw", "Search", "Settings2", "ShieldCheck", "SquareTerminal", "Terminal", "Trash2", "Upload", "X",
 ];
 
 await build({

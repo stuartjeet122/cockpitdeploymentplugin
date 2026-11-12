@@ -1090,8 +1090,28 @@ class AppManagerTests(unittest.TestCase):
             opener.return_value.open.side_effect = forbidden
             report = manager.health_check_app(app["id"])
         self.assertFalse(report["public_healthy"])
+        self.assertEqual(report["public_status"], 403)
         self.assertIn("HTTP 403 Forbidden", report["public_error"])
+        self.assertIn("Nginx error logs", report["public_error"])
         self.assertIn("health-check path", report["public_error"])
+
+    def test_public_health_identifies_a_cloudflare_forbidden_probe(self):
+        app = self.add_app(framework="go")["app"]
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored.update(hosting_active=True, active_route=stored["route"])
+        forbidden = urllib.error.HTTPError(
+            manager.DEFAULT_PUBLIC_ORIGIN + app["route"], 403, "Forbidden", {"Server": "cloudflare"}, None
+        )
+        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
+            manager, "check_app_health", return_value=True
+        ), patch.object(manager.urllib.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = forbidden
+            report = manager.health_check_app(app["id"])
+        self.assertTrue(report["local_healthy"])
+        self.assertEqual(report["service_state"], "active")
+        self.assertEqual(report["public_status"], 403)
+        self.assertIn("Cloudflare edge protection", report["public_error"])
 
     def test_nextjs_public_health_preserves_an_existing_route_prefix(self):
         app = self.add_app(framework="nextjs")["app"]
@@ -1580,6 +1600,28 @@ class AppManagerTests(unittest.TestCase):
             side_effect=urllib.error.HTTPError("http://127.0.0.1:8100/health", 404, "Not Found", {}, None),
         ):
             self.assertFalse(manager.check_app_health(app))
+
+    def test_local_health_redirects_cannot_leave_the_application(self):
+        handler = manager._LocalHealthRedirectHandler()
+        request = urllib.request.Request("http://127.0.0.1:8123/")
+        for target, allowed in (("http://127.0.0.1:8123/login/", True),
+                                ("http://127.0.0.1:8080/", False),
+                                ("https://example.com/", False)):
+            with self.subTest(target=target):
+                redirected = handler.redirect_request(request, None, 302, "Found", {}, target)
+                self.assertEqual(redirected is not None, allowed)
+
+    def test_startup_failure_includes_redacted_runtime_diagnostics(self):
+        app = self.add_app("Go diagnostics", framework="go")["app"]
+        with patch.object(manager, "_environment_values_app", return_value={"TOKEN": "private-token"}), patch.object(
+            manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, stdout="ExecMainStatus=1", stderr="")
+        ), patch.object(manager, "_tail_log", return_value="permission denied private-token"):
+            message = manager._startup_failure(app, manager.get_config())
+        self.assertIn(f"PORT={app['port']}", message)
+        self.assertIn("APP_DATA_DIR", message)
+        self.assertIn("ExecMainStatus=1", message)
+        self.assertIn("permission denied [REDACTED]", message)
+        self.assertNotIn("private-token", message)
 
     def test_runtime_listener_must_be_loopback_only(self):
         app = {"port": 8123}
@@ -2607,6 +2649,70 @@ class FrameworkAdapterTests(unittest.TestCase):
             self.assertFalse(result["runtime_required"])
             self.assertEqual(result["start_command"], [])
             runner.assert_not_called()
+
+    def test_static_html_assets_are_scoped_without_changing_source_or_other_apps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "assets").mkdir()
+            (source / "assets" / "icon.svg").write_text("<svg/>", encoding="utf-8")
+            page = '<!doctype html>\n<link rel="icon" href="/assets/icon.svg?v=1&amp;x=2"><img src="/assets/icon.svg"/><a href="/other-app/">Other</a><script>const url="/assets/icon.svg";</script><img src="//cdn.example/icon.svg"><img src="/docs/assets/icon.svg">'
+            (source / "index.html").write_text(page, encoding="utf-8")
+            result = get_adapter("static").build({"port": 8123, "route": "/docs/"}, source, root / "release")
+            output = (Path(result["release_dir"]) / "app" / "index.html").read_text(encoding="utf-8")
+            self.assertIn('href="/docs/assets/icon.svg?v=1&amp;x=2"', output)
+            self.assertIn('src="/docs/assets/icon.svg"', output)
+            self.assertIn('href="/other-app/"', output)
+            self.assertIn('const url="/assets/icon.svg";', output)
+            self.assertIn('src="//cdn.example/icon.svg"', output)
+            self.assertNotIn("/docs/docs/", output)
+            self.assertEqual((source / "index.html").read_text(encoding="utf-8"), page)
+
+    def test_go_builds_an_isolated_binary_and_preserves_static_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
+            (source / "icon.svg").write_text("<svg/>", encoding="utf-8")
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+            result = get_adapter("go").build({"port": 8123}, source, root / "release", runner=runner)
+            runner.assert_called_once_with(["go", "build", "-o", str(root / "release" / "server"), "."], root / "release" / "app", 900)
+            self.assertEqual(result["start_command"], [str(root / "release" / "server")])
+            self.assertTrue((root / "release" / "app" / "icon.svg").is_file())
+
+    def test_python_uses_release_venv_and_loopback_gunicorn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "requirements.txt").write_text("flask\n", encoding="utf-8")
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+            result = get_adapter("python").build({"port": 8123}, source, root / "release", runner=runner)
+            self.assertEqual(result["start_command"], [str(root / "release" / "app" / ".venv" / "bin" / "gunicorn"), "--bind", "127.0.0.1:8123", "app:app"])
+            self.assertEqual(runner.call_args_list[0].args[0], ["python3", "-m", "venv", ".venv"])
+
+    def test_python_custom_start_resolves_the_release_virtual_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "requirements.txt").write_text("uvicorn\nfastapi\n", encoding="utf-8")
+            command = ["uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8123"]
+
+            def runner(arguments, cwd, timeout):
+                executable = cwd / ".venv" / "bin" / "uvicorn"
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_text("entry point", encoding="utf-8")
+                return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+            result = get_adapter("python").build(
+                {"port": 8123, "build_config": {"start_command": command}}, source, root / "release", runner=runner,
+            )
+            self.assertEqual(result["start_command"][0], str(root / "release" / "app" / ".venv" / "bin" / "uvicorn"))
+            self.assertEqual(result["start_command"][1:], command[1:])
+            self.assertEqual(command[0], "uvicorn")
 
     def test_node_uses_lockfile_package_manager_without_injecting_start_flags(self):
         for package_manager, lockfile in (

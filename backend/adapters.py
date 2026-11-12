@@ -9,8 +9,11 @@ import stat
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
+from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 CommandRunner = Callable[[Sequence[str], Path, int], subprocess.CompletedProcess]
@@ -942,7 +945,62 @@ class PythonAdapter(FrameworkAdapter):
             app,
             [str(app_dir / ".venv" / "bin" / "gunicorn"), "--bind", f"127.0.0.1:{app['port']}", "app:app"],
         )
+        if "/" not in start[0] and "\\" not in start[0]:
+            executable = app_dir / ".venv" / "bin" / start[0]
+            if executable.is_file():
+                start = [str(executable), *start[1:]]
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
+
+
+class _StaticAssetParser(HTMLParser):
+    def __init__(self, content: str, root: Path, route: str):
+        super().__init__(convert_charrefs=False)
+        self.content = content
+        self.root = root.resolve(strict=True)
+        self.route = route
+        self.offsets = [0]
+        for line in content.splitlines(keepends=True):
+            self.offsets.append(self.offsets[-1] + len(line))
+        self.replacements = []
+
+    def handle_starttag(self, tag, attrs):
+        updated = []
+        changed = False
+        for name, value in attrs:
+            if tag != "base" and name in {"src", "href", "poster", "data"} and value:
+                parsed = urlsplit(value)
+                if not parsed.scheme and not parsed.netloc and parsed.path.startswith("/") and not parsed.path.startswith(("//", self.route)):
+                    asset = self.root / unquote(parsed.path).lstrip("/")
+                    try:
+                        asset.resolve(strict=True).relative_to(self.root)
+                        if asset.is_file():
+                            value = urlunsplit(("", "", self.route.rstrip("/") + parsed.path, parsed.query, parsed.fragment))
+                            changed = True
+                    except (OSError, ValueError):
+                        pass
+            updated.append(name if value is None else f'{name}="{escape(value, quote=True)}"')
+        if changed:
+            original = self.get_starttag_text()
+            ending = " />" if original.endswith("/>") else ">"
+            line, column = self.getpos()
+            start = self.offsets[line - 1] + column
+            self.replacements.append((start, start + len(original), "<" + tag + " " + " ".join(updated) + ending))
+
+    handle_startendtag = handle_starttag
+
+
+def _prefix_static_html_assets(app_dir: Path, route: str) -> None:
+    for path in app_dir.rglob("*.html"):
+        if path.is_symlink():
+            continue
+        content = path.read_text(encoding="utf-8")
+        parser = _StaticAssetParser(content, app_dir, route)
+        parser.feed(content)
+        parser.close()
+        if parser.replacements:
+            for start, end, replacement in reversed(parser.replacements):
+                content = content[:start] + replacement + content[end:]
+            path.write_text(content, encoding="utf-8")
 
 
 class StaticAdapter(FrameworkAdapter):
@@ -968,6 +1026,8 @@ class StaticAdapter(FrameworkAdapter):
             raise FileNotFoundError("index.html not found for static application")
         app_dir = _copy_source(repo_path, release_dir, group_id)
         start = _configured_start(app, [])
+        if not start and app.get("route"):
+            _prefix_static_html_assets(app_dir, app["route"])
         return {
             "status": "success",
             "release_dir": str(release_dir),

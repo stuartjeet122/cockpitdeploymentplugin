@@ -126,6 +126,36 @@ test("successful service transitions override older health observations", async 
   } finally { ui.dom.window.close(); }
 });
 
+test("forbidden public probes are blocked without marking a healthy runtime failed", async () => {
+  const ui = await loadUi({ list: { apps: [{ ...fixtureApps[0], health: {
+    checked_at: new Date().toISOString(), service_state: "active", local_healthy: true,
+    public_healthy: false, public_status: 403, public_error: "Cloudflare returned HTTP 403",
+  } }] } });
+  try {
+    const card = ui.document.querySelector(".am-app-card");
+    assert.equal(card.dataset.status, "running");
+    assert.match(card.textContent, /Blocked · 403/);
+    assert.match(card.textContent, /ReadinessHealthy/);
+    assert.equal(card.querySelector(".am-runtime-details").open, false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("offline bundle renders every requested interface icon", async () => {
+  const bundle = fs.readFileSync(path.join(root, "cockpit/icons.js"), "utf8");
+  const ui = await loadUi({}, (window) => window.eval(bundle));
+  try {
+    const names = new Set([...script.matchAll(/icon\("([a-z-]+)"\)/g)].map((match) => match[1]));
+    for (const name of names) {
+      const element = ui.document.createElement("i");
+      element.dataset.lucide = name;
+      ui.document.body.append(element);
+    }
+    ui.window.renderAppManagerIcons();
+    assert.equal(ui.document.querySelectorAll("i[data-lucide]").length, 0);
+    assert.ok(ui.document.querySelectorAll("svg.lucide").length > 20);
+  } finally { ui.dom.window.close(); }
+});
+
 test("preflight and metrics render structured backend observations", async () => {
   const ui = await loadUi({ preflight: { passed: false, checks: [{ name: "node", passed: false, message: "minimum 20.9" }], errors: ["Missing API_KEY"] }, metrics: { metrics: { memory_bytes: 1048576, cpu_percent: 5, restarts: 2, checked_at: "2026-11-11T09:00:00Z" } } });
   try {
