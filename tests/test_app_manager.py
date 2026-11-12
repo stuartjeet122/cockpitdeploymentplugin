@@ -818,6 +818,43 @@ class AppManagerTests(unittest.TestCase):
                 systemctl.assert_not_called()
                 prune.assert_not_called()
 
+    def test_abort_recovers_legacy_running_records_but_not_unpublished_workers(self):
+        app = self.add_app()["app"]
+        deployment_id = "20261109220923-abcdef12"
+        unit = f"cockpit-app-manager-deploy-{app['id']}-{deployment_id}.service"
+        cases = [
+            ("running", {}, True),
+            ("running", {"systemd_unit": None}, True),
+            ("pending", {}, False),
+            ("pending", {"systemd_unit": None}, False),
+            ("running", {"systemd_unit": "stuserver-websites.service"}, False),
+        ]
+        for build_status, metadata, recovered in cases:
+            with self.subTest(build_status=build_status, metadata=metadata):
+                with manager._registry_transaction() as registry:
+                    stored = manager._find_app(registry, app["id"])
+                    stored["status"] = "deploying"
+                    stored["deployments"] = [{
+                        "id": deployment_id, "status": "deploying", "build_status": build_status,
+                        "previous_status": "running", "abortable": True, **metadata,
+                    }]
+                with patch.object(manager, "_require_root"), patch.object(
+                    manager, "run_command", return_value=subprocess.CompletedProcess(
+                        [], 0, "LoadState=not-found\nActiveState=inactive\nSubState=dead\nJob=\n", ""
+                    )
+                ) as run:
+                    result = manager.abort_deployment_app(app["id"], deployment_id)
+                self.assertEqual(result["aborted"], recovered)
+                stored = manager._find_app(manager.get_registry(), app["id"])
+                self.assertEqual(stored["status"], "running" if recovered else "deploying")
+                self.assertEqual(stored["deployments"][0]["status"], "aborted" if recovered else "deploying")
+                if recovered:
+                    run.assert_called_once_with(
+                        ["systemctl", "show", unit, "--property=LoadState,ActiveState,SubState,Job"], timeout=5
+                    )
+                else:
+                    run.assert_not_called()
+
     def test_abort_does_not_recover_a_locked_deployment(self):
         app = self.add_app()["app"]
         deployment_id = "20261109220923-abcdef12"

@@ -3501,7 +3501,10 @@ def _abort_interrupted_deployment(app_id: str, deployment_id: str) -> bool:
             if (
                 not isinstance(latest, dict) or latest.get("id") != deployment_id
                 or latest.get("status") != "deploying" or latest.get("abortable", True) is False
-                or latest.get("systemd_unit") != unit_name
+                or (
+                    latest.get("systemd_unit") != unit_name
+                    and not (latest.get("systemd_unit") is None and latest.get("build_status") == "running")
+                )
             ):
                 return False
             result = run_command(
