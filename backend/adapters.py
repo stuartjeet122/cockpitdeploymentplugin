@@ -20,7 +20,7 @@ class CommandRunner(Protocol):
     def __call__(self, command: Sequence[str], cwd: Path, timeout: int, *, preserve_stdout: bool = False) -> subprocess.CompletedProcess: ...
 
 
-def _copy_source(repo_path: Path, release_dir: Path, group_id: Optional[int] = None) -> Path:
+def _copy_source(repo_path: Path, release_dir: Path, group_id: Optional[int] = None, route: Optional[str] = None) -> Path:
     app_dir = release_dir / "app"
     shutil.copytree(
         repo_path,
@@ -29,6 +29,8 @@ def _copy_source(repo_path: Path, release_dir: Path, group_id: Optional[int] = N
         ignore=shutil.ignore_patterns(".git", "node_modules", ".venv", "__pycache__", ".pytest_cache"),
     )
     _validate_copy_symlinks(app_dir)
+    if route:
+        _prefix_static_html_assets(app_dir, route)
     if group_id is not None:
         _prepare_build_copy_permissions(app_dir, group_id)
     return app_dir
@@ -716,7 +718,7 @@ class NextJSAdapter(FrameworkAdapter):
         package_relative_path = source_package_dir.relative_to(repo_path)
         source_package_path = source_app_dir / "package.json"
         source_package_contents = _readable_regular_file(source_package_path, "Next.js package.json")
-        app_dir = _copy_source(repo_path, release_dir, group_id)
+        app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
         project_dir = app_dir / app_relative_path
         package_dir = app_dir / package_relative_path
         copied_package_path = project_dir / "package.json"
@@ -789,7 +791,8 @@ class NextJSAdapter(FrameworkAdapter):
             static_export = (config_result.stdout or "").strip() == "APP_MANAGER_NEXT_STATIC_EXPORT"
             _run_build(
                 runner,
-                ["node", str(Path(__file__).with_name("prepare_next_assets.cjs")), route.rstrip("/")],
+                ["node", str(Path(__file__).with_name("prepare_next_assets.cjs")), route.rstrip("/"),
+                 "--install-hook", manager, str(timeout)],
                 project_dir, timeout, "Preparing Next.js local asset/API URLs for the public route",
             )
         _run_build(
@@ -868,7 +871,7 @@ class GoAdapter(FrameworkAdapter):
     ) -> Dict[str, Any]:
         if not (repo_path / "go.mod").is_file():
             raise FileNotFoundError("go.mod not found for Go application")
-        app_dir = _copy_source(repo_path, release_dir, group_id)
+        app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
         binary_path = release_dir / "server"
         target_result = _run_build(
             runner, ["go", "env", "-json", "GOHOSTOS", "GOHOSTARCH", "GOOS", "GOARCH"],
@@ -952,11 +955,16 @@ class NodeAdapter(FrameworkAdapter):
         scripts = package.get("scripts", {})
         if not scripts.get("start") and not app.get("build_config", {}).get("start_command"):
             raise ValueError("Node.js applications need a start script or build_config.start_command")
-        app_dir = _copy_source(repo_path, release_dir, group_id)
+        app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
         manager, lockfile = _detect_js_package_manager(app_dir)
         _install_js_dependencies(manager, lockfile, app_dir, runner, timeout, "Node.js", log=log)
         if scripts.get("build"):
-            _run_build(runner, _js_build_command(manager), app_dir, timeout, "Building Node.js application")
+            build_command = _js_build_command(manager)
+            if app.get("route") and scripts["build"].strip() == "vite build":
+                build_command.extend((["--"] if manager == "npm" else []) + ["--base", app["route"]])
+            _run_build(runner, build_command, app_dir, timeout, "Building Node.js application")
+            if app.get("route"):
+                _prefix_static_html_assets(app_dir, app["route"])
         _install_js_production_dependencies(manager, app_dir, runner, timeout, "Node.js", log=log)
         start = _configured_start(app, [manager, "run", "start"])
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
@@ -981,7 +989,7 @@ class PythonAdapter(FrameworkAdapter):
         log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         del log
-        app_dir = _copy_source(repo_path, release_dir, group_id)
+        app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
         _run_build(runner, ["python3", "-m", "venv", ".venv"], app_dir, timeout, "Creating Python virtual environment")
         python = str(app_dir / ".venv" / "bin" / "python")
         if (app_dir / "requirements.txt").is_file():
@@ -1018,6 +1026,48 @@ class PythonAdapter(FrameworkAdapter):
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
+def _scoped_file_url(value: str, root: Path, route: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith(("//", route)):
+        return value
+    segments = unquote(parsed.path).lstrip("/").split("/")
+    if any(not segment or segment.startswith(".") or "\\" in segment for segment in segments):
+        return value
+    for candidate_root in (root, root / "public", root / "static", root / "dist", root / "build"):
+        candidate = candidate_root.joinpath(*segments)
+        try:
+            candidate.resolve(strict=True).relative_to(root)
+            if candidate.is_file():
+                return urlunsplit(("", "", route.rstrip("/") + parsed.path, parsed.query, parsed.fragment))
+        except (OSError, ValueError):
+            continue
+    return value
+
+
+def _prefix_web_manifest(path: Path, root: Path, route: str) -> None:
+    contents = path.read_text(encoding="utf-8")
+    try:
+        manifest = json.loads(contents)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid web manifest in release: {path.relative_to(root)}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Web manifest must be a JSON object: {path.relative_to(root)}")
+    original = json.dumps(manifest)
+    if path.suffix != ".webmanifest" and not any(key in manifest for key in ("start_url", "scope")):
+        return
+    for key in ("id", "scope", "start_url"):
+        value = manifest.get(key)
+        if isinstance(value, str) and value.startswith("/") and not value.startswith(("//", route)) and value != route.rstrip("/"):
+            manifest[key] = route.rstrip("/") + value
+    icons = manifest.get("icons", [])
+    if isinstance(icons, list):
+        for icon in icons:
+            if isinstance(icon, dict) and isinstance(icon.get("src"), str):
+                icon["src"] = _scoped_file_url(icon["src"], root, route)
+    if json.dumps(manifest) != original:
+        path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
 class _StaticAssetParser(HTMLParser):
     def __init__(self, content: str, root: Path, route: str):
         super().__init__(convert_charrefs=False)
@@ -1037,16 +1087,9 @@ class _StaticAssetParser(HTMLParser):
                 value = self.route
                 changed = True
             elif tag != "base" and name in {"src", "href", "poster", "data"} and value:
-                parsed = urlsplit(value)
-                if not parsed.scheme and not parsed.netloc and parsed.path.startswith("/") and not parsed.path.startswith(("//", self.route)):
-                    asset = self.root / unquote(parsed.path).lstrip("/")
-                    try:
-                        asset.resolve(strict=True).relative_to(self.root)
-                        if asset.is_file():
-                            value = urlunsplit(("", "", self.route.rstrip("/") + parsed.path, parsed.query, parsed.fragment))
-                            changed = True
-                    except (OSError, ValueError):
-                        pass
+                scoped = _scoped_file_url(value, self.root, self.route)
+                changed = changed or scoped != value
+                value = scoped
             updated.append(name if value is None else f'{name}="{escape(value, quote=True)}"')
         if changed:
             original = self.get_starttag_text()
@@ -1059,17 +1102,25 @@ class _StaticAssetParser(HTMLParser):
 
 
 def _prefix_static_html_assets(app_dir: Path, route: str) -> None:
-    for path in app_dir.rglob("*.html"):
-        if path.is_symlink():
-            continue
-        content = path.read_text(encoding="utf-8")
-        parser = _StaticAssetParser(content, app_dir, route)
-        parser.feed(content)
-        parser.close()
-        if parser.replacements:
-            for start, end, replacement in reversed(parser.replacements):
-                content = content[:start] + replacement + content[end:]
-            path.write_text(content, encoding="utf-8")
+    for current, directories, filenames in os.walk(app_dir, followlinks=False):
+        directories[:] = [name for name in directories if name not in {
+            "node_modules", ".venv", ".git", ".next", "__pycache__",
+        } and not (Path(current) / name).is_symlink()]
+        for name in filenames:
+            path = Path(current) / name
+            if path.is_symlink():
+                continue
+            if path.suffix == ".webmanifest" or name == "manifest.json":
+                _prefix_web_manifest(path, app_dir.resolve(strict=True), route)
+            elif path.suffix == ".html":
+                content = path.read_text(encoding="utf-8")
+                parser = _StaticAssetParser(content, app_dir, route)
+                parser.feed(content)
+                parser.close()
+                if parser.replacements:
+                    for start, end, replacement in reversed(parser.replacements):
+                        content = content[:start] + replacement + content[end:]
+                    path.write_text(content, encoding="utf-8")
 
 
 class StaticAdapter(FrameworkAdapter):
@@ -1093,10 +1144,8 @@ class StaticAdapter(FrameworkAdapter):
         del log
         if not (repo_path / "index.html").is_file():
             raise FileNotFoundError("index.html not found for static application")
-        app_dir = _copy_source(repo_path, release_dir, group_id)
+        app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
         start = _configured_start(app, [])
-        if not start and app.get("route"):
-            _prefix_static_html_assets(app_dir, app["route"])
         return {
             "status": "success",
             "release_dir": str(release_dir),

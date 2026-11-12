@@ -7,7 +7,7 @@
     "test": "python -m unittest discover -s tests -v",
     "test:ui": "node --test tests/ui.test.cjs",
     "build:icons": "node scripts/build-icons.mjs",
-    "lint": "python -m compileall backend tests && node --check cockpit/app-manager.js"
+    "lint": "python -m compileall backend tests && node --check cockpit/app-manager.js && node --check backend/prepare_next_assets.cjs"
   },
   "devDependencies": {
     "@babel/parser": "^7.28.5",

@@ -2504,6 +2504,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         preparation = runner.call_args_list[2]
         self.assertEqual(preparation.args[0], [
             "node", str(Path(__file__).resolve().parents[1] / "backend" / "prepare_next_assets.cjs"), "/demo",
+            "--install-hook", "npm", "17",
         ])
         self.assertEqual(preparation.args[1], release / "app")
         self.assertEqual(runner.call_args_list[3].args[0], ["npm", "run", "build"])
@@ -3070,6 +3071,46 @@ class FrameworkAdapterTests(unittest.TestCase):
             self.assertIn('src="//cdn.example/icon.svg"', output)
             self.assertNotIn("/docs/docs/", output)
             self.assertEqual((source / "index.html").read_text(encoding="utf-8"), page)
+
+    def test_all_frameworks_prepare_html_and_manifest_in_the_release_copy(self):
+        for framework in ("static", "node", "python", "go"):
+            with self.subTest(framework=framework), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source"
+                (source / "public").mkdir(parents=True)
+                (source / "public" / "icon.svg").write_text("<svg/>", encoding="utf-8")
+                page = '<base href="/"><img src="/icon.svg"><a href="/other-app/">Other</a>'
+                (source / "index.html").write_text(page, encoding="utf-8")
+                manifest = {"id": "/", "scope": "/", "start_url": "/home", "icons": [{"src": "/icon.svg"}]}
+                (source / "public" / "manifest.webmanifest").write_text(json.dumps(manifest), encoding="utf-8")
+                (source / "package.json").write_text('{"scripts":{"start":"node server.js","build":"vite build"}}', encoding="utf-8")
+                (source / "requirements.txt").write_text("", encoding="utf-8")
+                (source / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
+
+                commands = []
+
+                def runner(arguments, cwd, timeout, *, preserve_stdout=False):
+                    commands.append(arguments)
+                    metadata = self._go_metadata(arguments, cwd)
+                    if metadata is not None:
+                        return metadata
+                    if "go" in arguments and "build" in arguments:
+                        binary = root / "release" / "server"
+                        binary.write_bytes(b"\x7fELF" + b"\0" * 60)
+                        binary.chmod(0o750)
+                    self.assertIn('src="/docs/icon.svg"', (cwd / "index.html").read_text(encoding="utf-8"))
+                    return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+                get_adapter(framework).build({"port": 8123, "route": "/docs/"}, source, root / "release", runner=runner)
+                if framework == "node":
+                    self.assertIn(["npm", "run", "build", "--", "--base", "/docs/"], commands)
+                release = root / "release" / "app"
+                self.assertIn('src="/docs/icon.svg"', (release / "index.html").read_text(encoding="utf-8"))
+                self.assertIn('href="/other-app/"', (release / "index.html").read_text(encoding="utf-8"))
+                prepared = json.loads((release / "public" / "manifest.webmanifest").read_text(encoding="utf-8"))
+                self.assertEqual(prepared, {"id": "/docs/", "scope": "/docs/", "start_url": "/docs/home", "icons": [{"src": "/docs/icon.svg"}]})
+                self.assertEqual((source / "index.html").read_text(encoding="utf-8"), page)
+                self.assertEqual(json.loads((source / "public" / "manifest.webmanifest").read_text(encoding="utf-8")), manifest)
 
     def test_go_builds_an_isolated_binary_and_preserves_static_files(self):
         with tempfile.TemporaryDirectory() as temporary:

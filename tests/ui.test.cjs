@@ -20,6 +20,11 @@ test("deployment prefixes parsed local asset and API literals only in the releas
     fs.writeFileSync(path.join(checkout, "public", "icons", "logo.svg"), "<svg/>");
     fs.writeFileSync(path.join(checkout, "public", ".env"), "FIXTURE=private");
     fs.mkdirSync(path.join(checkout, "src", "app", "api", "teams"), { recursive: true });
+    fs.writeFileSync(path.join(checkout, "src", "app", "icon.svg"), "<svg/>");
+    fs.mkdirSync(path.join(checkout, "src", "app", "participants"));
+    fs.writeFileSync(path.join(checkout, "src", "app", "participants", "page.tsx"), "export default function Page() { return null; }");
+    fs.writeFileSync(path.join(checkout, "src", "app", "manifest.ts"),
+      'export default function manifest() { return { id: "/", scope: "/", start_url: "/participants", icons: [{ src: "/icon.svg" }] }; }');
     fs.writeFileSync(path.join(checkout, "src", "app", "api", "teams", "route.ts"),
       'export function GET() { return Response.json({ configured: Boolean(process.env.DATABASE_URL) }); }');
     fs.mkdirSync(path.join(checkout, "src", "pages", "api"), { recursive: true });
@@ -27,6 +32,14 @@ test("deployment prefixes parsed local asset and API literals only in the releas
       'export default function handler(req, res) { res.json({ configured: Boolean(process.env.DATABASE_URL) }); }');
     const requests = 'function cloudFetch(input) { return fetch(input); }\ncloudFetch("/api/teams?refresh=1");\nfetch("/api/team");';
     fs.writeFileSync(path.join(checkout, "src", "cloud.js"), requests);
+    const navigation = 'window.history.replaceState(null, "", "/teams?team=" + "fixture");\n' +
+      'window.history.pushState(null, "", "/scrumtimer/?team=fixture");\n' +
+      'window.history.pushState(null, "", "https://example.com/elsewhere");\n' +
+      'document.documentElement.requestFullscreen().catch(() => {});';
+    fs.writeFileSync(path.join(checkout, "src", "navigation.js"), navigation);
+    fs.writeFileSync(path.join(checkout, "src", "pathname.js"),
+      'import { usePathname as currentPath } from "next/navigation";\n' +
+      'const pathname = currentPath();\nconst routeLoaded = pathname === "/teams";');
     const source = [
       'import logo from "/infomil-logo.svg";',
       '// Keep /infomil-logo.svg in comments.',
@@ -79,7 +92,33 @@ test("deployment prefixes parsed local asset and API literals only in the releas
     assert.equal(fs.readFileSync(path.join(checkout, "src", "cloud.js"), "utf8"), requests);
     assert.ok(fs.readFileSync(path.join(release, "src", "app", "api", "teams", "route.ts"), "utf8")
       .includes("process.env.DATABASE_URL"));
-    assert.match(prepared.stdout, /Prepared 6 local asset\/API URL\(s\) in 2 release file/);
+    const manifest = fs.readFileSync(path.join(release, "src", "app", "manifest.ts"), "utf8");
+    assert.ok(manifest.includes('id: "/scrumtimer/"'));
+    assert.ok(manifest.includes('scope: "/scrumtimer/"'));
+    assert.ok(manifest.includes('start_url: "/scrumtimer/participants"'));
+    assert.ok(manifest.includes('src: "/scrumtimer/icon.svg"'));
+    const historyUrls = [];
+    let fullscreenAttempts = 0;
+    const navigationContext = {
+      window: { history: {
+        replaceState: (state, title, url) => historyUrls.push(url),
+        pushState: (state, title, url) => historyUrls.push(url),
+      } },
+      navigator: { userActivation: { isActive: false } },
+      document: { documentElement: { requestFullscreen: () => { fullscreenAttempts += 1; return Promise.resolve(); } } },
+    };
+    const preparedNavigation = fs.readFileSync(path.join(release, "src", "navigation.js"), "utf8");
+    require("node:vm").runInNewContext(preparedNavigation, navigationContext);
+    assert.deepEqual(historyUrls, ["/scrumtimer/teams?team=fixture", "/scrumtimer/?team=fixture", "https://example.com/elsewhere"]);
+    assert.equal(fullscreenAttempts, 0);
+    navigationContext.navigator.userActivation.isActive = true;
+    require("node:vm").runInNewContext(preparedNavigation, navigationContext);
+    assert.equal(fullscreenAttempts, 1);
+    const preparedPathname = fs.readFileSync(path.join(release, "src", "pathname.js"), "utf8");
+    const routeLoaded = require("node:vm").runInNewContext(
+      preparedPathname.replace(/^import[^\n]*\n/, "") + "\nrouteLoaded;", { currentPath: () => "/teams/" });
+    assert.equal(routeLoaded, true);
+    assert.match(prepared.stdout, /Prepared 15 local asset\/API URL\(s\) in 5 release file/);
     const repeated = spawnSync(process.execPath, [helper, "/scrumtimer"], {
       cwd: release, encoding: "utf8", timeout: 10000,
     });
@@ -92,6 +131,54 @@ test("deployment prefixes parsed local asset and API literals only in the releas
     });
     assert.notEqual(malformed.status, 0);
     assert.match(malformed.stderr, /Cannot safely prepare asset URLs in src/);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("deployment waits for generated assets and preserves build lifecycle hooks", () => {
+  const os = require("node:os");
+  const { spawnSync } = require("node:child_process");
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "app-manager-build-"));
+  try {
+    fs.mkdirSync(path.join(temporary, "src"));
+    fs.mkdirSync(path.join(temporary, "scripts"));
+    const packageData = { scripts: {
+      prebuild: "node scripts/generate.cjs",
+      build: "node scripts/verify.cjs",
+      postbuild: "node scripts/post.cjs",
+    } };
+    fs.writeFileSync(path.join(temporary, "package.json"), JSON.stringify(packageData));
+    fs.writeFileSync(path.join(temporary, "src", "page.tsx"), 'export const page = <img src="/guide/participants.svg" />;');
+    fs.writeFileSync(path.join(temporary, "scripts", "generate.cjs"),
+      "const fs = require('node:fs'); fs.mkdirSync('public/guide', { recursive: true }); " +
+      "fs.writeFileSync('public/guide/participants.svg', '<svg/>'); " +
+      "fs.writeFileSync('public/manifest.webmanifest', JSON.stringify({ scope: '/', start_url: '/', icons: [{src:'/guide/participants.svg'}] })); " +
+      "fs.appendFileSync('order.txt', 'prebuild\\n');");
+    fs.writeFileSync(path.join(temporary, "scripts", "verify.cjs"),
+      "const fs = require('node:fs'); require('node:assert/strict').ok(" +
+      "fs.readFileSync('src/page.tsx', 'utf8').includes('/demo/guide/participants.svg')); " +
+      "fs.appendFileSync('order.txt', 'build\\n');");
+    fs.writeFileSync(path.join(temporary, "scripts", "post.cjs"),
+      "require('node:fs').appendFileSync('order.txt', 'postbuild\\n');");
+    const parserBridge = path.join(temporary, "node_modules", "next", "dist", "compiled", "babel");
+    fs.mkdirSync(parserBridge, { recursive: true });
+    fs.writeFileSync(path.join(parserBridge, "core.js"),
+      `exports.parseSync = (source, options) => require(${JSON.stringify(require.resolve("@babel/parser"))}).parse(source, { ...options.parserOpts, sourceType: options.sourceType });`);
+    const helper = path.join(root, "backend", "prepare_next_assets.cjs");
+    const setup = spawnSync(process.execPath, [helper, "/demo", "--install-hook", "npm", "20"], {
+      cwd: temporary, encoding: "utf8", timeout: 10000,
+    });
+    assert.equal(setup.status, 0, setup.stderr);
+    assert.equal(fs.existsSync(path.join(temporary, "order.txt")), false);
+    const built = spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
+      cwd: temporary, encoding: "utf8", timeout: 20000, shell: process.platform === "win32",
+    });
+    assert.equal(built.status, 0, built.stdout + built.stderr);
+    assert.equal(fs.readFileSync(path.join(temporary, "order.txt"), "utf8"), "prebuild\nbuild\npostbuild\n");
+    assert.match(built.stdout, /Prepared 4 local asset\/API URL/);
+    const manifest = JSON.parse(fs.readFileSync(path.join(temporary, "public", "manifest.webmanifest"), "utf8"));
+    assert.deepEqual(manifest, { scope: "/demo/", start_url: "/demo/", icons: [{ src: "/demo/guide/participants.svg" }] });
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
