@@ -1115,128 +1115,112 @@ body { background-image: linear-gradient(180deg, #fff 0, #f3f5f6 28rem); }
     padding: 1rem;
     font-size: 0.9rem;
   }
+}
 
-  .am-dialog--deployment {
-    width: min(76rem, calc(100vw - 2rem));
-    max-width: 76rem;
-    max-height: min(92dvh, 68rem);
-  }
+body:has(.am-dialog--deployment[open]) { overflow: hidden; }
 
-  .am-dialog--deployment .am-dialog-form {
-    max-height: min(92dvh, 68rem);
-    grid-template-rows: auto minmax(0, 1fr);
-  }
+.am-dialog.am-dialog--deployment {
+  box-sizing: border-box;
+  width: min(70rem, calc(100vw - 3rem));
+  max-width: 70rem;
+  height: min(52rem, calc(100dvh - 3rem));
+  max-height: calc(100dvh - 3rem);
+  border-radius: 8px;
+  letter-spacing: 0;
+}
+.am-dialog--deployment .am-dialog-form { height: 100%; min-height: 0; }
+.am-dialog--deployment .am-dialog-header { padding: 1.25rem 1.75rem; align-items: flex-start; }
+.am-dialog--deployment .am-dialog-header h2 {
+  display: grid;
+  min-width: 0;
+  gap: 0.25rem;
+  font-size: 1.375rem;
+  line-height: 1.3;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+.am-deployment-eyebrow { color: var(--am-muted); font-size: 0.75rem; font-weight: 500; }
+.am-dialog--deployment .am-dialog-close { flex: 0 0 auto; }
+.am-dialog--deployment .am-dialog-body {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  padding: 0;
+  overflow: hidden;
+  scrollbar-gutter: auto;
+}
+.am-deployment-summary { min-width: 0; padding: 1.25rem 1.75rem; }
+.am-deployment-status { display: flex; align-items: center; gap: 0.65rem; margin: 0 0 1.25rem; font-size: 1rem; font-weight: 650; line-height: 1.5; }
+.am-deployment-status::before { content: ""; flex: 0 0 auto; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: #b78318; box-shadow: 0 0 0 4px rgb(183 131 24 / 12%); }
+.am-deployment-status[data-status="deployed"]::before { background: #258352; box-shadow: 0 0 0 4px rgb(37 131 82 / 12%); }
+.am-deployment-status[data-status="failed"]::before { background: var(--am-danger); box-shadow: 0 0 0 4px rgb(201 25 11 / 10%); }
+.am-deployment-status[data-status="aborted"]::before { background: var(--am-muted); box-shadow: none; }
+.am-deployment-facts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.7fr); gap: 1rem; margin: 0; }
+.am-deployment-facts > div { min-width: 0; }
+.am-deployment-facts dt { margin-bottom: 0.35rem; color: var(--am-muted); font-size: 0.75rem; }
+.am-deployment-facts dd { display: flex; align-items: flex-start; gap: 0.4rem; margin: 0; font-size: 0.8125rem; font-weight: 550; overflow-wrap: anywhere; }
+.am-deployment-facts dd > span, .am-deployment-facts code { min-width: 0; }
+.am-deployment-facts svg { width: 1rem; height: 1rem; flex: 0 0 auto; color: var(--am-muted); }
+.am-deployment-facts code { font: 0.8125rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.am-dialog--deployment .am-log-window { display: grid; min-width: 0; min-height: 0; grid-template-rows: auto minmax(0, 1fr); border-top: 1px solid var(--am-border); background: #16191d; }
+.am-log-window__bar { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.625rem 1.75rem; border-bottom: 1px solid #32363d; color: #e4e6eb; }
+.am-log-window__bar h3 { display: flex; align-items: center; flex-wrap: wrap; gap: 0.625rem; margin: 0; font-size: 0.8125rem; font-weight: 600; }
+.am-log-window__bar h3 > svg { width: 1rem; height: 1rem; color: #aeb5bf; }
+.am-output-state { border-left: 1px solid #4d535c; padding-left: 0.625rem; color: #b5bdc8; font-size: 0.6875rem; font-weight: 400; }
+.am-dialog--deployment .am-deployment-log-actions { display: flex; flex: 0 0 auto; gap: 0.25rem; margin: 0; }
+.am-dialog--deployment .am-deployment-log-actions button { display: grid; width: 2.5rem; height: 2.5rem; min-height: 2.5rem; padding: 0; place-items: center; border: 1px solid transparent; border-radius: 4px; background: transparent; color: #d2d7df; }
+.am-dialog--deployment .am-deployment-log-actions button:hover:not(:disabled) { background: #30353d; color: #fff; }
+.am-dialog--deployment .am-deployment-log-actions svg { width: 1.125rem; height: 1.125rem; }
+.am-dialog--deployment button:disabled { opacity: 0.45; cursor: not-allowed; }
+.am-dialog--deployment .am-log-output { width: 100%; min-width: 0; min-height: 0; max-height: none; padding: 1rem 1.75rem 1.5rem; border-radius: 0; background: transparent; font-size: 0.8125rem; line-height: 1.8; white-space: normal; scrollbar-color: #555d68 #16191d; scrollbar-gutter: stable; }
+.am-dialog--deployment .am-log-line { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr); gap: 1rem; padding: 0.15rem 0; }
+.am-dialog--deployment .am-log-time { min-width: 0; margin: 0; padding-right: 0.75rem; border-right: 1px solid #32363d; color: #9aa4b2; font-size: 0.6875rem; }
+.am-dialog--deployment .am-log-message { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.am-dialog--deployment .am-log-line--info { color: #d2d7df; }
+.am-dialog--deployment .am-log-line--phase { color: #82d9cb; }
+.am-dialog--deployment .am-dialog-footer { min-height: 4.5rem; gap: 1rem; padding: 0.875rem 1.75rem; }
+.am-dialog--deployment .am-dialog-footer [data-dialog-close] { margin-left: auto; min-width: 6rem; }
+.am-dialog--deployment .am-button--danger { border-color: color-mix(in srgb, var(--am-danger) 35%, var(--am-border)); background: var(--am-danger-soft); color: var(--am-danger); }
+.am-dialog--deployment .am-button--danger:hover:not(:disabled) { border-color: var(--am-danger); }
+.am-dialog--deployment :focus-visible { outline: 2px solid var(--am-focus); outline-offset: -3px; }
 
-  .am-dialog--deployment .am-dialog-header {
-    min-height: 4.25rem;
-    padding-inline: 1.5rem;
-    background: color-mix(in srgb, var(--am-surface) 92%, var(--am-accent-soft));
-  }
+@media (max-width: 760px) {
+  .am-dialog.am-dialog--deployment { width: calc(100vw - 1.5rem); height: calc(100dvh - 1.5rem); max-height: calc(100dvh - 1.5rem); }
+  .am-dialog--deployment .am-dialog-header, .am-deployment-summary, .am-dialog--deployment .am-dialog-footer { padding: 1rem 1.25rem; }
+  .am-deployment-facts { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem 1.25rem; }
+  .am-log-window__bar { padding: 0.5rem 1.25rem; }
+  .am-dialog--deployment .am-log-output { padding: 0.75rem 1.25rem 1rem; }
+}
 
-  .am-dialog--deployment .am-dialog-footer {
-    display: none;
-  }
+@media (max-width: 420px) {
+  .am-dialog.am-dialog--deployment { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0; border: 0; border-radius: 0; }
+  .am-dialog--deployment .am-dialog-header { padding: 1rem; }
+  .am-dialog--deployment .am-dialog-header h2 { font-size: 1.125rem; }
+  .am-deployment-summary { padding: 1rem; }
+  .am-deployment-status { margin-bottom: 1rem; font-size: 0.9375rem; }
+  .am-deployment-facts { gap: 0.75rem 1rem; }
+  .am-deployment-facts__id { grid-column: 1 / -1; }
+  .am-deployment-facts > div:nth-child(3) { grid-column: 2; grid-row: 1; }
+  .am-deployment-facts dd, .am-deployment-facts code { font-size: 0.75rem; }
+  .am-log-window__bar { padding: 0.375rem 1rem; }
+  .am-dialog--deployment .am-log-output { padding: 0.75rem; font-size: 0.75rem; }
+  .am-dialog--deployment .am-log-line { grid-template-columns: 3.75rem minmax(0, 1fr); gap: 0.625rem; }
+  .am-dialog--deployment .am-log-time { padding-right: 0.375rem; font-size: 0.625rem; }
+  .am-dialog--deployment .am-dialog-footer { min-height: 4.25rem; padding: 0.75rem 1rem max(0.75rem, env(safe-area-inset-bottom)); gap: 0.5rem; }
+}
 
-  .am-dialog--deployment .am-dialog-body {
-    display: flex;
-    min-height: 0;
-    flex-direction: column;
-    gap: 1.1rem;
-    padding: clamp(1rem, 2.5vw, 1.75rem);
-    background: var(--am-page, #f5f7fa);
-  }
+@media (max-height: 560px) and (min-width: 421px) {
+  .am-dialog.am-dialog--deployment { height: calc(100dvh - 1rem); max-height: calc(100dvh - 1rem); }
+  .am-dialog--deployment .am-dialog-header, .am-deployment-summary, .am-dialog--deployment .am-dialog-footer { padding-block: 0.625rem; }
+  .am-dialog--deployment .am-dialog-header h2 { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.75rem; font-size: 1.125rem; }
+  .am-deployment-status { margin-bottom: 0.625rem; }
+  .am-deployment-facts { grid-template-columns: minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(0, 0.8fr) minmax(0, 1.6fr); }
+  .am-dialog--deployment .am-dialog-footer { min-height: 3.25rem; padding-block: 0.375rem; }
+  .am-log-window__bar { padding-block: 0.25rem; }
+}
 
-  .am-deployment-overview {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    gap: 1rem;
-    padding: 1.25rem;
-    border: 1px solid color-mix(in srgb, var(--am-accent) 18%, var(--am-border));
-    border-radius: 1rem;
-    background: linear-gradient(120deg, var(--am-surface), color-mix(in srgb, var(--am-accent-soft, #edf5ff) 55%, var(--am-surface)));
-    box-shadow: 0 0.5rem 1.5rem rgb(15 23 42 / 5%);
-  }
-
-  .am-deployment-overview__icon {
-    display: grid;
-    width: 3.25rem;
-    height: 3.25rem;
-    flex: 0 0 auto;
-    place-items: center;
-    border: 1px solid color-mix(in srgb, var(--am-accent) 20%, transparent);
-    border-radius: 0.9rem;
-    background: var(--am-accent-soft);
-    color: var(--am-accent);
-  }
-
-  .am-deployment-overview__icon svg { width: 1.4rem; height: 1.4rem; }
-  .am-deployment-overview__copy { min-width: 0; flex: 1; }
-  .am-deployment-overview__eyebrow { color: var(--am-muted); font-size: 0.65rem; font-weight: 750; letter-spacing: 0.12em; }
-  .am-deployment-status { display: flex; align-items: center; gap: 0.55rem; margin: 0.2rem 0; font-size: 1.1rem; font-weight: 750; letter-spacing: -0.02em; }
-  .am-deployment-status::before { width: 0.55rem; height: 0.55rem; flex: 0 0 auto; border-radius: 50%; background: #d29d28; content: ""; }
-  .am-deployment-status[data-status="deployed"]::before { background: #36a269; }
-  .am-deployment-status[data-status="failed"],
-  .am-deployment-status[data-status="aborted"] { color: var(--am-danger); }
-  .am-deployment-status[data-status="failed"]::before,
-  .am-deployment-status[data-status="aborted"]::before { background: var(--am-danger); }
-  .am-deployment-status[data-status="running"]::before { animation: am-pulse 1.4s ease-in-out infinite; }
-  .am-deployment-overview__meta { display: flex; flex-wrap: wrap; gap: 0.35rem 0.55rem; margin: 0; color: var(--am-muted); font-size: 0.78rem; overflow-wrap: anywhere; }
-  .am-deployment-overview__meta code,
-  .am-deployment-id code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-  .am-deployment-id { display: grid; flex: 0 0 auto; gap: 0.25rem; color: var(--am-muted); font-size: 0.65rem; font-weight: 750; letter-spacing: 0.08em; text-align: right; }
-  .am-deployment-id code { color: var(--am-text); font-size: 0.72rem; letter-spacing: 0; }
-
-  .am-deployment-log-toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-  }
-
-  .am-dialog--deployment .am-log-legend { justify-content: flex-start; gap: 0.4rem; margin: 0; }
-  .am-dialog--deployment .am-log-legend__item { padding: 0.2rem 0.5rem; border: 1px solid currentColor; border-radius: 999px; font-size: 0.67rem; line-height: 1.4; }
-  .am-dialog--deployment .am-log-legend__item.am-log-line--error { color: #b42318; }
-  .am-dialog--deployment .am-log-legend__item.am-log-line--warning { color: #8a5700; }
-  .am-dialog--deployment .am-log-legend__item.am-log-line--success { color: #16733c; }
-  .am-dialog--deployment .am-log-legend__item.am-log-line--phase { color: #7041a5; }
-  .am-dialog--deployment .am-log-legend__item.am-log-line--stdout { color: #475569; }
-  .am-dialog--deployment .am-log-legend__item.am-log-line--stderr { color: #a33a00; }
-  .am-deployment-log-actions { display: flex; flex: 0 0 auto; justify-content: flex-end; gap: 0.5rem; margin: 0; }
-  .am-dialog--deployment .am-deployment-log-actions .am-button { display: inline-flex; min-height: 2.35rem; align-items: center; gap: 0.45rem; padding: 0.45rem 0.7rem; font-size: 0.76rem; }
-  .am-deployment-log-actions svg { width: 1rem; height: 1rem; }
-  .am-dialog--deployment .am-deployment-log-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  .am-log-window {
-    display: flex;
-    min-height: 20rem;
-    flex: 1 1 auto;
-    flex-direction: column;
-    overflow: hidden;
-    border: 1px solid #293542;
-    border-radius: 0.9rem;
-    background: #0c1118;
-    box-shadow: 0 0.7rem 2rem rgb(15 23 42 / 15%);
-  }
-
-  .am-log-window__bar {
-    display: flex;
-    min-height: 2.65rem;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 0.55rem 1rem;
-    border-bottom: 1px solid #26313c;
-    color: #8e9ba9;
-    font-size: 0.7rem;
-  }
-
-  .am-log-window__bar > span:first-child { display: inline-flex; align-items: center; gap: 0.55rem; color: #d9e2ec; font-weight: 650; }
-  .am-log-window__bar i { width: 0.48rem; height: 0.48rem; border-radius: 50%; background: #36a269; box-shadow: 0 0 0 0.2rem rgb(54 162 105 / 15%); }
-  .am-log-output { width: 100%; max-height: none; min-height: 0; flex: 1 1 auto; padding: 1rem 1.1rem 1.25rem; border-radius: 0; background: transparent; color: #e8edf2; font-size: 0.77rem; line-height: 1.75; }
-  .am-log-line { display: grid; grid-template-columns: 6rem minmax(0, 1fr); gap: 0.6rem; padding: 0.08rem 0; }
-  .am-log-time { min-width: 0; margin: 0; color: #758596; font-size: 0.7rem; }
-  .am-log-message { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 520px) {
 
   .am-setup-environment {
     display: grid;
@@ -1255,44 +1239,9 @@ body { background-image: linear-gradient(180deg, #fff 0, #f3f5f6 28rem); }
   .am-setup-environment .am-field-hint { margin: 0; }
   .am-env-import-button { display: inline-flex !important; flex: 0 0 auto; align-items: center; cursor: pointer; }
 
-  @keyframes am-pulse { 50% { box-shadow: 0 0 0 0.32rem rgb(210 157 40 / 18%); } }
-
-  @media (max-width: 760px) {
-    .am-dialog--deployment { width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); }
-    .am-dialog--deployment .am-dialog-form { max-height: calc(100dvh - 1rem); }
-    .am-deployment-overview { align-items: flex-start; padding: 1rem; }
-    .am-deployment-overview__icon { width: 2.7rem; height: 2.7rem; }
-    .am-deployment-id { display: none; }
-    .am-deployment-log-toolbar { align-items: flex-start; flex-direction: column; }
-    .am-deployment-log-actions { width: 100%; flex-wrap: wrap; }
-    .am-deployment-log-actions .am-button { flex: 1 1 auto; justify-content: center; }
-    .am-log-window { min-height: 16rem; }
-    .am-log-output { padding: 0.8rem; font-size: 0.72rem; }
-  }
-
   @media (max-width: 420px) {
-    .am-log-line { grid-template-columns: 4.5rem minmax(0, 1fr); gap: 0.35rem; }
-    .am-log-time { font-size: 0.63rem; }
-    .am-log-window__bar > span:last-child { display: none; }
     .am-setup-environment__heading { align-items: flex-start; flex-direction: column; }
   }
-
-  @media (prefers-reduced-motion: reduce) {
-    .am-deployment-status[data-status="running"]::before { animation: none; }
-  }
-
-  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--error,
-  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--error { color: #ff8f87; }
-  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--warning,
-  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--warning { color: #ffd166; }
-  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--success,
-  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--success { color: #8de0a0; }
-  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--phase,
-  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--phase { color: #d3a6ff; }
-  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--stdout,
-  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--stdout { color: #c6d0dc; }
-  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--stderr,
-  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--stderr { color: #ffb86b; }
 
   .am-brand {
     align-items: flex-start;

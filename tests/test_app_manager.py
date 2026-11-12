@@ -690,6 +690,7 @@ class AppManagerTests(unittest.TestCase):
                 "release": None,
                 "release_available": False,
                 "status": "deploying",
+                "commit": "b" * 40,
             })
         log_path = manager._deployment_log_path(app["id"], deployment_id, create=True)
         manager._append_deployment_log(log_path, "Build started")
@@ -698,6 +699,7 @@ class AppManagerTests(unittest.TestCase):
 
         self.assertTrue(result["active"])
         self.assertEqual(result["status"], "deploying")
+        self.assertEqual(result["commit"], "b" * 40)
         self.assertIn("Build started", result["logs"])
         self.assertIn("Build started", manager.logs_app(app["id"])["logs"])
         with patch.object(manager, "_tail_log", side_effect=AssertionError("Status polling must not read logs")):
@@ -705,6 +707,7 @@ class AppManagerTests(unittest.TestCase):
             status = manager._dispatch(args)
         self.assertTrue(status["active"])
         self.assertEqual(status["status"], "deploying")
+        self.assertEqual(status["commit"], "b" * 40)
         self.assertNotIn("logs", status)
 
     def test_deployment_records_and_releases_keep_only_the_current_version(self):

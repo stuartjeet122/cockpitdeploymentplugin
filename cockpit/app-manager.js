@@ -937,7 +937,7 @@
 
     const timeLabel = timestamp
       ? `<time class="am-log-time" datetime="${timestamp}" title="${timestamp}">${timestamp.slice(11, 19)}</time>`
-      : "";
+      : '<span class="am-log-time" aria-hidden="true"></span>';
     return `<span class="am-log-line am-log-line--${level}" title="${level}">${timeLabel}<span class="am-log-message">${escapeHtml(message)}</span></span>`;
   }
 
@@ -983,6 +983,13 @@
     if (downloadButton) downloadButton.disabled = !state.logTarget.logs;
     const deploymentId = byId("deploymentLogId");
     if (deploymentId) deploymentId.textContent = result.deployment_id || "Starting";
+    const revision = byId("deploymentLogRevision");
+    if (revision && result.commit) {
+      revision.textContent = result.commit.slice(0, 7);
+      revision.title = result.commit;
+    }
+    const outputState = byId("deploymentOutputState");
+    if (outputState) outputState.textContent = result.active ? "Live" : "Finished";
     const abortButton = byId("abortDeploymentButton");
     if (abortButton) {
       abortButton.hidden = !result.active || result.abortable === false;
@@ -1033,51 +1040,49 @@
 
   function openDeploymentLogDialog(appId) {
     const app = state.apps.find((item) => item.id === appId);
-    const branch = app?.branch ? `Branch ${app.branch}` : "Branch unavailable";
+    const branch = app?.branch || "Unavailable";
     const route = app?.active_route || app?.route || `/${appId}/`;
-    const commit = app?.deployed_commit ? app.deployed_commit.slice(0, 7) : "Commit pending";
     openDialog(
-      `Deployment: ${app?.name || appId}`,
-      `<div class="am-deployment-overview">
-         <span class="am-deployment-overview__icon" aria-hidden="true">${icon("terminal")}</span>
-         <div class="am-deployment-overview__copy">
-           <span class="am-deployment-overview__eyebrow">DEPLOYMENT ACTIVITY</span>
-           <p id="deploymentLiveStatus" class="am-deployment-status" data-status="running" role="status" aria-live="polite">Starting deployment…</p>
-           <p class="am-deployment-overview__meta">${escapeHtml(branch)} <span aria-hidden="true">·</span> ${escapeHtml(route)} <span aria-hidden="true">·</span> <code>${escapeHtml(commit)}</code></p>
+      app?.name || appId,
+      `<section class="am-deployment-summary" aria-label="Deployment details">
+         <p id="deploymentLiveStatus" class="am-deployment-status" data-status="running" role="status" aria-live="polite">Starting deployment…</p>
+         <dl class="am-deployment-facts">
+           <div><dt>Branch</dt><dd>${icon("git-branch")}<span>${escapeHtml(branch)}</span></dd></div>
+           <div><dt>Route</dt><dd><span>${escapeHtml(route)}</span></dd></div>
+           <div><dt>Source revision</dt><dd><code id="deploymentLogRevision">Pending</code></dd></div>
+           <div class="am-deployment-facts__id"><dt>Deployment ID</dt><dd><code id="deploymentLogId">Starting</code></dd></div>
+         </dl>
+       </section>
+       <section class="am-log-window" aria-labelledby="deploymentOutputHeading">
+         <div class="am-log-window__bar">
+           <h3 id="deploymentOutputHeading">${icon("terminal")} Build output <span id="deploymentOutputState" class="am-output-state">Live</span></h3>
+           <div class="am-deployment-log-actions">
+             <button id="copyDeploymentLogButton" type="button" class="am-button am-icon-button" title="Copy log" aria-label="Copy log" disabled>${icon("copy")}<span class="am-visually-hidden">Copy log</span></button>
+             <button id="downloadDeploymentLogButton" type="button" class="am-button am-icon-button" title="Download log (.txt)" aria-label="Download log (.txt)" disabled>${icon("download")}</button>
+           </div>
          </div>
-         <span class="am-deployment-id">ID <code id="deploymentLogId">Starting</code></span>
-       </div>
-       <div class="am-deployment-log-toolbar">
-         <div class="am-log-legend" aria-label="Log color key">
-           <span class="am-log-legend__item am-log-line--error">Error</span>
-           <span class="am-log-legend__item am-log-line--warning">Warning</span>
-           <span class="am-log-legend__item am-log-line--success">Passed</span>
-           <span class="am-log-legend__item am-log-line--phase">Phase</span>
-           <span class="am-log-legend__item am-log-line--stdout">Output</span>
-           <span class="am-log-legend__item am-log-line--stderr">Stderr</span>
-         </div>
-         <div class="am-deployment-log-actions">
-           <button id="copyDeploymentLogButton" type="button" class="am-button" disabled>${icon("copy")} Copy log</button>
-           <button id="downloadDeploymentLogButton" type="button" class="am-button" disabled>${icon("download")} Download .txt</button>
-           <button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort</button>
-         </div>
-       </div>
-       <div class="am-log-window">
-         <div class="am-log-window__bar"><span><i></i> Live output</span><span>Plain-text safe · secrets redacted</span></div>
-         <pre id="deploymentLiveLog" class="am-log-output" aria-label="Deployment log output" aria-live="off">Waiting for deployment output…</pre>
-       </div>`,
+         <pre id="deploymentLiveLog" class="am-log-output" aria-label="Deployment log output" aria-live="off" tabindex="0">Waiting for deployment output…</pre>
+       </section>`,
     );
-    byId("appManagerDialog").classList.add("am-dialog--deployment");
+    const dialog = byId("appManagerDialog");
+    dialog.classList.add("am-dialog--deployment");
+    byId("appManagerDialogTitle").insertAdjacentHTML("afterbegin", '<span class="am-deployment-eyebrow">Deployment</span>');
+    dialog.querySelector(".am-dialog-footer").insertAdjacentHTML("afterbegin",
+      '<button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort deployment</button>');
     state.logTarget = { appId, deploymentId: null };
     byId("copyDeploymentLogButton").addEventListener("click", async (event) => {
       const button = event.currentTarget;
       try {
         await copyDeploymentLog();
-        button.innerHTML = `${icon("check")} Copied`;
+        button.innerHTML = `${icon("check")}<span class="am-visually-hidden">Copied</span>`;
+        button.title = "Copied";
+        button.setAttribute("aria-label", "Copied");
         renderIcons();
         window.setTimeout(() => {
           if (button.isConnected) {
-            button.innerHTML = `${icon("copy")} Copy log`;
+            button.innerHTML = `${icon("copy")}<span class="am-visually-hidden">Copy log</span>`;
+            button.title = "Copy log";
+            button.setAttribute("aria-label", "Copy log");
             renderIcons();
           }
         }, 1800);

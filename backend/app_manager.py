@@ -4247,6 +4247,7 @@ def deployment_logs_app(app_id: str, deployment_id: Optional[str] = None, *, sta
         "ok": True,
         "app_id": app_id,
         "deployment_id": latest["id"],
+        "commit": latest.get("commit"),
         "active": latest.get("status") == "deploying",
         "aborting": latest.get("status") == "deploying" and cancel_file.exists(),
         "build_status": latest.get("build_status", "pending"),

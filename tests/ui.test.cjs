@@ -257,7 +257,9 @@ test("live logs preserve scroll, skip unchanged redraws, and poll only status wh
     assert.ok(output.querySelector(".am-log-line--stderr"));
     assert.ok(output.querySelector(".am-log-line--error"));
     assert.equal(output.querySelector(".am-log-time").textContent, "02:48:14");
-    assert.ok(ui.document.querySelector(".am-log-legend"));
+    assert.ok(ui.document.querySelector(".am-deployment-facts"));
+    assert.equal(output.querySelectorAll(".am-log-time").length, output.querySelectorAll(".am-log-message").length);
+    assert.equal(output.getAttribute("tabindex"), "0");
     Object.defineProperties(output, { scrollHeight: { value: 1000 }, clientHeight: { value: 200 } });
     output.scrollTop = 300;
     const firstLine = output.firstChild;
@@ -332,6 +334,7 @@ test("deployment logs can be copied and downloaded as plain text", async () => {
   const deployment = {
     app_id: "portal",
     deployment_id: "20261112024814-82d96f71",
+    commit: "b".repeat(40),
     active: false,
     status: "failed",
     logs: "Build phase: running\nCannot find module '@swc/core'",
@@ -356,6 +359,12 @@ test("deployment logs can be copied and downloaded as plain text", async () => {
   try {
     ui.document.querySelector('[data-action="deployment-log"]').click();
     await settle(ui.window);
+    assert.equal(ui.document.querySelector("#deploymentLogRevision").textContent, "bbbbbbb");
+    assert.equal(ui.document.querySelector("#deploymentLogRevision").title, deployment.commit);
+    assert.equal(ui.document.querySelector("#deploymentOutputState").textContent, "Finished");
+    assert.equal(ui.document.querySelector("#deploymentLogId").textContent, deployment.deployment_id);
+    assert.ok(ui.document.querySelector(".am-dialog-footer #abortDeploymentButton"));
+    assert.equal(ui.document.querySelector("#copyDeploymentLogButton").getAttribute("aria-label"), "Copy log");
     ui.document.querySelector("#copyDeploymentLogButton").click();
     await settle(ui.window);
     assert.equal(copied, deployment.logs);
@@ -415,7 +424,8 @@ test("pending approval cannot be dismissed or submitted twice", async () => {
     assert.equal(ui.calls.filter((record) => record.command === "approve").length, 1);
     release({ deployment_id: "approved" });
     await settle(ui.window);
-    assert.match(dialog.textContent, /Deployment:/);
+    assert.equal(dialog.querySelector(".am-deployment-eyebrow").textContent, "Deployment");
+    assert.match(dialog.querySelector("#appManagerDialogTitle").textContent, /Customer Portal/);
   } finally { release({ deployment_id: "approved" }); ui.dom.window.close(); }
 });
 
