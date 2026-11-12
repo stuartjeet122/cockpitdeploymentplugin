@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import configparser
 import json
 import os
 import re
@@ -192,6 +193,60 @@ def _npm_lockfile_version(lockfile: Optional[Path]) -> Optional[int]:
     return None
 
 
+def _convert_to_pnpm(
+    package_dir: Path,
+    source_manager: str,
+    lockfile: Optional[Path],
+    runner: Optional[CommandRunner],
+    timeout: int,
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[Path]:
+    package_path = package_dir / "package.json"
+    package = json.loads(_readable_regular_file(package_path, "JavaScript package.json").decode("utf-8"))
+    if not isinstance(package, dict):
+        raise ValueError("JavaScript package.json must be an object")
+    package.pop("packageManager", None)
+    if isinstance(package.get("devEngines"), dict):
+        package["devEngines"].pop("packageManager", None)
+    package_path.write_text(json.dumps(package, indent=2) + "\n", encoding="utf-8")
+    npmrc = package_dir / ".npmrc"
+    contents = _readable_regular_file(npmrc, "Project npm configuration").decode("utf-8") if npmrc.exists() or npmrc.is_symlink() else ""
+    settings = configparser.ConfigParser(interpolation=None, delimiters=("=",), strict=False)
+    settings.read_string("[npm]\n" + contents)
+    for key, value in settings.items("npm"):
+        if key in {"_auth", "_authtoken", "username", "_password"}:
+            raise ValueError("Registry credentials must be scoped to their registry URL before pnpm conversion")
+        if key == "registry" and value.rstrip("/") not in {"https://registry.npmjs.org", "http://127.0.0.1:4873"}:
+            raise ValueError("A custom default registry cannot be converted to the public shared cache; configure private registries by package scope")
+    npmrc.write_bytes((contents.rstrip() + "\n" + "\n".join([
+        "registry=http://127.0.0.1:4873/",
+        "enable-pre-post-scripts=true",
+        "manage-package-manager-versions=false",
+        "package-manager-strict=false",
+        "package-import-method=copy",
+        "verify-store-integrity=true",
+        "strict-dep-builds=true",
+    ]) + "\n").encode("utf-8"))
+    workspace_path = package_dir / "pnpm-workspace.yaml"
+    patterns = _workspace_patterns(package)
+    if patterns and not workspace_path.exists():
+        workspace_path.write_text(json.dumps({"packages": patterns}, indent=2) + "\n", encoding="utf-8")
+    if log is not None:
+        log(f"Converting release dependencies from {source_manager} to pnpm; shared registry cache: http://127.0.0.1:4873/")
+    if source_manager == "pnpm":
+        return lockfile
+    if lockfile is not None and source_manager in {"npm", "yarn"}:
+        if lockfile.name == "npm-shrinkwrap.json":
+            (package_dir / "package-lock.json").unlink(missing_ok=True)
+        _run_build(runner, ["pnpm", "import"], package_dir, timeout, "Importing dependency lockfile into pnpm")
+        imported = package_dir / "pnpm-lock.yaml"
+        _readable_regular_file(imported, "Imported pnpm lockfile")
+        return imported
+    if log is not None:
+        log("No pnpm-importable lockfile: resolving package.json ranges into a new release-only pnpm lockfile")
+    return None
+
+
 def _log_npm_preflight(
     app_dir: Path,
     package_dir: Path,
@@ -253,7 +308,7 @@ def _js_install_command(
         operation = "ci" if has_lockfile else "install"
         return ["npm", *prefix, operation, "--include=dev", "--no-fund", "--no-audit"]
     if manager == "pnpm":
-        return ["pnpm", *prefix, "install", "--frozen-lockfile", "--prod=false"]
+        return ["pnpm", *prefix, "install", "--frozen-lockfile" if has_lockfile else "--no-frozen-lockfile", "--prod=false"]
     if manager == "yarn":
         return ["yarn", *prefix, "install", "--frozen-lockfile", "--production=false"]
     if manager == "bun":
@@ -755,6 +810,9 @@ class NextJSAdapter(FrameworkAdapter):
                         f"npm lockfile changed while copying source: source={source_lockfile}; release={lockfile}"
                     )
             _log_npm_preflight(project_dir, package_dir, lockfile, group_id, log)
+        if app.get("_managed_pnpm"):
+            lockfile = _convert_to_pnpm(package_dir, manager, lockfile, runner, timeout, log)
+            manager = "pnpm"
         _install_js_dependencies(
             manager,
             lockfile,
@@ -957,6 +1015,9 @@ class NodeAdapter(FrameworkAdapter):
             raise ValueError("Node.js applications need a start script or build_config.start_command")
         app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
         manager, lockfile = _detect_js_package_manager(app_dir)
+        if app.get("_managed_pnpm"):
+            lockfile = _convert_to_pnpm(app_dir, manager, lockfile, runner, timeout, log)
+            manager = "pnpm"
         _install_js_dependencies(manager, lockfile, app_dir, runner, timeout, "Node.js", log=log)
         if scripts.get("build"):
             build_command = _js_build_command(manager)
@@ -1186,7 +1247,8 @@ def inspect_project(repo_path: Path, framework: str, build_config: Dict[str, Any
             if framework == "node" and not scripts.get("start") and not explicit_start:
                 errors.append("Node.js requires a start script or an explicit start command")
             manager, _ = _detect_js_package_manager(package_root)
-            tools.update({"node": "18.18.0", manager: None})
+            tools.update({"node": "18.18.0", "pnpm": "10.3.0"})
+            warnings.append(f"Managed builds convert {manager} dependencies to pnpm in the release copy and reuse the loopback registry cache")
             dependencies = {}
             for field in ("devDependencies", "dependencies"):
                 if not isinstance(package.get(field, {}), dict):

@@ -350,6 +350,7 @@ remove_default_plugin_files() {
   remove_owned_file "${PLUGIN_DEST}/app-manager.js" "App Manager Cockpit UI loaded"
   remove_owned_file "${PLUGIN_DEST}/icons.js" "Cockpit App Manager offline icons"
   remove_owned_file "${CONFIG_DEST}/defaults.json" '"nginx_template"'
+  remove_owned_file "${CONFIG_DEST}/npm-cache.json" '"_comment": "Managed by Cockpit App Manager"'
   remove_owned_file "${CONFIG_DEST}/templates/nginx.conf.tpl" "{{ app_route_location }}"
   remove_owned_file "${CONFIG_DEST}/templates/app.service.tpl" "# Managed by Cockpit App Manager"
   remove_owned_file "${BACKEND_DEST}/app-manager" 'APP_NAME = "app-manager"'
@@ -408,6 +409,26 @@ remove_auto_deploy_units() {
   systemctl daemon-reload || fail "Could not reload systemd after removing automatic-deployment units."
 }
 
+remove_npm_cache_unit() {
+  local service_path="${SYSTEMD_DIR}/cockpit-app-manager-npm-cache.service"
+  [[ -e "$service_path" || -L "$service_path" ]] || return 0
+  if [[ -L "$service_path" || ! -f "$service_path" ]] || has_symlink_ancestor "$service_path" ||
+    ! grep -Fqx '# Managed by Cockpit App Manager' "$service_path" ||
+    ! grep -Fqx 'Description=Cockpit App Manager shared npm registry cache' "$service_path" ||
+    ! grep -Fqx 'User=cockpit-am-npm-cache' "$service_path"; then
+    fail "Refusing to remove an unverified registry cache service."
+  fi
+  command -v systemctl >/dev/null 2>&1 || fail "systemctl is required to stop the registry cache."
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log 'DRY-RUN: systemctl disable --now cockpit-app-manager-npm-cache.service'
+    log "DRY-RUN: remove $service_path"
+    return 0
+  fi
+  systemctl disable --now cockpit-app-manager-npm-cache.service >/dev/null || fail "Could not stop the registry cache."
+  rm -f -- "$service_path"
+  systemctl daemon-reload || fail "Could not reload systemd after removing the registry cache service."
+}
+
 if [[ $# -gt 0 ]]; then
   for arg in "$@"; do
     case "$arg" in
@@ -440,6 +461,7 @@ if [[ "$REMOVE_MANAGED_DATA" -eq 1 ]]; then
 else
   log 'Removing only App Manager-owned Cockpit and backend files; preserving app data and production releases.'
   remove_auto_deploy_units
+  remove_npm_cache_unit
   remove_default_plugin_files
   log 'Finished App Manager plugin uninstallation.'
 fi

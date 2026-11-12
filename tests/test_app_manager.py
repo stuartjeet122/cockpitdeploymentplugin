@@ -109,6 +109,36 @@ class AppManagerTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["preserve_stdout"])
         self.assertEqual(run.call_args.kwargs["redact_values"], ["private"])
 
+    def test_shared_npm_cache_requires_its_own_loopback_listener(self):
+        status = subprocess.CompletedProcess([], 0, stdout="ActiveState=active\nMainPID=1234\n", stderr="")
+        for address, uid, allowed in (("127.0.0.1:4873", "61123", True), ("0.0.0.0:4873", "61123", False), ("127.0.0.1:4873", "1001", False)):
+            with self.subTest(address=address, uid=uid), patch.object(manager.Path, "read_text", return_value="Uid:\t61123\t61123\t61123\t61123\n"), patch.object(manager, "run_command", side_effect=[
+                status,
+                subprocess.CompletedProcess([], 0, stdout=f'LISTEN 0 128 {address} 0.0.0.0:* uid:{uid} ino:100 sk:200\n', stderr=""),
+            ]) as command:
+                if allowed:
+                    manager._assert_npm_cache_service()
+                else:
+                    with self.assertRaises(RuntimeError):
+                        manager._assert_npm_cache_service()
+                self.assertTrue(all(call.kwargs["timeout"] == 10 for call in command.call_args_list))
+                self.assertEqual(command.call_args.args[0], ["ss", "-H", "-ltne", "sport = :4873"])
+        with patch.object(manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="ActiveState=failed\nMainPID=0\n", stderr="")):
+            with self.assertRaisesRegex(RuntimeError, "shared npm cache is unavailable"):
+                manager._assert_npm_cache_service()
+
+    def test_pnpm_download_commands_verify_the_cache_before_switching_user(self):
+        for arguments, expected_calls in ((["pnpm", "import"], 1), (["pnpm", "install"], 1), (["pnpm", "--version"], 0)):
+            with self.subTest(arguments=arguments), patch.object(manager, "_require_root"), patch.object(
+                manager.os, "name", "posix"
+            ), patch.object(manager, "_account_exists", return_value=True), patch.object(
+                manager, "_home_path", return_value="/managed/home"
+            ), patch.object(manager, "_assert_npm_cache_service") as cache, patch.object(
+                manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            ):
+                manager._run_as_user("app-demo", arguments)
+                self.assertEqual(cache.call_count, expected_calls)
+
     def test_identity_switch_failure_includes_redacted_parent_diagnostics(self):
         for returncode, stderr, expected_diagnostics in (
             (127, "setpriv: setresuid failed: Operation not permitted", True),
@@ -1879,7 +1909,8 @@ class AppManagerTests(unittest.TestCase):
         self.assertIn("Next.js npm preflight", logs)
         self.assertIn("lockfileVersion=3", logs)
         self.assertIn("app_group_readable:", logs)
-        self.assertIn("Command: npm ci --include=dev --no-fund --no-audit", logs)
+        self.assertIn("Converting release dependencies from npm to pnpm", logs)
+        self.assertIn("Importing dependency lockfile into pnpm failed", logs)
         self.assertIn(expected_error, logs)
 
     def test_health_check_accepts_only_success_responses(self):
@@ -2421,6 +2452,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
         app_route=None,
         next_config=None,
         next_config_name="next.config.mjs",
+        managed_pnpm=False,
     ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -2457,7 +2489,7 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
                 for filename in filenames:
                     (Path(current) / filename).chmod(0o600)
         result = NextJSAdapter().build(
-            {"port": 8123, "build_config": app_build_config or {}, "route": app_route},
+            {"port": 8123, "build_config": app_build_config or {}, "route": app_route, "_managed_pnpm": managed_pnpm},
             repo,
             release,
             runner=runner,
@@ -2472,6 +2504,94 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
             subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
             for _ in range(3)
         ])
+
+    def test_managed_pnpm_commands_for_every_detected_javascript_manager(self):
+        cases = (
+            ({"package-lock.json": '{"lockfileVersion":3,"packages":{}}'}, True),
+            ({"yarn.lock": "# yarn lockfile\n"}, True),
+            ({"bun.lock": '{"lockfileVersion":1}'}, False),
+            ({"bun.lockb": b"\x00bun-lock"}, False),
+            ({"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"}, False),
+            ({}, False),
+        )
+        for lockfiles, imports_lock in cases:
+            with self.subTest(lockfiles=lockfiles):
+                def complete(command, cwd, timeout):
+                    if command[:2] == ["pnpm", "import"]:
+                        (cwd / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                runner = Mock(side_effect=complete)
+                repo, release, result, _ = self.build_project(lockfiles, runner, managed_pnpm=True)
+                commands = [call.args[0] for call in runner.call_args_list]
+                if imports_lock:
+                    self.assertEqual(commands.pop(0), ["pnpm", "import"])
+                frozen = imports_lock or "pnpm-lock.yaml" in lockfiles
+                self.assertEqual(commands, [
+                    ["pnpm", "install", "--frozen-lockfile" if frozen else "--no-frozen-lockfile", "--prod=false"],
+                    ["pnpm", "run", "build"],
+                    ["pnpm", "install", "--frozen-lockfile", "--prod=true"],
+                ])
+                self.assertEqual(result["start_command"], ["pnpm", "exec", "next", "start", "--hostname", "127.0.0.1", "--port", "8123"])
+                self.assertFalse((repo / ".npmrc").exists())
+                self.assertTrue((release / "app" / ".npmrc").is_file())
+
+    def test_pnpm_conversion_preserves_checkout_and_creates_workspace_metadata(self):
+        from backend.adapters import _convert_to_pnpm
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            release = Path(temporary) / "release"
+            source.mkdir()
+            original = json.dumps({"packageManager": "npm@10.0.0", "workspaces": ["apps/*"], "scripts": {"build": "npm run assets"}})
+            (source / "package.json").write_text(original, encoding="utf-8")
+            (source / "package-lock.json").write_text('{"lockfileVersion":3,"packages":{}}', encoding="utf-8")
+            shutil.copytree(source, release)
+
+            def runner(command, cwd, timeout):
+                self.assertEqual(command, ["pnpm", "import"])
+                self.assertEqual(cwd, release)
+                self.assertEqual(json.loads((cwd / "pnpm-workspace.yaml").read_text(encoding="utf-8")), {"packages": ["apps/*"]})
+                (cwd / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            imported = _convert_to_pnpm(release, "npm", release / "package-lock.json", runner, 17)
+            self.assertEqual(imported, release / "pnpm-lock.yaml")
+            prepared = json.loads((release / "package.json").read_text(encoding="utf-8"))
+            self.assertNotIn("packageManager", prepared)
+            self.assertEqual(prepared["scripts"], {"build": "npm run assets"})
+            npmrc = (release / ".npmrc").read_text(encoding="utf-8")
+            self.assertIn("registry=http://127.0.0.1:4873/", npmrc)
+            self.assertIn("package-import-method=copy", npmrc)
+            self.assertIn("verify-store-integrity=true", npmrc)
+            self.assertEqual((source / "package.json").read_text(encoding="utf-8"), original)
+            self.assertFalse((source / "pnpm-lock.yaml").exists())
+
+    def test_pnpm_conversion_rejects_unscoped_credentials_and_custom_default_registries(self):
+        from backend.adapters import _convert_to_pnpm
+        for configuration in ("_auth=fixture", "_authToken=fixture", "registry=https://private.example/"):
+            with self.subTest(configuration=configuration), tempfile.TemporaryDirectory() as temporary:
+                project = Path(temporary)
+                (project / "package.json").write_text("{}", encoding="utf-8")
+                (project / ".npmrc").write_text(configuration, encoding="utf-8")
+                runner = Mock()
+                with self.assertRaises(ValueError):
+                    _convert_to_pnpm(project, "npm", None, runner, 17)
+                runner.assert_not_called()
+
+    def test_pnpm_conversion_retains_scoped_registries_and_prefers_shrinkwrap(self):
+        from backend.adapters import _convert_to_pnpm
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "package.json").write_text("{}", encoding="utf-8")
+            config = "@private:registry=https://private.example/\n//private.example/:_authToken=${PRIVATE_TOKEN}\n"
+            (project / ".npmrc").write_text(config, encoding="utf-8")
+            (project / "npm-shrinkwrap.json").write_text("{}", encoding="utf-8")
+            (project / "package-lock.json").write_text("{}", encoding="utf-8")
+            def complete(command, cwd, timeout):
+                self.assertFalse((project / "package-lock.json").exists())
+                (project / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            _convert_to_pnpm(project, "npm", project / "npm-shrinkwrap.json", complete, 17)
+            self.assertIn(config, (project / ".npmrc").read_text(encoding="utf-8"))
 
     def test_npm_lockfile_uses_ci_build_and_production_prune(self):
         package_lock = json.dumps({"lockfileVersion": 3, "packages": {}})
@@ -3014,6 +3134,26 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
 
 
 class FrameworkAdapterTests(unittest.TestCase):
+    def test_managed_node_converts_to_pnpm_before_vite_build(self):
+        from backend.adapters import NodeAdapter
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            release = Path(temporary) / "release"
+            repo.mkdir()
+            release.mkdir()
+            (repo / "package.json").write_text(json.dumps({
+                "scripts": {"build": "vite build", "start": "node server.js"},
+            }), encoding="utf-8")
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+            result = NodeAdapter().build({"port": 8123, "route": "/demo/", "_managed_pnpm": True}, repo, release, runner=runner)
+            self.assertEqual([call.args[0] for call in runner.call_args_list], [
+                ["pnpm", "install", "--no-frozen-lockfile", "--prod=false"],
+                ["pnpm", "run", "build", "--base", "/demo/"],
+                ["pnpm", "install", "--frozen-lockfile", "--prod=true"],
+            ])
+            self.assertEqual(result["start_command"], ["pnpm", "run", "start"])
+            self.assertFalse((repo / ".npmrc").exists())
+
     @staticmethod
     def _go_metadata(arguments, cwd):
         if arguments[:3] == ["go", "env", "-json"]:
@@ -4186,6 +4326,24 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         frontend = (project / "cockpit" / "app-manager.js").read_text(encoding="utf-8")
         self.assertIn('superuser: "require"', frontend)
         self.assertIn('config.command_timeout_seconds ?? 30', frontend)
+
+    def test_shared_cache_service_uses_private_systemd_storage_and_read_only_registry_rules(self):
+        project = Path(__file__).resolve().parent.parent
+        service = (project / "templates" / "npm-cache.service").read_text(encoding="utf-8")
+        config = json.loads((project / "config" / "npm-cache.json").read_text(encoding="utf-8"))
+        for setting in ("DynamicUser=yes", "User=cockpit-am-npm-cache", "ProtectSystem=strict", "ProtectHome=yes", "NoNewPrivileges=yes", "CacheDirectoryMode=0700", "StateDirectoryMode=0700", "CapabilityBoundingSet="):
+            self.assertIn(setting, service)
+        self.assertIn("--listen 127.0.0.1:4873", service)
+        self.assertEqual(config["listen"], "127.0.0.1:4873")
+        self.assertEqual(config["auth"]["htpasswd"]["max_users"], -1)
+        self.assertFalse(config["web"]["enable"])
+        for rules in config["packages"].values():
+            self.assertEqual(rules["access"], "$all")
+            self.assertEqual(rules["publish"], [])
+            self.assertEqual(rules["unpublish"], [])
+        installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
+        self.assertIn('systemctl enable --now cockpit-app-manager-npm-cache.service', installer)
+        self.assertIn("_assert_npm_cache_service()", installer)
 
     def test_standalone_frontend_assets_are_referenced_and_installed(self):
         project = Path(__file__).resolve().parent.parent

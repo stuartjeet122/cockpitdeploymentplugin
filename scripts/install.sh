@@ -50,6 +50,36 @@ preflight() {
   done
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' ||
     fail "Python 3.9 or newer is required."
+  for required_command in node pnpm verdaccio; do
+    command -v "$required_command" >/dev/null 2>&1 ||
+      fail "Shared JavaScript cache requires $required_command in /usr/local/bin or /usr/bin; install Node.js, pnpm 10.3+ (10.x), and Verdaccio 6.x first."
+    case "$(command -v "$required_command")" in
+      /usr/bin/*|/usr/local/bin/*) ;;
+      *) fail "$required_command must be installed in /usr/bin or /usr/local/bin for isolated services." ;;
+    esac
+  done
+  local pnpm_version
+  pnpm_version="$(cd /; pnpm --version)"
+  [[ "$pnpm_version" == 10.* ]] && dpkg --compare-versions "$pnpm_version" ge 10.3.0 ||
+    fail "Managed builds require pnpm 10.3 or newer within the tested 10.x series."
+  [[ -f "$APP_DIR/config/npm-cache.json" && -f "$APP_DIR/templates/npm-cache.service" ]] ||
+    fail "Shared registry cache configuration or service template is missing."
+  local cache_unit="$SYSTEMD_DEST/cockpit-app-manager-npm-cache.service"
+  [[ ! -L "$cache_unit" ]] || fail "Shared cache unit must not be a symlink."
+  if [[ -e "$cache_unit" ]]; then
+    grep -Fqx '# Managed by Cockpit App Manager' "$cache_unit" &&
+      grep -Fqx 'Description=Cockpit App Manager shared npm registry cache' "$cache_unit" ||
+      fail "Refusing to overwrite an unmanaged registry cache unit."
+  elif [[ -n "$(ss -H -ltn 'sport = :4873')" ]]; then
+    fail "Port 4873 is occupied; refusing to replace an existing registry."
+  fi
+  [[ ! -L "$CONFIG_DEST/npm-cache.json" ]] || fail "Shared cache configuration must not be a symlink."
+  if [[ -e "$CONFIG_DEST/npm-cache.json" ]]; then
+    grep -Fq '"_comment": "Managed by Cockpit App Manager"' "$CONFIG_DEST/npm-cache.json" ||
+      fail "Refusing to overwrite an unmanaged registry cache configuration."
+  fi
+  [[ "$CONFIG_DEST" == /etc/cockpit/app-manager ]] ||
+    fail "Shared registry cache currently requires the standard /etc/cockpit/app-manager config directory."
 
   local cockpit_version
   cockpit_version="$(dpkg-query -W -f='${Version}' cockpit-bridge 2>/dev/null)" ||
@@ -119,6 +149,8 @@ install_files() {
   install -o root -g root -m 0644 "$APP_DIR/templates/app-manager.logrotate" /etc/logrotate.d/cockpit-app-manager
   install -o root -g root -m 0644 "$APP_DIR/templates/auto-deploy.service" "$SYSTEMD_DEST/cockpit-app-manager-auto-deploy.service"
   install -o root -g root -m 0644 "$APP_DIR/templates/auto-deploy.timer" "$SYSTEMD_DEST/cockpit-app-manager-auto-deploy.timer"
+  install -o root -g root -m 0644 "$APP_DIR/config/npm-cache.json" "$CONFIG_DEST/npm-cache.json"
+  install -o root -g root -m 0644 "$APP_DIR/templates/npm-cache.service" "$SYSTEMD_DEST/cockpit-app-manager-npm-cache.service"
 
   if [[ -L "$STATE_ROOT/apps.json" || -L "$STATE_ROOT/config.json" ]]; then
     fail "Registry and configuration files must not be symlinks."
@@ -140,6 +172,25 @@ install_files() {
   [[ -r "$BACKEND_DEST/adapters.py" && -x "$BACKEND_DEST/app-manager" ]] ||
     fail "Installed backend files have incorrect permissions."
   systemctl daemon-reload
+  systemctl enable --now cockpit-app-manager-npm-cache.service
+  systemctl restart cockpit-app-manager-npm-cache.service
+  python3 - <<'PY'
+import json
+import time
+import urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+for attempt in range(30):
+  try:
+    with opener.open("http://127.0.0.1:4873/-/ping", timeout=2) as response:
+      json.load(response)
+    break
+  except Exception as exc:
+    if attempt == 29:
+      raise SystemExit("Shared registry cache is unavailable; inspect journalctl -u cockpit-app-manager-npm-cache: " + str(exc))
+    time.sleep(0.5)
+PY
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import app_manager; app_manager._assert_npm_cache_service()' "$APP_DIR/backend" ||
+    fail "The shared registry listener is not owned by the managed cache service."
   systemctl enable --now cockpit-app-manager-auto-deploy.timer
 
   local plugin_commit=""

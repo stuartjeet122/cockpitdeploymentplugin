@@ -1,0 +1,35 @@
+[Unit]
+# Managed by Cockpit App Manager
+Description=Cockpit App Manager shared npm registry cache
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+User=cockpit-am-npm-cache
+StateDirectory=cockpit-app-manager-npm-cache
+CacheDirectory=cockpit-app-manager-npm-cache
+StateDirectoryMode=0700
+CacheDirectoryMode=0700
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env verdaccio --config /etc/cockpit/app-manager/npm-cache.json --listen 127.0.0.1:4873
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+UMask=0077
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

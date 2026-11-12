@@ -136,7 +136,8 @@ test("deployment prefixes parsed local asset and API literals only in the releas
   }
 });
 
-test("deployment waits for generated assets and preserves build lifecycle hooks", () => {
+for (const manager of process.env.APP_MANAGER_TEST_PACKAGE_TOOLS ? ["npm", "pnpm"] : ["npm"]) {
+test(`deployment waits for generated assets and preserves ${manager} build lifecycle hooks`, () => {
   const os = require("node:os");
   const { spawnSync } = require("node:child_process");
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "app-manager-build-"));
@@ -166,12 +167,13 @@ test("deployment waits for generated assets and preserves build lifecycle hooks"
     fs.writeFileSync(path.join(parserBridge, "core.js"),
       `exports.parseSync = (source, options) => require(${JSON.stringify(require.resolve("@babel/parser"))}).parse(source, { ...options.parserOpts, sourceType: options.sourceType });`);
     const helper = path.join(root, "backend", "prepare_next_assets.cjs");
-    const setup = spawnSync(process.execPath, [helper, "/demo", "--install-hook", "npm", "20"], {
+    fs.writeFileSync(path.join(temporary, ".npmrc"), "enable-pre-post-scripts=true\nmanage-package-manager-versions=false\n");
+    const setup = spawnSync(process.execPath, [helper, "/demo", "--install-hook", manager, "20"], {
       cwd: temporary, encoding: "utf8", timeout: 10000,
     });
     assert.equal(setup.status, 0, setup.stderr);
     assert.equal(fs.existsSync(path.join(temporary, "order.txt")), false);
-    const built = spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
+    const built = spawnSync(process.platform === "win32" ? `${manager}.cmd` : manager, ["run", "build"], {
       cwd: temporary, encoding: "utf8", timeout: 20000, shell: process.platform === "win32",
     });
     assert.equal(built.status, 0, built.stdout + built.stderr);
@@ -180,6 +182,129 @@ test("deployment waits for generated assets and preserves build lifecycle hooks"
     const manifest = JSON.parse(fs.readFileSync(path.join(temporary, "public", "manifest.webmanifest"), "utf8"));
     assert.deepEqual(manifest, { scope: "/demo/", start_url: "/demo/", icons: [{ src: "/demo/guide/participants.svg" }] });
   } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+}
+
+test("shared registry reuses tarballs across isolated stores and rejects writes", {
+  skip: !process.env.APP_MANAGER_TEST_PACKAGE_TOOLS,
+  timeout: 120000,
+}, async () => {
+  const http = require("node:http");
+  const crypto = require("node:crypto");
+  const { spawn, spawnSync } = require("node:child_process");
+  const temporary = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "app-manager-cache-"));
+  const tool = (name) => {
+    const directory = process.env.PATH.split(path.delimiter).map((entry) => path.resolve(entry, "..", name))
+      .find((entry) => fs.existsSync(path.join(entry, "package.json")));
+    assert.ok(directory, `${name} must be available through npm exec`);
+    const metadata = JSON.parse(fs.readFileSync(path.join(directory, "package.json"), "utf8"));
+    return path.join(directory, typeof metadata.bin === "string" ? metadata.bin : metadata.bin[name]);
+  };
+  const pnpm = tool("pnpm");
+  let registry;
+  let registryOutput = "";
+  let tarballDownloads = 0;
+  const fixture = path.join(temporary, "fixture");
+  fs.mkdirSync(fixture);
+  fs.writeFileSync(path.join(fixture, "package.json"), JSON.stringify({
+    name: "app-manager-cache-fixture", version: "1.0.0", main: "index.js",
+    scripts: { postinstall: "node -e \"require('fs').writeFileSync('built.txt', 'built')\"" },
+  }));
+  fs.writeFileSync(path.join(fixture, "index.js"), "module.exports = 'shared-download';");
+  const packed = spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["pack", "--ignore-scripts", "--pack-destination", temporary], {
+    cwd: fixture, encoding: "utf8", timeout: 20000, shell: process.platform === "win32",
+  });
+  assert.equal(packed.status, 0, packed.stdout + packed.stderr);
+  const tarball = fs.readFileSync(path.join(temporary, "app-manager-cache-fixture-1.0.0.tgz"));
+  const integrity = `sha512-${crypto.createHash("sha512").update(tarball).digest("base64")}`;
+  const upstream = http.createServer((request, response) => {
+    if (request.url.endsWith(".tgz")) {
+      tarballDownloads += 1;
+      response.end(tarball);
+    } else {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        name: "app-manager-cache-fixture", "dist-tags": { latest: "1.0.0" },
+        versions: { "1.0.0": {
+          name: "app-manager-cache-fixture", version: "1.0.0",
+          dist: { tarball: `http://127.0.0.1:${upstream.address().port}/app-manager-cache-fixture/-/app-manager-cache-fixture-1.0.0.tgz`, integrity },
+        } },
+      }));
+    }
+  });
+  try {
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const reservation = http.createServer();
+    await new Promise((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+    const port = reservation.address().port;
+    await new Promise((resolve) => reservation.close(resolve));
+    const config = JSON.parse(fs.readFileSync(path.join(root, "config", "npm-cache.json"), "utf8"));
+    assert.equal(config.listen, "127.0.0.1:4873");
+    assert.equal(config.uplinks.npmjs.url, "https://registry.npmjs.org/");
+    config.storage = path.join(temporary, "shared-cache");
+    config.auth.htpasswd.file = path.join(temporary, "htpasswd");
+    config.uplinks.npmjs.url = `http://127.0.0.1:${upstream.address().port}/`;
+    config.listen = `127.0.0.1:${port}`;
+    const configPath = path.join(temporary, "cache.json");
+    fs.writeFileSync(configPath, JSON.stringify(config));
+    registry = spawn(process.execPath, [tool("verdaccio"), "--config", configPath], { stdio: ["ignore", "pipe", "pipe"] });
+    registry.stdout.on("data", (data) => { registryOutput += data; });
+    registry.stderr.on("data", (data) => { registryOutput += data; });
+    const url = `http://127.0.0.1:${port}/`;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const response = await fetch(url + "-/ping");
+        if (response.ok) break;
+      } catch {}
+      assert.ok(attempt < 100 && registry.exitCode === null, registryOutput);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    for (const endpoint of ["app-manager-cache-fixture", "-/user/org.couchdb.user:fixture"]) {
+      const response = await fetch(url + endpoint, { method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "fixture", password: "fixture", type: "user", roles: [] }) });
+      assert.ok(response.status === 401 || response.status === 403 || response.status === 409, `${endpoint}: ${response.status}`);
+    }
+    const execute = async (command, args, cwd, environment = {}) => {
+      const child = spawn(command, args, { cwd, env: { ...process.env, CI: "true", ...environment }, stdio: ["ignore", "pipe", "pipe"] });
+      let output = "";
+      child.stdout.on("data", (data) => { output += data; });
+      child.stderr.on("data", (data) => { output += data; });
+      const timer = setTimeout(() => child.kill(), 30000);
+      try {
+        const status = await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
+        assert.equal(status, 0, output);
+        return output;
+      } finally { clearTimeout(timer); }
+    };
+    for (const app of ["first", "second"]) {
+      const project = path.join(temporary, app);
+      fs.mkdirSync(project);
+      fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ name: app, version: "1.0.0",
+        dependencies: { "app-manager-cache-fixture": "1.0.0" }, pnpm: { onlyBuiltDependencies: ["app-manager-cache-fixture"] } }));
+      fs.writeFileSync(path.join(project, "package-lock.json"), JSON.stringify({ lockfileVersion: 3, packages: {
+        "": { dependencies: { "app-manager-cache-fixture": "1.0.0" } },
+        "node_modules/app-manager-cache-fixture": { version: "1.0.0", resolved: "https://registry.npmjs.org/app-manager-cache-fixture/-/app-manager-cache-fixture-1.0.0.tgz", integrity },
+      } }));
+      await execute(process.env.PYTHON || (process.platform === "win32" ? "python" : "python3"), ["-c",
+        "import subprocess,sys; from pathlib import Path; from backend.adapters import _convert_to_pnpm; " +
+        "project=Path(sys.argv[1]); _convert_to_pnpm(project, 'npm', project/'package-lock.json', " +
+        "lambda command,cwd,timeout: subprocess.run([sys.argv[2],sys.argv[3],*command[1:]],cwd=cwd,timeout=timeout,capture_output=True,text=True),30)",
+        project, process.execPath, pnpm], root, { npm_config_registry: url });
+      await execute(process.execPath, [pnpm, "install", "--frozen-lockfile", "--prod=false", "--store-dir", path.join(temporary, `${app}-store`)], project, { npm_config_registry: url });
+      assert.equal(fs.readFileSync(path.join(project, "node_modules", "app-manager-cache-fixture", "built.txt"), "utf8"), "built");
+      await execute(process.execPath, [pnpm, "install", "--frozen-lockfile", "--prod=true", "--store-dir", path.join(temporary, `${app}-store`)], project, { npm_config_registry: url });
+    }
+    assert.equal(tarballDownloads, 1, "independent stores must reuse the service-owned cached tarball");
+  } finally {
+    if (registry && registry.exitCode === null) {
+      const stopped = new Promise((resolve) => registry.once("exit", resolve));
+      registry.kill();
+      await stopped;
+    }
+    upstream.closeAllConnections();
+    await new Promise((resolve) => upstream.close(resolve));
     fs.rmSync(temporary, { recursive: true, force: true });
   }
 });

@@ -1,0 +1,21 @@
+{
+  "_comment": "Managed by Cockpit App Manager",
+  "storage": "/var/cache/cockpit-app-manager-npm-cache",
+  "auth": {
+    "htpasswd": {
+      "file": "/var/lib/cockpit-app-manager-npm-cache/htpasswd",
+      "max_users": -1
+    }
+  },
+  "uplinks": {
+    "npmjs": { "url": "https://registry.npmjs.org/" }
+  },
+  "packages": {
+    "@*/*": { "access": "$all", "publish": [], "unpublish": [], "proxy": "npmjs" },
+    "**": { "access": "$all", "publish": [], "unpublish": [], "proxy": "npmjs" }
+  },
+  "listen": "127.0.0.1:4873",
+  "web": { "enable": false },
+  "middlewares": { "audit": { "enabled": false } },
+  "log": { "type": "stdout", "format": "json", "level": "warn" }
+}

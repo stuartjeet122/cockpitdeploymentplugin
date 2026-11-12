@@ -1049,6 +1049,31 @@ def _identity_switch_diagnostics() -> str:
     return "Identity-switch parent diagnostics: " + "; ".join(details)
 
 
+def _assert_npm_cache_service() -> None:
+    service = run_command([
+        "systemctl", "show", "cockpit-app-manager-npm-cache.service",
+        "--property=ActiveState", "--property=MainPID",
+    ], timeout=10)
+    properties = dict(line.split("=", 1) for line in (service.stdout or "").splitlines() if "=" in line)
+    pid = properties.get("MainPID", "")
+    if service.returncode != 0 or properties.get("ActiveState") != "active" or not pid.isdigit() or int(pid) <= 0:
+        raise RuntimeError("The shared npm cache is unavailable; inspect journalctl -u cockpit-app-manager-npm-cache")
+    try:
+        status = (Path("/proc") / pid / "status").read_text(encoding="ascii")
+        uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+        uids = set(uid_line.split()[1:])
+    except (OSError, UnicodeError, StopIteration) as exc:
+        raise RuntimeError("Could not verify the shared npm cache service identity") from exc
+    if len(uids) != 1 or not next(iter(uids)).isdigit() or int(next(iter(uids))) <= 0:
+        raise RuntimeError("The shared npm cache must run as an isolated unprivileged user")
+    listeners = run_command(["ss", "-H", "-ltne", "sport = :4873"], timeout=10)
+    entries = [line.split() for line in (listeners.stdout or "").splitlines() if line.strip()]
+    if (listeners.returncode != 0 or len(entries) != 1 or len(entries[0]) < 6
+            or entries[0][3] != "127.0.0.1:4873"
+            or set(re.findall(r"\buid:([0-9]+)\b", " ".join(entries[0][5:]))) != uids):
+        raise RuntimeError("Port 4873 is not owned exclusively by the managed loopback npm cache; refusing dependency downloads")
+
+
 def _run_as_user(
     username: str,
     args: Sequence[str],
@@ -1066,6 +1091,8 @@ def _run_as_user(
     if not _account_exists(username):
         raise RuntimeError(f"Application service account {username} does not exist")
     home = str(_home_path(username.removeprefix("app-")))
+    if args and args[0] == "pnpm" and list(args[1:]) != ["--version"]:
+        _assert_npm_cache_service()
     env_args = [
         "env",
         "-i",
@@ -3811,9 +3838,17 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 app_snapshot.get("route"),
                 app_id,
             ).rstrip("/")
+            if framework in {"nextjs", "node"}:
+                build_environment["CI"] = "true"
+                build_environment["npm_config_registry"] = "http://127.0.0.1:4873/"
+                build_environment["npm_config_enable_pre_post_scripts"] = "true"
+                build_environment["npm_config_manage_package_manager_versions"] = "false"
+                build_environment["npm_config_store_dir"] = str(Path(_home_path(app_id)) / "pnpm-store")
+                build_environment["npm_config_package_import_method"] = "copy"
+                build_environment["COREPACK_ENABLE_PROJECT_SPEC"] = "0"
             _, release_group = _account_ids(username)
             build_result = _build_release(
-                app_snapshot,
+                dict(app_snapshot, _managed_pnpm=True) if framework in {"nextjs", "node"} else app_snapshot,
                 source_path,
                 release_dir,
                 adapter,
