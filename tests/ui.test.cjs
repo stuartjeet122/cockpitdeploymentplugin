@@ -260,6 +260,45 @@ test("live logs preserve scroll, skip unchanged redraws, and poll only status wh
   } finally { ui.dom.window.close(); }
 });
 
+test("deployment logs can be copied and downloaded as plain text", async () => {
+  const deployment = {
+    app_id: "portal",
+    deployment_id: "20261112024814-82d96f71",
+    active: false,
+    status: "failed",
+    logs: "Build phase: running\nCannot find module '@swc/core'",
+  };
+  const ui = await loadUi({
+    deployments: { deployments: [{ app_id: "portal", id: deployment.deployment_id, status: "failed" }] },
+    "deployment-logs": deployment,
+  });
+  let copied = "";
+  let downloaded;
+  Object.defineProperty(ui.window.navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (text) => { copied = text; } },
+  });
+  Object.defineProperty(ui.window.URL, "createObjectURL", {
+    configurable: true,
+    value: (blob) => { downloaded = { blob, url: "blob:deployment-log" }; return downloaded.url; },
+  });
+  Object.defineProperty(ui.window.URL, "revokeObjectURL", { configurable: true, value: () => {} });
+  let downloadName = "";
+  ui.window.HTMLAnchorElement.prototype.click = function () { downloadName = this.download; };
+  try {
+    ui.document.querySelector('[data-action="deployment-log"]').click();
+    await settle(ui.window);
+    ui.document.querySelector("#copyDeploymentLogButton").click();
+    await settle(ui.window);
+    assert.equal(copied, deployment.logs);
+    assert.match(ui.document.querySelector("#copyDeploymentLogButton").textContent, /Copied/);
+    ui.document.querySelector("#downloadDeploymentLogButton").click();
+    assert.equal(downloadName, `deployment-${deployment.app_id}-${deployment.deployment_id}.txt`);
+    assert.equal(downloaded.blob.type, "text/plain;charset=utf-8");
+    assert.equal(ui.document.querySelector("#appManagerDialog").classList.contains("am-dialog--deployment"), true);
+  } finally { ui.dom.window.close(); }
+});
+
 test("delayed dialog loads prevent competing edits and duplicate requests", async () => {
   for (const command of ["env-get", "deployment-logs"]) {
     let release;
@@ -397,6 +436,63 @@ test("setup reviews repository, route, and environment before registering once",
     assert.equal(ui.calls.filter((record) => record.command === "add").length, 1);
     assert.equal(ui.calls.find((record) => record.command === "env-save").input, 'API_URL="https://api.example.test"\n');
     assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("application setup imports .env variants and text files into private environment values", async () => {
+  let savedApps = [...fixtureApps];
+  const ui = await loadUi({
+    list: () => ({ apps: savedApps }),
+    add: (record) => {
+      const payload = JSON.parse(record.values[0]);
+      const app = { ...payload, id: payload.slug, status: "stopped", deployments: [] };
+      savedApps = [...savedApps, app];
+      return { app };
+    },
+  });
+  try {
+    ui.document.querySelector("[data-open-add]").click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    form.elements.repo_url.value = "https://github.com/example/imported.git";
+    form.elements.name.value = "Imported";
+    form.elements.name.dispatchEvent(new ui.window.Event("input"));
+    ui.document.querySelector("#setupNext").click();
+    const importInput = ui.document.querySelector("#appEnvironmentImport");
+    assert.match(importInput.accept, /\.env/);
+    assert.match(importInput.accept, /\.txt/);
+    Object.defineProperty(importInput, "files", {
+      configurable: true,
+      value: [{
+        name: ".env.production",
+        size: 37,
+        text: async () => "export API_KEY='secret-value'\nREGION=west\n",
+      }],
+    });
+    importInput.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+    await settle(ui.window);
+    assert.match(form.elements.environment.value, /API_KEY="secret-value"/);
+    assert.match(form.elements.environment.value, /REGION="west"/);
+    Object.defineProperty(importInput, "files", {
+      configurable: true,
+      value: [{
+        name: "production.txt",
+        size: 20,
+        text: async () => "TOKEN=from-text-file\n",
+      }],
+    });
+    importInput.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+    await settle(ui.window);
+    assert.equal(form.elements.environment.value, 'TOKEN="from-text-file"\n');
+    ui.document.querySelector("#setupNext").click();
+    assert.match(ui.document.querySelector("#setupReview").textContent, /TOKEN/);
+    assert.doesNotMatch(ui.document.querySelector("#setupReview").textContent, /from-text-file/);
+    form.elements.deploy_now.checked = false;
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.equal(
+      ui.calls.find((record) => record.command === "env-save").input,
+      'TOKEN="from-text-file"\n',
+    );
   } finally { ui.dom.window.close(); }
 });
 

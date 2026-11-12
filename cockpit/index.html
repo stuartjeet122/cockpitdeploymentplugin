@@ -169,10 +169,19 @@
             <div class="am-form-grid__wide"><label for="appStartCommand">Start command <span class="am-optional">JSON argument array</span></label><textarea id="appStartCommand" name="start_command" rows="2" spellcheck="false" placeholder='["node", "dist/server.js"]'></textarea></div>
           </div>
         </details>
-        <details class="am-advanced">
-          <summary>Environment variables <span class="am-optional">Optional</span></summary>
-          <div><label for="appEnvironment">Environment file</label><textarea id="appEnvironment" name="environment" rows="5" autocomplete="off" spellcheck="false" placeholder="DATABASE_URL=&#10;API_KEY="></textarea></div>
-        </details>
+        <section class="am-setup-environment" aria-labelledby="setupEnvironmentTitle">
+          <div class="am-setup-environment__heading">
+            <div>
+              <h4 id="setupEnvironmentTitle">Environment variables <span class="am-optional">Optional</span></h4>
+              <p>Private values are stored outside your repository and never shown in the review.</p>
+            </div>
+            <label class="am-button am-env-import-button" for="appEnvironmentImport">Import file</label>
+            <input id="appEnvironmentImport" class="am-visually-hidden" type="file" accept=".env,.txt,.env.*,text/plain">
+          </div>
+          <label for="appEnvironment">Add one KEY=value per line</label>
+          <textarea id="appEnvironment" name="environment" rows="6" autocomplete="off" spellcheck="false" placeholder="DATABASE_URL=&#10;API_KEY="></textarea>
+          <small class="am-field-hint">Import a .env, .env.* or .txt file. Maximum size: 64 KiB.</small>
+        </section>
       </section>
       <section data-setup-step="2" aria-labelledby="setupReviewTitle" hidden>
         <h3 id="setupReviewTitle" class="am-setup-title">Ready for the first release</h3>

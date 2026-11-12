@@ -447,6 +447,7 @@
 
   function openDialog(title, body, submitLabel, onSubmit, onSuccess) {
     const dialog = byId("appManagerDialog");
+    dialog.classList.remove("am-dialog--deployment");
     state.logTarget = null;
     byId("appManagerError").classList.add("hidden");
     const submit = submitLabel
@@ -564,6 +565,9 @@
 
     const form = byId("appManagerDialog").querySelector("form");
     form.noValidate = true;
+    bindEnvironmentImport(byId("appEnvironmentImport"), (content) => {
+      form.elements.namedItem("environment").value = content;
+    });
     const footer = form.querySelector(".am-dialog-footer");
     footer.insertAdjacentHTML("afterbegin", `<button type="button" id="setupBack" class="am-button am-button--quiet" hidden>${icon("arrow-left")} Back</button>`);
     footer.insertAdjacentHTML("beforeend", `<button type="button" id="setupNext" class="am-button pf-m-primary">Continue ${icon("arrow-right")}</button>`);
@@ -792,6 +796,27 @@
     }).join("\n") + (rows.length ? "\n" : "");
   }
 
+  async function readEnvironmentFile(file) {
+    if (file.size > 64 * 1024) {
+      throw new Error("The selected environment file is larger than 64 KiB.");
+    }
+    return serializeEnvironmentRows(parseEnvironmentContent(await file.text()));
+  }
+
+  function bindEnvironmentImport(input, onImport) {
+    input.addEventListener("change", async () => {
+      const file = input.files && input.files[0];
+      if (!file) return;
+      try {
+        onImport(await readEnvironmentFile(file));
+      } catch (error) {
+        showError(new Error(`Could not import the selected file: ${error.message}`));
+      } finally {
+        input.value = "";
+      }
+    });
+  }
+
   async function manageEnvironment(app) {
     const result = await callBackend("env-get", [app.id]);
     const body = `
@@ -832,6 +857,10 @@
       renderIcons();
     };
     dialog.querySelector("[data-env-add]").addEventListener("click", () => addRow());
+    bindEnvironmentImport(importInput, (content) => {
+      container.innerHTML = environmentMarkup(parseEnvironmentContent(content));
+      renderIcons();
+    });
     container.addEventListener("click", (event) => {
       const removeButton = event.target instanceof Element ? event.target.closest("[data-env-remove]") : null;
       if (removeButton) removeButton.closest(".am-env-row").remove();
@@ -844,21 +873,6 @@
         toggle.title = reveal ? "Hide value" : "Reveal value";
         toggle.innerHTML = icon(reveal ? "eye-off" : "eye");
         renderIcons();
-      }
-    });
-    importInput.addEventListener("change", async () => {
-      const file = importInput.files && importInput.files[0];
-      if (!file) return;
-      if (file.size > 64 * 1024) {
-        showError(new Error("The selected environment file is larger than 64 KiB."));
-        importInput.value = "";
-        return;
-      }
-      try {
-        container.innerHTML = environmentMarkup(parseEnvironmentContent(await file.text()));
-        renderIcons();
-      } catch (error) {
-        showError(new Error(`Could not import the selected file: ${error.message}`));
       }
     });
     dialog.querySelector("[data-env-export]").addEventListener("click", () => {
@@ -938,18 +952,30 @@
       output.scrollTop = follow ? output.scrollHeight : previousScroll;
       state.logTarget.logs = text;
     }
+    if (status) {
+      status.dataset.status = result.active ? "running" : result.status || "unknown";
+    }
     if (result.active) {
       status.textContent = result.abortable === false
         ? "Finalizing deployment"
-        : result.build_status === "queued" ? "Queued: waiting for build capacity" : result.build_status === "preflight" ? "Running preflight checks" : "Deployment in progress";
+        : result.build_status === "queued" ? "Queued · waiting for build capacity"
+          : result.build_status === "preflight" ? "Checking requirements"
+            : result.build_status === "running" ? "Building application"
+              : "Deployment in progress";
     } else {
       const finalStatuses = {
-        deployed: "Deployment complete",
+        deployed: "Deployment completed",
         failed: "Deployment failed",
-        aborted: "Deployment aborted",
+        aborted: "Deployment was aborted",
       };
-      status.textContent = finalStatuses[result.status] || "Preparing deployment";
+      status.textContent = finalStatuses[result.status] || "Deployment status unavailable";
     }
+    const copyButton = byId("copyDeploymentLogButton");
+    const downloadButton = byId("downloadDeploymentLogButton");
+    if (copyButton) copyButton.disabled = !state.logTarget.logs;
+    if (downloadButton) downloadButton.disabled = !state.logTarget.logs;
+    const deploymentId = byId("deploymentLogId");
+    if (deploymentId) deploymentId.textContent = result.deployment_id || "Starting";
     const abortButton = byId("abortDeploymentButton");
     if (abortButton) {
       abortButton.hidden = !result.active || result.abortable === false;
@@ -960,23 +986,105 @@
     }
   }
 
+  async function copyDeploymentLog() {
+    const text = state.logTarget?.logs || "";
+    if (!text) throw new Error("There is no deployment log to copy yet.");
+    if (window.navigator.clipboard?.writeText) {
+      await window.navigator.clipboard.writeText(text);
+      return;
+    }
+    const fallback = document.createElement("textarea");
+    fallback.value = text;
+    fallback.setAttribute("readonly", "");
+    fallback.className = "am-visually-hidden";
+    document.body.append(fallback);
+    fallback.select();
+    let copied = false;
+    try {
+      copied = typeof document.execCommand === "function" && document.execCommand("copy");
+    } finally {
+      fallback.remove();
+    }
+    if (!copied) throw new Error("Clipboard access is unavailable in this Cockpit session.");
+  }
+
+  function downloadDeploymentLog() {
+    const text = state.logTarget?.logs || "";
+    if (!text) throw new Error("There is no deployment log to download yet.");
+    const appId = String(state.logTarget.appId || "application").replace(/[^a-z0-9-]/gi, "-");
+    const deploymentId = String(state.logTarget.deploymentId || "latest").replace(/[^a-z0-9-]/gi, "-");
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `deployment-${appId}-${deploymentId}.txt`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
   function openDeploymentLogDialog(appId) {
     const app = state.apps.find((item) => item.id === appId);
+    const branch = app?.branch ? `Branch ${app.branch}` : "Branch unavailable";
+    const route = app?.active_route || app?.route || `/${appId}/`;
+    const commit = app?.deployed_commit ? app.deployed_commit.slice(0, 7) : "Commit pending";
     openDialog(
       `Deployment: ${app?.name || appId}`,
-      `<p id="deploymentLiveStatus" class="am-dialog-intro" role="status" aria-live="polite">Starting deployment…</p>
-       <div class="am-deployment-log-actions"><button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort deployment</button></div>
-       <div class="am-log-legend" aria-label="Deployment log color key">
-         <span class="am-log-legend__item am-log-line--error">Error</span>
-         <span class="am-log-legend__item am-log-line--warning">Warning</span>
-         <span class="am-log-legend__item am-log-line--success">Passed</span>
-         <span class="am-log-legend__item am-log-line--phase">Phase</span>
-         <span class="am-log-legend__item am-log-line--stdout">Output</span>
-         <span class="am-log-legend__item am-log-line--stderr">Stderr</span>
+      `<div class="am-deployment-overview">
+         <span class="am-deployment-overview__icon" aria-hidden="true">${icon("terminal")}</span>
+         <div class="am-deployment-overview__copy">
+           <span class="am-deployment-overview__eyebrow">DEPLOYMENT ACTIVITY</span>
+           <p id="deploymentLiveStatus" class="am-deployment-status" data-status="running" role="status" aria-live="polite">Starting deployment…</p>
+           <p class="am-deployment-overview__meta">${escapeHtml(branch)} <span aria-hidden="true">·</span> ${escapeHtml(route)} <span aria-hidden="true">·</span> <code>${escapeHtml(commit)}</code></p>
+         </div>
+         <span class="am-deployment-id">ID <code id="deploymentLogId">Starting</code></span>
        </div>
-       <pre id="deploymentLiveLog" class="am-log-output" aria-live="polite">Waiting for deployment output…</pre>`,
+       <div class="am-deployment-log-toolbar">
+         <div class="am-log-legend" aria-label="Log color key">
+           <span class="am-log-legend__item am-log-line--error">Error</span>
+           <span class="am-log-legend__item am-log-line--warning">Warning</span>
+           <span class="am-log-legend__item am-log-line--success">Passed</span>
+           <span class="am-log-legend__item am-log-line--phase">Phase</span>
+           <span class="am-log-legend__item am-log-line--stdout">Output</span>
+           <span class="am-log-legend__item am-log-line--stderr">Stderr</span>
+         </div>
+         <div class="am-deployment-log-actions">
+           <button id="copyDeploymentLogButton" type="button" class="am-button" disabled>${icon("copy")} Copy log</button>
+           <button id="downloadDeploymentLogButton" type="button" class="am-button" disabled>${icon("download")} Download .txt</button>
+           <button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort</button>
+         </div>
+       </div>
+       <div class="am-log-window">
+         <div class="am-log-window__bar"><span><i></i> Live output</span><span>Plain-text safe · secrets redacted</span></div>
+         <pre id="deploymentLiveLog" class="am-log-output" aria-label="Deployment log output" aria-live="off">Waiting for deployment output…</pre>
+       </div>`,
     );
-     state.logTarget = { appId, deploymentId: null };
+    byId("appManagerDialog").classList.add("am-dialog--deployment");
+    state.logTarget = { appId, deploymentId: null };
+    byId("copyDeploymentLogButton").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      try {
+        await copyDeploymentLog();
+        button.innerHTML = `${icon("check")} Copied`;
+        renderIcons();
+        window.setTimeout(() => {
+          if (button.isConnected) {
+            button.innerHTML = `${icon("copy")} Copy log`;
+            renderIcons();
+          }
+        }, 1800);
+      } catch (error) {
+        showError(error);
+      }
+    });
+    byId("downloadDeploymentLogButton").addEventListener("click", () => {
+      try {
+        downloadDeploymentLog();
+      } catch (error) {
+        showError(error);
+      }
+    });
   }
 
   async function monitorDeployment(appId, deploymentId) {

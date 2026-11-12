@@ -4215,10 +4215,23 @@ def health_check_app(app_id: str) -> Dict[str, Any]:
         public_url = DEFAULT_PUBLIC_ORIGIN + _routed_health_path(app)
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
-            with opener.open(urllib.request.Request(public_url, method="GET"), timeout=3) as response:
+            request = urllib.request.Request(
+                public_url,
+                headers={
+                    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+                    "User-Agent": "Cockpit-App-Manager/1.0",
+                },
+                method="GET",
+            )
+            with opener.open(request, timeout=3) as response:
                 public_healthy = 200 <= response.status < 300
                 if not public_healthy:
                     public_error = f"Public route returned HTTP {response.status}"
+        except urllib.error.HTTPError as exc:
+            public_healthy = False
+            public_error = f"Public route returned HTTP {exc.code} {exc.reason}"
+            if exc.code == 403:
+                public_error += "; use a health-check path accessible without authentication or an edge-security challenge"
         except (urllib.error.URLError, OSError, ValueError) as exc:
             public_healthy = False
             public_error = str(exc)

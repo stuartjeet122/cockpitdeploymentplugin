@@ -1116,6 +1116,184 @@ body { background-image: linear-gradient(180deg, #fff 0, #f6f7f8 22rem); }
     font-size: 0.9rem;
   }
 
+  .am-dialog--deployment {
+    width: min(76rem, calc(100vw - 2rem));
+    max-width: 76rem;
+    max-height: min(92dvh, 68rem);
+  }
+
+  .am-dialog--deployment .am-dialog-form {
+    max-height: min(92dvh, 68rem);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .am-dialog--deployment .am-dialog-header {
+    min-height: 4.25rem;
+    padding-inline: 1.5rem;
+    background: color-mix(in srgb, var(--am-surface) 92%, var(--am-accent-soft));
+  }
+
+  .am-dialog--deployment .am-dialog-footer {
+    display: none;
+  }
+
+  .am-dialog--deployment .am-dialog-body {
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
+    gap: 1.1rem;
+    padding: clamp(1rem, 2.5vw, 1.75rem);
+    background: var(--am-page, #f5f7fa);
+  }
+
+  .am-deployment-overview {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 1rem;
+    padding: 1.25rem;
+    border: 1px solid color-mix(in srgb, var(--am-accent) 18%, var(--am-border));
+    border-radius: 1rem;
+    background: linear-gradient(120deg, var(--am-surface), color-mix(in srgb, var(--am-accent-soft, #edf5ff) 55%, var(--am-surface)));
+    box-shadow: 0 0.5rem 1.5rem rgb(15 23 42 / 5%);
+  }
+
+  .am-deployment-overview__icon {
+    display: grid;
+    width: 3.25rem;
+    height: 3.25rem;
+    flex: 0 0 auto;
+    place-items: center;
+    border: 1px solid color-mix(in srgb, var(--am-accent) 20%, transparent);
+    border-radius: 0.9rem;
+    background: var(--am-accent-soft);
+    color: var(--am-accent);
+  }
+
+  .am-deployment-overview__icon svg { width: 1.4rem; height: 1.4rem; }
+  .am-deployment-overview__copy { min-width: 0; flex: 1; }
+  .am-deployment-overview__eyebrow { color: var(--am-muted); font-size: 0.65rem; font-weight: 750; letter-spacing: 0.12em; }
+  .am-deployment-status { display: flex; align-items: center; gap: 0.55rem; margin: 0.2rem 0; font-size: 1.1rem; font-weight: 750; letter-spacing: -0.02em; }
+  .am-deployment-status::before { width: 0.55rem; height: 0.55rem; flex: 0 0 auto; border-radius: 50%; background: #d29d28; content: ""; }
+  .am-deployment-status[data-status="deployed"]::before { background: #36a269; }
+  .am-deployment-status[data-status="failed"],
+  .am-deployment-status[data-status="aborted"] { color: var(--am-danger); }
+  .am-deployment-status[data-status="failed"]::before,
+  .am-deployment-status[data-status="aborted"]::before { background: var(--am-danger); }
+  .am-deployment-status[data-status="running"]::before { animation: am-pulse 1.4s ease-in-out infinite; }
+  .am-deployment-overview__meta { display: flex; flex-wrap: wrap; gap: 0.35rem 0.55rem; margin: 0; color: var(--am-muted); font-size: 0.78rem; overflow-wrap: anywhere; }
+  .am-deployment-overview__meta code,
+  .am-deployment-id code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  .am-deployment-id { display: grid; flex: 0 0 auto; gap: 0.25rem; color: var(--am-muted); font-size: 0.65rem; font-weight: 750; letter-spacing: 0.08em; text-align: right; }
+  .am-deployment-id code { color: var(--am-text); font-size: 0.72rem; letter-spacing: 0; }
+
+  .am-deployment-log-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .am-dialog--deployment .am-log-legend { justify-content: flex-start; gap: 0.4rem; margin: 0; }
+  .am-dialog--deployment .am-log-legend__item { padding: 0.2rem 0.5rem; border: 1px solid currentColor; border-radius: 999px; font-size: 0.67rem; line-height: 1.4; }
+  .am-dialog--deployment .am-log-legend__item.am-log-line--error { color: #b42318; }
+  .am-dialog--deployment .am-log-legend__item.am-log-line--warning { color: #8a5700; }
+  .am-dialog--deployment .am-log-legend__item.am-log-line--success { color: #16733c; }
+  .am-dialog--deployment .am-log-legend__item.am-log-line--phase { color: #7041a5; }
+  .am-dialog--deployment .am-log-legend__item.am-log-line--stdout { color: #475569; }
+  .am-dialog--deployment .am-log-legend__item.am-log-line--stderr { color: #a33a00; }
+  .am-deployment-log-actions { display: flex; flex: 0 0 auto; justify-content: flex-end; gap: 0.5rem; margin: 0; }
+  .am-dialog--deployment .am-deployment-log-actions .am-button { display: inline-flex; min-height: 2.35rem; align-items: center; gap: 0.45rem; padding: 0.45rem 0.7rem; font-size: 0.76rem; }
+  .am-deployment-log-actions svg { width: 1rem; height: 1rem; }
+  .am-dialog--deployment .am-deployment-log-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .am-log-window {
+    display: flex;
+    min-height: 20rem;
+    flex: 1 1 auto;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid #293542;
+    border-radius: 0.9rem;
+    background: #0c1118;
+    box-shadow: 0 0.7rem 2rem rgb(15 23 42 / 15%);
+  }
+
+  .am-log-window__bar {
+    display: flex;
+    min-height: 2.65rem;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.55rem 1rem;
+    border-bottom: 1px solid #26313c;
+    color: #8e9ba9;
+    font-size: 0.7rem;
+  }
+
+  .am-log-window__bar > span:first-child { display: inline-flex; align-items: center; gap: 0.55rem; color: #d9e2ec; font-weight: 650; }
+  .am-log-window__bar i { width: 0.48rem; height: 0.48rem; border-radius: 50%; background: #36a269; box-shadow: 0 0 0 0.2rem rgb(54 162 105 / 15%); }
+  .am-log-output { width: 100%; max-height: none; min-height: 0; flex: 1 1 auto; padding: 1rem 1.1rem 1.25rem; border-radius: 0; background: transparent; color: #e8edf2; font-size: 0.77rem; line-height: 1.75; }
+  .am-log-line { display: grid; grid-template-columns: 6rem minmax(0, 1fr); gap: 0.6rem; padding: 0.08rem 0; }
+  .am-log-time { min-width: 0; margin: 0; color: #758596; font-size: 0.7rem; }
+  .am-log-message { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  .am-setup-environment {
+    display: grid;
+    gap: 0.65rem;
+    margin-top: 1rem;
+    padding: 1rem;
+    border: 1px solid var(--am-border);
+    border-radius: var(--am-radius-sm);
+    background: color-mix(in srgb, var(--am-page) 45%, var(--am-surface));
+  }
+
+  .am-setup-environment__heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  .am-setup-environment__heading h4 { margin: 0; font-size: 0.9rem; }
+  .am-setup-environment__heading p { margin: 0.2rem 0 0; color: var(--am-muted); font-size: 0.75rem; }
+  .am-setup-environment textarea { width: 100%; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.8rem; }
+  .am-setup-environment .am-field-hint { margin: 0; }
+  .am-env-import-button { display: inline-flex !important; flex: 0 0 auto; align-items: center; cursor: pointer; }
+
+  @keyframes am-pulse { 50% { box-shadow: 0 0 0 0.32rem rgb(210 157 40 / 18%); } }
+
+  @media (max-width: 760px) {
+    .am-dialog--deployment { width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); }
+    .am-dialog--deployment .am-dialog-form { max-height: calc(100dvh - 1rem); }
+    .am-deployment-overview { align-items: flex-start; padding: 1rem; }
+    .am-deployment-overview__icon { width: 2.7rem; height: 2.7rem; }
+    .am-deployment-id { display: none; }
+    .am-deployment-log-toolbar { align-items: flex-start; flex-direction: column; }
+    .am-deployment-log-actions { width: 100%; flex-wrap: wrap; }
+    .am-deployment-log-actions .am-button { flex: 1 1 auto; justify-content: center; }
+    .am-log-window { min-height: 16rem; }
+    .am-log-output { padding: 0.8rem; font-size: 0.72rem; }
+  }
+
+  @media (max-width: 420px) {
+    .am-log-line { grid-template-columns: 4.5rem minmax(0, 1fr); gap: 0.35rem; }
+    .am-log-time { font-size: 0.63rem; }
+    .am-log-window__bar > span:last-child { display: none; }
+    .am-setup-environment__heading { align-items: flex-start; flex-direction: column; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .am-deployment-status[data-status="running"]::before { animation: none; }
+  }
+
+  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--error,
+  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--error { color: #ff8f87; }
+  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--warning,
+  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--warning { color: #ffd166; }
+  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--success,
+  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--success { color: #8de0a0; }
+  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--phase,
+  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--phase { color: #d3a6ff; }
+  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--stdout,
+  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--stdout { color: #c6d0dc; }
+  .pf-v5-theme-dark .am-dialog--deployment .am-log-legend__item.am-log-line--stderr,
+  [data-theme="dark"] .am-dialog--deployment .am-log-legend__item.am-log-line--stderr { color: #ffb86b; }
+
   .am-brand {
     align-items: flex-start;
     gap: 0.75rem;

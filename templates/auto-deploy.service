@@ -12,6 +12,7 @@ ExecStartPre=/usr/sbin/logrotate --state /var/lib/cockpit/app-manager/logrotate.
 ExecStart=/usr/libexec/cockpit/app-manager/app-manager auto-deploy
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateUsers=false
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true

@@ -1068,11 +1068,30 @@ class AppManagerTests(unittest.TestCase):
         ), patch.object(manager.urllib.request, "build_opener") as opener:
             opener.return_value.open.side_effect = urllib.error.URLError("public DNS unavailable")
             result = manager.health_check_app(app["id"])
+        request = opener.return_value.open.call_args.args[0]
         self.assertEqual(result["service_state"], "active")
         self.assertTrue(result["local_healthy"])
         self.assertFalse(result["public_healthy"])
         self.assertIn("DNS", result["public_error"])
+        self.assertEqual(request.get_header("User-agent"), "Cockpit-App-Manager/1.0")
         self.assertEqual(manager.get_registry()["apps"][0]["health"]["checked_at"], result["checked_at"])
+
+    def test_public_health_explains_forbidden_health_paths(self):
+        app = self.add_app(framework="node")["app"]
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored.update(hosting_active=True, active_route=stored["route"])
+        forbidden = urllib.error.HTTPError(
+            manager.DEFAULT_PUBLIC_ORIGIN + app["route"], 403, "Forbidden", {}, None
+        )
+        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
+            manager, "check_app_health", return_value=True
+        ), patch.object(manager.urllib.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = forbidden
+            report = manager.health_check_app(app["id"])
+        self.assertFalse(report["public_healthy"])
+        self.assertIn("HTTP 403 Forbidden", report["public_error"])
+        self.assertIn("health-check path", report["public_error"])
 
     def test_nextjs_public_health_preserves_an_existing_route_prefix(self):
         app = self.add_app(framework="nextjs")["app"]
@@ -2823,6 +2842,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn("/var/lib/cockpit/app-manager", read_write_paths)
         self.assertIn("/etc/nginx", read_write_paths)
         self.assertIn("/var/log/nginx", read_write_paths)
+        self.assertIn("PrivateUsers=false", template)
 
     def test_resource_limits_reject_unsafe_values_and_persist(self):
         for value in ({"memory_mb": True}, {"tasks_max": 0}, {"unknown": 1}, "unlimited"):
