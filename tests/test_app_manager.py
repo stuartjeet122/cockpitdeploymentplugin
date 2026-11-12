@@ -99,12 +99,14 @@ class AppManagerTests(unittest.TestCase):
         ), patch.object(manager, "_home_path", return_value="/managed/home"), patch.object(
             manager, "run_command", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")
         ) as run:
-            manager._run_as_user("app-demo", ["node", "build.js"], environment={"Database_URL": "private"})
+            manager._run_as_user("app-demo", ["node", "build.js"], environment={"Database_URL": "private"}, preserve_stdout=True)
         command = run.call_args.args[0]
         self.assertIn("-i", command)
         self.assertIn("GIT_TERMINAL_PROMPT=0", command)
         self.assertIn("Database_URL=private", command)
         self.assertEqual(command[-2:], ["node", "build.js"])
+        self.assertTrue(run.call_args.kwargs["preserve_stdout"])
+        self.assertEqual(run.call_args.kwargs["redact_values"], ["private"])
 
     def test_unsupported_framework_detection_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
