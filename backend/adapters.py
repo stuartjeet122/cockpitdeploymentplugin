@@ -119,6 +119,19 @@ def _readable_regular_file(path: Path, description: str) -> bytes:
         raise ValueError(f"{description} is not readable: {path}: {exc}") from exc
 
 
+def _set_build_file_permissions(path: Path, group_id: int) -> None:
+    if isinstance(group_id, bool) or not isinstance(group_id, int) or group_id < 0:
+        raise ValueError("Build release group ID is invalid")
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Generated build file is not a regular file: {path}")
+    mode = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+    if os.name == "nt":
+        os.chmod(str(path), (mode & 0o700) | 0o040)
+    else:
+        os.chown(str(path), -1, group_id, follow_symlinks=False)
+        os.chmod(str(path), (mode & 0o700) | 0o040, follow_symlinks=False)
+
+
 def _run_build(
     runner: Optional[CommandRunner],
     command: Sequence[str],
@@ -210,6 +223,7 @@ def _convert_to_pnpm(
     runner: Optional[CommandRunner],
     timeout: int,
     log: Optional[Callable[[str], None]] = None,
+    group_id: Optional[int] = None,
 ) -> Optional[Path]:
     package_path = package_dir / "package.json"
     package = json.loads(_readable_regular_file(package_path, "JavaScript package.json").decode("utf-8"))
@@ -237,10 +251,14 @@ def _convert_to_pnpm(
         "verify-store-integrity=true",
         "strict-dep-builds=true",
     ]) + "\n").encode("utf-8"))
+    if group_id is not None:
+        _set_build_file_permissions(npmrc, group_id)
     workspace_path = package_dir / "pnpm-workspace.yaml"
     patterns = _workspace_patterns(package)
     if patterns and not workspace_path.exists():
         workspace_path.write_text(json.dumps({"packages": patterns}, indent=2) + "\n", encoding="utf-8")
+        if group_id is not None:
+            _set_build_file_permissions(workspace_path, group_id)
     if log is not None:
         log(f"Converting release dependencies from {source_manager} to pnpm; shared registry cache: http://127.0.0.1:4873/")
     if source_manager == "pnpm":
@@ -1235,7 +1253,9 @@ class NextJSAdapter(FrameworkAdapter):
                     )
             _log_npm_preflight(project_dir, package_dir, lockfile, group_id, log)
         if app.get("_managed_pnpm"):
-            lockfile = _convert_to_pnpm(package_dir, manager, lockfile, runner, timeout, log)
+            lockfile = _convert_to_pnpm(
+                package_dir, manager, lockfile, runner, timeout, log, group_id=group_id
+            )
             manager = "pnpm"
         _install_js_dependencies(
             manager,
@@ -1440,7 +1460,9 @@ class NodeAdapter(FrameworkAdapter):
         app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
         manager, lockfile = _detect_js_package_manager(app_dir)
         if app.get("_managed_pnpm"):
-            lockfile = _convert_to_pnpm(app_dir, manager, lockfile, runner, timeout, log)
+            lockfile = _convert_to_pnpm(
+                app_dir, manager, lockfile, runner, timeout, log, group_id=group_id
+            )
             manager = "pnpm"
         _install_js_dependencies(manager, lockfile, app_dir, runner, timeout, "Node.js", log=log)
         if scripts.get("build"):

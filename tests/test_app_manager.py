@@ -2930,6 +2930,67 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
             self.assertEqual((source / "package.json").read_text(encoding="utf-8"), original)
             self.assertFalse((source / "pnpm-lock.yaml").exists())
 
+    def test_generated_build_file_permissions_grant_group_read_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_files = [Path(temporary) / ".npmrc", Path(temporary) / "pnpm-workspace.yaml"]
+            for path in config_files:
+                path.write_text("config\n", encoding="utf-8")
+
+            with patch("backend.adapters.os.chown", create=True) as chown, patch(
+                "backend.adapters.os.chmod"
+            ) as chmod:
+                for path in config_files:
+                    adapters._set_build_file_permissions(path, 1234)
+
+            self.assertEqual(chmod.call_count, len(config_files))
+            chmod_calls = {Path(call.args[0]): call for call in chmod.call_args_list}
+            for path in config_files:
+                mode = chmod_calls[path].args[1]
+                self.assertTrue(mode & 0o040)
+                self.assertFalse(mode & 0o020)
+            if os.name != "nt":
+                self.assertEqual(chown.call_count, len(config_files))
+                self.assertTrue(all(call.args[1] == 1234 for call in chown.call_args_list))
+
+    @unittest.skipIf(os.name == "nt", "POSIX group ownership is required")
+    def test_pnpm_conversion_makes_generated_config_readable_by_the_build_group(self):
+        from backend.adapters import _convert_to_pnpm
+
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "package.json").write_text(
+                json.dumps({"workspaces": ["apps/*"]}),
+                encoding="utf-8",
+            )
+            lockfile = project / "package-lock.json"
+            lockfile.write_text('{"lockfileVersion":3,"packages":{}}', encoding="utf-8")
+
+            def complete(command, cwd, timeout):
+                (cwd / "pnpm-lock.yaml").write_text(
+                    "lockfileVersion: '9.0'\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            previous_umask = os.umask(0o077)
+            try:
+                _convert_to_pnpm(
+                    project,
+                    "npm",
+                    lockfile,
+                    complete,
+                    17,
+                    group_id=os.getgid(),
+                )
+            finally:
+                os.umask(previous_umask)
+
+            for path in (project / ".npmrc", project / "pnpm-workspace.yaml"):
+                metadata = path.stat()
+                self.assertEqual(metadata.st_gid, os.getgid())
+                self.assertTrue(metadata.st_mode & 0o040, f"{path.name} must be group-readable")
+                self.assertFalse(metadata.st_mode & 0o020, f"{path.name} should not be group-writable")
+
     def test_pnpm_conversion_rejects_unscoped_credentials_and_custom_default_registries(self):
         from backend.adapters import _convert_to_pnpm
         for configuration in ("_auth=fixture", "_authToken=fixture", "registry=https://private.example/"):
