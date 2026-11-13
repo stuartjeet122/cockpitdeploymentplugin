@@ -1064,6 +1064,7 @@ class DockerAdapter(FrameworkAdapter):
                         "limits": {
                             "memory": f"{limits.get('memory_mb', 1024)}M",
                             "cpus": str(limits.get("cpu_percent", 100) / 100),
+                            "pids": limits.get("tasks_max", 256),
                         }
                     }
                 },

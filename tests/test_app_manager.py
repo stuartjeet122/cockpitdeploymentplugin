@@ -3578,7 +3578,10 @@ class FrameworkAdapterTests(unittest.TestCase):
             project_dir = release / "app"
             base_config = {
                 "services": {
-                    "web": {"build": {"context": str(project_dir), "dockerfile": "Dockerfile"}},
+                    "web": {
+                        "build": {"context": str(project_dir), "dockerfile": "Dockerfile"},
+                        "deploy": {"resources": {"limits": {"pids": 128}}},
+                    },
                     "db": {"image": "postgres:16"},
                 },
                 "volumes": {"database": {}},
@@ -3591,6 +3594,8 @@ class FrameworkAdapterTests(unittest.TestCase):
                         **base_config["services"]["web"],
                         "ports": [{"target": 4321, "published": "8123", "host_ip": "127.0.0.1"}],
                         "env_file": [str(environment_file)],
+                        "pids_limit": 96,
+                        "deploy": {"resources": {"limits": {"pids": 96}}},
                         "cap_drop": ["ALL"],
                         "security_opt": ["no-new-privileges:true"],
                     },
@@ -3628,6 +3633,9 @@ class FrameworkAdapterTests(unittest.TestCase):
             override_contents = (release / ".app-manager-compose.override.json").read_text(encoding="utf-8")
             self.assertIn("127.0.0.1", override_contents)
             self.assertIn("8123", override_contents)
+            override_service = json.loads(override_contents)["services"]["web"]
+            self.assertEqual(override_service["pids_limit"], 96)
+            self.assertEqual(override_service["deploy"]["resources"]["limits"]["pids"], 96)
             self.assertIn('"cap_drop": [\n        "ALL"', override_contents)
             self.assertIn("no-new-privileges:true", override_contents)
             self.assertNotIn("--volumes", result["stop_command"])
