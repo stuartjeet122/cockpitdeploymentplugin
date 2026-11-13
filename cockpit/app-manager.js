@@ -25,7 +25,7 @@
 
   const icon = (name) => `<i data-lucide="${name}" aria-hidden="true"></i>`;
   const renderIcons = () => globalThis.renderAppManagerIcons?.();
-  const frameworkName = (value) => ({ auto: "Auto detect", nextjs: "Next.js", node: "Node.js", go: "Go", python: "Python", static: "Static HTML" })[value] || value;
+  const frameworkName = (value) => ({ auto: "Auto detect", nextjs: "Next.js", node: "Node.js", go: "Go", python: "Python", static: "Static HTML", docker: "Docker" })[value] || value;
   function formatDate(value) {
     const date = new Date(value);
     return value && !Number.isNaN(date.valueOf())
@@ -531,10 +531,20 @@
     let deployAfterSetup = true;
     const collect = (form) => {
       const values = Object.fromEntries(new FormData(form).entries());
-      const { app_directory, go_package, start_command, environment, deploy_now, ...payload } = values;
+      const { app_directory, go_package, start_command, docker_mode, dockerfile, compose_file, compose_service, container_port, environment, deploy_now, ...payload } = values;
       payload.build_config = {};
       if (app_directory.trim()) payload.build_config.app_directory = app_directory.trim();
       if (go_package.trim()) payload.build_config.go_package = go_package.trim();
+      if (payload.framework === "docker") {
+        payload.build_config.docker_mode = docker_mode;
+        if (docker_mode === "compose") {
+          payload.build_config.compose_file = compose_file.trim() || "compose.yaml";
+          payload.build_config.compose_service = compose_service.trim() || "web";
+        } else {
+          payload.build_config.dockerfile = dockerfile.trim() || "Dockerfile";
+        }
+        payload.build_config.container_port = Number(container_port);
+      }
       if (start_command.trim()) {
         let command;
         try { command = JSON.parse(start_command); } catch (_error) { throw new Error('Start command must be a JSON array, such as ["node", "server.js"].'); }
@@ -587,6 +597,27 @@
     const nameInput = form.elements.namedItem("name");
     const slugInput = form.elements.namedItem("slug");
     const routeInput = form.elements.namedItem("route");
+    const frameworkInput = form.elements.namedItem("framework");
+    const dockerOptions = form.querySelector("[data-docker-options]");
+    const containerPortInput = form.elements.namedItem("container_port");
+    const dockerModeInput = form.elements.namedItem("docker_mode");
+    const dockerfileOptions = form.querySelector("[data-dockerfile-options]");
+    const composeOptions = form.querySelector("[data-compose-options]");
+    const composeFileInput = form.elements.namedItem("compose_file");
+    const composeServiceInput = form.elements.namedItem("compose_service");
+    const updateDockerOptions = () => {
+      const dockerSelected = frameworkInput.value === "docker";
+      dockerOptions.hidden = !dockerSelected;
+      containerPortInput.required = dockerSelected;
+      const composeSelected = dockerSelected && dockerModeInput.value === "compose";
+      dockerfileOptions.hidden = !dockerSelected || composeSelected;
+      composeOptions.hidden = !composeSelected;
+      composeFileInput.required = composeSelected;
+      composeServiceInput.required = composeSelected;
+    };
+    frameworkInput.addEventListener("change", updateDockerOptions);
+    dockerModeInput.addEventListener("change", updateDockerOptions);
+    updateDockerOptions();
     form.elements.namedItem("branch").value = state.settings.default_branch || "main";
     const updatePreview = () => { byId("setupUrlPreview").textContent = `https://stuserver.online${routeInput.value || "/"}`; };
     const showStep = () => {
@@ -664,7 +695,7 @@
   }
 
   function editApplication(app) {
-    const frameworks = ["auto", "nextjs", "go", "node", "python", "static"];
+    const frameworks = ["auto", "nextjs", "go", "node", "python", "static", "docker"];
     const options = frameworks.map((framework) => `
       <option value="${framework}"${app.framework === framework ? " selected" : ""}>${framework === "auto" ? "Auto detect" : escapeHtml(framework)}</option>
     `).join("");
@@ -1371,6 +1402,20 @@
 
   function bindTabs() {
     const tabs = Array.from(document.querySelectorAll('.am-app-manager [role="tab"][data-tab]'));
+    function renderDockerStatus(status) {
+      const rows = [
+        ["Engine", status.installed ? (status.engine_version || "Installed; version unavailable") : "Not installed"],
+        ["Daemon", status.daemon_active ? "Active" : "Inactive"],
+        ["Compose", status.compose_available ? (status.compose_version || "Installed") : "Not installed"],
+      ];
+      byId("dockerStatus").innerHTML = rows.map(([label, value]) =>
+        `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`
+      ).join("");
+      renderIcons();
+    }
+    async function refreshDockerStatus() {
+      renderDockerStatus(await callBackend("docker-status"));
+    }
     function activate(tab) {
       tabs.forEach((item) => {
         const selected = item === tab;
@@ -1384,7 +1429,12 @@
     }
 
     tabs.forEach((tab) => {
-      tab.addEventListener("click", () => activate(tab));
+      tab.addEventListener("click", () => {
+        activate(tab);
+        if (tab.dataset.tab === "docker" && !state.busy) {
+          void runOperation(refreshDockerStatus, "", false);
+        }
+      });
       tab.addEventListener("keydown", (event) => {
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
         event.preventDefault();
@@ -1397,6 +1447,15 @@
         tabs[nextIndex].focus();
         activate(tabs[nextIndex]);
       });
+    });
+    byId("dockerRefreshButton").addEventListener("click", () => {
+      void runOperation(refreshDockerStatus, "", false);
+    });
+    byId("dockerInstallButton").addEventListener("click", () => {
+      if (state.busy || !window.confirm("Install or update Docker Engine and Compose using Ubuntu APT packages?")) return;
+      void runOperation(async () => {
+        renderDockerStatus(await callBackend("docker-install"));
+      }, "Docker Engine and Compose are installed and running.", false);
     });
   }
 

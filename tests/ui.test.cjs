@@ -369,6 +369,92 @@ test("applications are the initial view and only active routes have public links
   } finally { ui.dom.window.close(); }
 });
 
+test("Docker tab reports Engine status and exposes an explicit install/update action", async () => {
+  const dockerStatus = {
+    installed: true, daemon_active: true, engine_version: "27.0.1",
+    compose_available: true, compose_version: "v2.29.0",
+  };
+  const ui = await loadUi({ "docker-status": dockerStatus, "docker-install": { updated: true, ...dockerStatus } });
+  try {
+    ui.document.querySelector('[data-tab="docker"]').click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#dockerStatus").textContent, /27\.0\.1/);
+    assert.match(ui.document.querySelector("#dockerStatus").textContent, /v2\.29\.0/);
+    ui.document.querySelector("#dockerInstallButton").click();
+    await settle(ui.window);
+    assert.equal(ui.calls.filter((record) => record.command === "docker-install").length, 1);
+    assert.match(ui.document.querySelector("#appManagerNotice").textContent, /installed and running/);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Docker application setup saves Dockerfile and container-port configuration", async () => {
+  let savedApps = [...fixtureApps];
+  const ui = await loadUi({
+    list: () => ({ apps: savedApps }),
+    add: (record) => {
+      const payload = JSON.parse(record.values[0]);
+      savedApps = [...savedApps, { ...payload, id: payload.slug, status: "stopped", deployments: [] }];
+      return { app: savedApps.at(-1) };
+    },
+  });
+  try {
+    ui.document.querySelector("[data-open-add]").click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    form.elements.repo_url.value = "https://github.com/example/docker-shop.git";
+    form.elements.name.value = "Docker Shop";
+    form.elements.name.dispatchEvent(new ui.window.Event("input"));
+    ui.document.querySelector("#setupNext").click();
+    form.elements.framework.value = "docker";
+    form.elements.dockerfile.value = "deploy/Dockerfile";
+    form.elements.container_port.value = "8081";
+    form.elements.deploy_now.checked = false;
+    ui.document.querySelector("#setupNext").click();
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
+    assert.deepEqual(payload.build_config, {
+      docker_mode: "dockerfile", dockerfile: "deploy/Dockerfile", container_port: 8081,
+    });
+    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Docker application setup configures a Compose web service", async () => {
+  let savedApps = [...fixtureApps];
+  const ui = await loadUi({
+    list: () => ({ apps: savedApps }),
+    add: (record) => {
+      const payload = JSON.parse(record.values[0]);
+      savedApps = [...savedApps, { ...payload, id: payload.slug, status: "stopped", deployments: [] }];
+      return { app: savedApps.at(-1) };
+    },
+  });
+  try {
+    ui.document.querySelector("[data-open-add]").click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    form.elements.repo_url.value = "https://github.com/example/compose-shop.git";
+    form.elements.name.value = "Compose Shop";
+    form.elements.name.dispatchEvent(new ui.window.Event("input"));
+    ui.document.querySelector("#setupNext").click();
+    form.elements.framework.value = "docker";
+    form.elements.framework.dispatchEvent(new ui.window.Event("change"));
+    form.elements.docker_mode.value = "compose";
+    form.elements.docker_mode.dispatchEvent(new ui.window.Event("change"));
+    form.elements.compose_file.value = "deploy/compose.yaml";
+    form.elements.compose_service.value = "frontend";
+    form.elements.container_port.value = "8080";
+    form.elements.deploy_now.checked = false;
+    ui.document.querySelector("#setupNext").click();
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
+    assert.deepEqual(payload.build_config, {
+      docker_mode: "compose", compose_file: "deploy/compose.yaml",
+      compose_service: "frontend", container_port: 8080,
+    });
+  } finally { ui.dom.window.close(); }
+});
+
 test("application editing submits automatic deployment policy and numeric resource limits", async () => {
   const ui = await loadUi();
   try {

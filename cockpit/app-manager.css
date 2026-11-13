@@ -115,6 +115,11 @@ body { background-image: linear-gradient(180deg, #fff 0, #f3f5f6 28rem); }
   flex-wrap: wrap;
 }
 
+.am-docker-actions {
+  justify-content: flex-start;
+  margin-top: 1rem;
+}
+
 .am-connection-status {
   display: inline-flex;
   align-items: center;

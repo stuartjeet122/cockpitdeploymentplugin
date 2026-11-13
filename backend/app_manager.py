@@ -48,9 +48,9 @@ except ImportError:  # pragma: no cover - Windows has no POSIX group database
     grp = None
 
 try:
-    from .adapters import detect_framework, get_adapter, inspect_project, validate_go_package, python_command, python_interpreter
+    from .adapters import DOCKER_COMPOSE_FILES, detect_framework, docker_deployment_mode, get_adapter, inspect_project, validate_docker_build_config, validate_go_package, python_command, python_interpreter
 except ImportError:  # pragma: no cover - direct execution after installation
-    from adapters import detect_framework, get_adapter, inspect_project, validate_go_package, python_command, python_interpreter
+    from adapters import DOCKER_COMPOSE_FILES, detect_framework, docker_deployment_mode, get_adapter, inspect_project, validate_docker_build_config, validate_go_package, python_command, python_interpreter
 
 APP_NAME = "app-manager"
 DEFAULT_STATE_ROOT = "/var/lib/cockpit/app-manager"
@@ -64,6 +64,7 @@ DEFAULT_NGINX_CONFIG_ROOT = "/etc/nginx"
 NGINX_MANAGED_INCLUDE = f"include {DEFAULT_NGINX_SNIPPET_DIR}/*.conf;"
 DEFAULT_PUBLIC_ORIGIN = "https://stuserver.online"
 DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
+DEFAULT_OS_RELEASE_PATH = "/etc/os-release"
 PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
 PLUGIN_REPOSITORY_BRANCH = "main"
 PLUGIN_UPDATE_USER = "nobody"
@@ -77,7 +78,7 @@ APP_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 APP_ROUTE_SEGMENT_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
-FRAMEWORKS = {"auto", "nextjs", "go", "node", "python", "static"}
+FRAMEWORKS = {"auto", "nextjs", "go", "node", "python", "static", "docker"}
 RESOURCE_DEFAULTS = {
     "memory_mb": 1024, "cpu_percent": 100, "tasks_max": 256,
     "build_memory_mb": 2048, "build_cpu_percent": 100, "build_tasks_max": 512,
@@ -503,6 +504,8 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     _validate_app_directory_setting(build_config.get("app_directory"))
     validate_go_package(build_config.get("go_package"))
     python_interpreter(build_config)
+    if framework == "docker":
+        validate_docker_build_config(build_config)
     if "start_command" in build_config:
         command = build_config["start_command"]
         if not isinstance(command, list) or not command or not all(
@@ -1408,10 +1411,15 @@ def _wait_for_health(app: Dict[str, Any], timeout_seconds: int) -> bool:
 
 
 def _startup_failure(app: Dict[str, Any], config: Dict[str, Any], executable: Optional[Path] = None) -> str:
+    binding = (
+        f"the container must listen on HOST=0.0.0.0 and PORT={app.get('build_config', {}).get('container_port', 3000)}; "
+        "Docker publishes it only on host loopback"
+        if app.get("framework") == "docker"
+        else f"the runtime must listen on HOST=127.0.0.1 and PORT={app['port']}"
+    )
     message = (
         f"Application did not pass its health check before the timeout: {app_health_url(app)}. "
-        f"The {app.get('framework', 'application')} runtime must listen on HOST=127.0.0.1 and "
-        f"PORT={app['port']}, and the health-check path must return HTTP 2xx. "
+        f"{binding}, and the health-check path must return HTTP 2xx. "
         "Use APP_DATA_DIR for writable data; the release directory is read-only."
     )
     try:
@@ -1552,6 +1560,106 @@ def _environment_file_path(
     if env_path.is_symlink() or (env_path.exists() and not env_path.is_file()):
         raise RuntimeError("Application environment file must be a regular file")
     return env_path
+
+
+def _docker_environment_file_path(app_id: str) -> Path:
+    return Path(DEFAULT_STATE_ROOT) / "environment" / f"{validate_app_id(app_id)}.docker.env"
+
+
+def _remove_docker_image(app_id: str, image: str) -> None:
+    if not isinstance(image, str) or not re.fullmatch(
+        rf"cockpit-app-manager-{re.escape(validate_app_id(app_id))}(?:-[a-z0-9][a-z0-9-]*)?:[0-9a-f]{{16}}",
+        image,
+    ):
+        raise ValueError("Refusing to remove an unmanaged Docker image")
+    result = run_command(["docker", "image", "rm", image], timeout=60)
+    _command_error(result, f"Removing Docker image {image}")
+
+
+def _docker_compose_down_command(app: Dict[str, Any], config: Dict[str, Any], remove_data: bool = False) -> Optional[List[str]]:
+    build_config = app.get("build_config", {})
+    if app.get("framework") != "docker" or docker_deployment_mode(build_config) != "compose":
+        return None
+    paths = _app_paths(app["id"], config)
+    if not paths["current"].exists() and not paths["current"].is_symlink():
+        return None
+    release = paths["current"].resolve(strict=True)
+    if not _path_is_within(release, paths["releases"]) or release == paths["releases"]:
+        raise RuntimeError("Compose release is outside the managed application directory")
+    app_dir = release / "app"
+    if build_config.get("app_directory"):
+        app_dir = app_dir.joinpath(*build_config["app_directory"].split("/"))
+    compose_file_name = build_config.get("compose_file")
+    if compose_file_name is None:
+        compose_file_name = next(
+            (name for name in DOCKER_COMPOSE_FILES if (app_dir / name).is_file()),
+            DOCKER_COMPOSE_FILES[0],
+        )
+    compose_file = app_dir / compose_file_name
+    override_file = release / ".app-manager-compose.override.json"
+    for path in (app_dir, compose_file, override_file):
+        if path.is_symlink() or not path.exists() or not _path_is_within(path.resolve(strict=True), release):
+            raise RuntimeError("Managed Compose files are missing or outside the active release")
+    command = [
+        "docker", "compose", "--project-name", f"cockpit-app-manager-{app['id']}",
+        "--project-directory", str(app_dir),
+        "--env-file", str(_docker_environment_file_path(app["id"])),
+        "-f", str(compose_file), "-f", str(override_file),
+        "down", "--timeout", "10", "--remove-orphans",
+    ]
+    if remove_data:
+        command.append("--volumes")
+    return command
+
+
+def _stop_docker_compose(app: Dict[str, Any], config: Dict[str, Any], remove_data: bool = False) -> None:
+    command = _docker_compose_down_command(app, config, remove_data)
+    if command is None:
+        return
+    docker_config = Path(DEFAULT_STATE_ROOT) / "docker-cli"
+    _assert_no_symlink_components(docker_config)
+    docker_config.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(str(docker_config), 0o700)
+    result = run_command(
+        command,
+        timeout=int(config["command_timeout_seconds"]),
+        env={
+            "HOME": "/root",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "DOCKER_CONFIG": str(docker_config),
+        },
+    )
+    _command_error(result, "Stopping managed Docker Compose project")
+
+
+def _write_docker_environment_file(app_id: str) -> Path:
+    path = _docker_environment_file_path(app_id)
+    _assert_no_symlink_components(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o711)
+    if hasattr(os, "chown"):
+        os.chown(str(path.parent), 0, 0)
+    os.chmod(str(path.parent), 0o711)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError("Docker environment file must be a regular file")
+    values = _environment_values_app(app_id)
+    content = "".join(f"{key}={value}\n" for key, value in values.items())
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".docker-env.", dir=str(path.parent))
+    temporary_path = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if hasattr(os, "chown"):
+            os.chown(str(temporary_path), 0, 0)
+        os.replace(str(temporary_path), str(path))
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+        raise
+    return path
 
 
 def _parse_environment_data(contents: str) -> Tuple[str, Dict[str, str]]:
@@ -1704,6 +1812,8 @@ def save_environment_app(app_id: str, contents: str) -> Dict[str, Any]:
                 os.chown(str(temporary_path), 0, gid)
             temporary_path.chmod(0o640)
             os.replace(str(temporary_path), str(path))
+            if app.get("framework") == "docker" or app.get("container_image"):
+                _write_docker_environment_file(app_id)
         except Exception:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -1750,6 +1860,15 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         validate_branch(app.get("branch"))
         if app.get("framework") not in FRAMEWORKS:
             raise ValueError(f"Application {app_id!r} has an unsupported framework")
+        compose_images = app.get("compose_images", [])
+        if not isinstance(compose_images, list) or not all(
+            isinstance(image, str) and re.fullmatch(
+                rf"cockpit-app-manager-{re.escape(app_id)}-[a-z0-9][a-z0-9-]*:[0-9a-f]{{16}}",
+                image,
+            )
+            for image in compose_images
+        ):
+            raise ValueError(f"Application {app_id!r} has invalid managed Compose images")
         port = app.get("port")
         if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
             raise ValueError(f"Application {app_id!r} has an invalid port")
@@ -2315,7 +2434,8 @@ def _verified_service_bytes(app: Dict[str, Any], service_path: Path) -> Optional
     if not service_path.exists():
         return None
     contents = service_path.read_bytes()
-    required = {"# Managed by Cockpit App Manager", f"Description=Cockpit App Manager - {app['id']}", f"User={app['service_user']}"}
+    service_user = "root" if app.get("framework") == "docker" or app.get("container_image") else app["service_user"]
+    required = {"# Managed by Cockpit App Manager", f"Description=Cockpit App Manager - {app['id']}", f"User={service_user}"}
     if not required.issubset(set(contents.decode("utf-8").splitlines())):
         raise RuntimeError("Refusing to modify an unverified managed service unit")
     return contents
@@ -2382,6 +2502,7 @@ def _render_service(
         paths["config"],
         paths["logs"],
         *(paths["storage"] / name for name in app.get("storage_directories", ["data"])),
+        *((Path(DEFAULT_STATE_ROOT) / "docker-cli",) if app.get("framework") == "docker" else ()),
     )
     read_write_paths = " ".join(_systemd_quote(str(path)) for path in writable_paths)
     exec_start = " ".join(_systemd_quote(part) for part in start_command)
@@ -2415,6 +2536,26 @@ def _render_service(
         f"Environment={_systemd_quote('APP_STORAGE_' + name.upper().replace('-', '_') + '=' + str(paths['storage'] / name))}\n"
         for name in app.get("storage_directories", ["data"])
     )
+    docker_service = app.get("framework") == "docker"
+    service_user = "root" if docker_service else app["service_user"]
+    service_group = "root" if docker_service else app["service_user"]
+    environment_file = "" if docker_service else f"EnvironmentFile=-{str(paths['environment']).replace('%', '%%')}\n"
+    docker_config_environment = (
+        f"Environment={_systemd_quote('DOCKER_CONFIG=' + str(Path(DEFAULT_STATE_ROOT) / 'docker-cli'))}\n"
+        if docker_service else ""
+    )
+    docker_stop = ""
+    if docker_service:
+        configured_stop = app.get("docker_stop_command")
+        if configured_stop:
+            if not isinstance(configured_stop, list) or not configured_stop or not all(
+                isinstance(part, str) and part and "\0" not in part for part in configured_stop
+            ):
+                raise ValueError("Managed Docker stop command is invalid")
+            docker_stop = "ExecStop=" + " ".join(_systemd_quote(part) for part in configured_stop) + "\n"
+        else:
+            container_name = f"cockpit-app-manager-{app['id']}-{app.get('service_slot', 'primary')}"
+            docker_stop = f"ExecStop=/usr/bin/docker stop --time 10 {container_name}\n"
     return (
         "[Unit]\n"
         "# Managed by Cockpit App Manager\n"
@@ -2422,11 +2563,13 @@ def _render_service(
         "After=network.target\n\n"
         "[Service]\n"
         "Type=simple\n"
-        f"User={app['service_user']}\n"
-        f"Group={app['service_user']}\n"
+        f"User={service_user}\n"
+        f"Group={service_group}\n"
         f"WorkingDirectory={working_directory}\n"
         f"ExecStart={exec_start}\n"
-        f"EnvironmentFile=-{str(paths['environment']).replace('%', '%%')}\n"
+        f"{docker_stop}"
+        f"{environment_file}"
+        f"{docker_config_environment}"
         f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
         f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
         f"{node_environment}"
@@ -2973,6 +3116,8 @@ def _write_service(
     config: Dict[str, Any],
     working_directory: Optional[Path] = None,
 ) -> Path:
+    if app.get("framework") == "docker":
+        _write_docker_environment_file(app["id"])
     service = _render_service(app, start_command, config, working_directory, release_dir if "service_slot" in app or app.get("python_services") else None)
     service_path = _service_path(app)
     _verified_service_bytes(app, service_path)
@@ -3770,6 +3915,56 @@ def _build_slot(cancel_file: Path, on_wait: Optional[Callable[[], None]] = None)
         time.sleep(0.1)
 
 
+def docker_status() -> Dict[str, Any]:
+    docker = shutil.which("docker")
+    if not docker:
+        return {
+            "ok": True, "installed": False, "daemon_active": False,
+            "engine_version": None, "compose_available": False, "compose_version": None,
+        }
+    client = run_command([docker, "--version"], timeout=10)
+    engine = run_command([docker, "version", "--format", "{{.Server.Version}}"], timeout=15)
+    compose = run_command([docker, "compose", "version", "--short"], timeout=15)
+    service = run_command(
+        ["systemctl", "show", "docker.service", "--property=ActiveState", "--value"],
+        timeout=10,
+    )
+    return {
+        "ok": True,
+        "installed": client.returncode == 0,
+        "daemon_active": service.returncode == 0 and (service.stdout or "").strip() == "active",
+        "engine_version": (engine.stdout or "").strip() if engine.returncode == 0 else None,
+        "compose_available": compose.returncode == 0,
+        "compose_version": (compose.stdout or "").strip() if compose.returncode == 0 else None,
+    }
+
+
+def install_or_update_docker() -> Dict[str, Any]:
+    _require_root()
+    os_release = Path(DEFAULT_OS_RELEASE_PATH)
+    if not os_release.is_file():
+        raise RuntimeError("Cannot identify the host operating system; Docker installation requires Ubuntu")
+    release = {}
+    for line in os_release.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            release[key] = value.strip().strip('"')
+    if release.get("ID") != "ubuntu":
+        raise RuntimeError(f"Docker installation requires Ubuntu; found {release.get('ID', 'unknown')}")
+    environment = {"DEBIAN_FRONTEND": "noninteractive"}
+    for command, description in (
+        (["apt-get", "update"], "Refreshing Ubuntu package metadata"),
+        (["apt-get", "install", "--yes", "docker.io", "docker-compose-v2"], "Installing or updating Docker Engine and Compose"),
+        (["systemctl", "enable", "--now", "docker.service"], "Enabling and starting Docker Engine"),
+    ):
+        result = run_command(command, timeout=1800, env=environment)
+        _command_error(result, description)
+    status = docker_status()
+    if not status["installed"] or not status["daemon_active"] or not status["compose_available"]:
+        raise RuntimeError("Docker packages were installed, but the Engine daemon or Compose plugin is not ready")
+    return {"ok": True, "updated": True, **status}
+
+
 def _host_preflight(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     checks = []
     environment = _environment_values_app(app["id"])
@@ -3783,6 +3978,18 @@ def _host_preflight(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, An
         free = shutil.disk_usage(path).free
         checks.append({"name": key, "passed": free >= config.get("min_free_disk_mb", 512) * 1024 * 1024,
                        "message": f"{free // (1024 * 1024)} MiB free; minimum {config.get('min_free_disk_mb', 512)} MiB"})
+    if app.get("framework") == "docker":
+        docker = docker_status()
+        passed = docker["installed"] and docker["daemon_active"] and bool(docker["engine_version"])
+        checks.append({
+            "name": "Docker Engine and Compose",
+            "passed": passed,
+            "message": (
+                f"Engine {docker['engine_version'] or 'unavailable'}; "
+                f"Compose {docker['compose_version'] or 'unavailable'}; "
+                f"daemon {'active' if docker['daemon_active'] else 'inactive'}"
+            ),
+        })
     return {"checks": checks, "errors": [check["message"] for check in checks if not check["passed"]], "warnings": []}
 
 
@@ -3793,6 +4000,10 @@ def _deployment_preflight(app: Dict[str, Any], source: Path, username: str, conf
     report["warnings"].extend(project["warnings"])
     report["framework"] = app["framework"]
     report["project_directory"] = project["project_directory"]
+    if app["framework"] == "docker":
+        report["passed"] = not report["errors"]
+        report["checked_at"] = now_iso()
+        return report
     for tool, minimum in {**project["tools"], **app.get("runtime_requirements", {})}.items():
         executable = python_interpreter(app.get("build_config", {})) if tool == "python3" and app["framework"] == "python" else tool
         label = f"{tool} ({executable})" if executable != tool else tool
@@ -3980,6 +4191,8 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
         previous_worker_active = False
         native_activation = False
         native_recovered = False
+        docker_image = None
+        docker_images: List[str] = []
         try:
             deployment_log = _deployment_log_path(app_id, release_id, create=True)
             _prune_deployment_logs(app_id, release_id)
@@ -4024,6 +4237,14 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             if framework == "auto":
                 framework = detect_framework(source_path, app_snapshot.get("build_config", {}))
             app_snapshot["framework"] = framework
+            compose_deployment = False
+            if framework == "docker":
+                app_snapshot["build_config"] = dict(app_snapshot.get("build_config", {}))
+                compose_mode = docker_deployment_mode(app_snapshot["build_config"], source_path)
+                app_snapshot["build_config"]["docker_mode"] = compose_mode
+                compose_deployment = compose_mode == "compose"
+                app_snapshot["docker_tag"] = hashlib.sha256(release_id.encode("utf-8")).hexdigest()[:16]
+                app_snapshot["docker_environment_file"] = str(_write_docker_environment_file(app_id))
             _append_deployment_log(deployment_log, f"Detected framework: {framework}")
             adapter = get_adapter(framework)
             release_dir = paths["releases"] / release_id
@@ -4043,7 +4264,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             service_path = _service_path(app_snapshot)
             previous_service_content = _verified_service_bytes(app_snapshot, service_path)
             expects_runtime = framework != "static" or bool(app_snapshot.get("build_config", {}).get("start_command"))
-            if not native and expects_runtime and current_release is not None and previous_service_content is not None and previous_app.get("status") == "running":
+            if not native and not compose_deployment and expects_runtime and current_release is not None and previous_service_content is not None and previous_app.get("status") == "running":
                 staged = True
                 old_service_retired = False
                 with _registry_transaction() as registry:
@@ -4069,6 +4290,40 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 build_environment["npm_config_package_import_method"] = "copy"
                 build_environment["COREPACK_ENABLE_PROJECT_SPEC"] = "0"
             _, release_group = _account_ids(username)
+
+            def build_runner(args, cwd, timeout, preserve_stdout=False):
+                if framework == "docker":
+                    docker_config = Path(DEFAULT_STATE_ROOT) / "docker-cli"
+                    _assert_no_symlink_components(docker_config)
+                    docker_config.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    os.chmod(str(docker_config), 0o700)
+                    is_compose_config = "config" in args
+                    return run_command(
+                        args,
+                        cwd,
+                        timeout,
+                        env={
+                            "HOME": "/root",
+                            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                            "DOCKER_CONFIG": str(docker_config),
+                        },
+                        live_log_path=None if is_compose_config else deployment_log,
+                        redact_values=list(_environment_values_app(app_id).values()),
+                        cancel_file=cancel_file,
+                        preserve_stdout=preserve_stdout,
+                    )
+                return _run_as_user(
+                    username,
+                    args,
+                    cwd,
+                    timeout,
+                    environment=build_environment,
+                    live_log_path=deployment_log,
+                    cancel_file=cancel_file,
+                    resource_limits=app_snapshot.get("resource_limits", {}),
+                    preserve_stdout=preserve_stdout,
+                )
+
             build_result = _build_release(
                 dict(app_snapshot, _managed_pnpm=True) if framework in {"nextjs", "node"} else app_snapshot,
                 source_path,
@@ -4079,23 +4334,18 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 release_id,
                 cancel_file,
                 deployment_log,
-                runner=lambda args, cwd, timeout, preserve_stdout=False: _run_as_user(
-                    username,
-                    args,
-                    cwd,
-                    timeout,
-                    environment=build_environment,
-                    live_log_path=deployment_log,
-                    cancel_file=cancel_file,
-                    resource_limits=app_snapshot.get("resource_limits", {}),
-                    preserve_stdout=preserve_stdout,
-                ),
+                runner=build_runner,
                 timeout=int(config["build_timeout_seconds"]),
                 group_id=release_group,
                 log=lambda message: _append_deployment_log(deployment_log, message),
             )
             _append_deployment_log(deployment_log, "Build completed; activating the release")
             _raise_if_deployment_cancelled(cancel_file)
+            if framework == "docker":
+                if build_result.get("image"):
+                    app_snapshot["container_image"] = build_result["image"]
+                    docker_image = build_result["image"]
+                docker_images = build_result.get("images", [])
             runtime_required = build_result.get("runtime_required", True)
             static_root = build_result.get("static_root")
             static_export = bool(static_root)
@@ -4110,6 +4360,10 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             record["static_export"] = static_export
             _seal_release(release_dir, release_group, public=hosting_framework == "static")
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
+            if build_result.get("stop_command"):
+                app_snapshot["docker_stop_command"] = _release_command_path(
+                    build_result["stop_command"], release_dir, paths["current"]
+                )
             working_directory = None
             build_working_directory = build_result.get("working_directory")
             if build_working_directory is not None:
@@ -4182,6 +4436,8 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             with _registry_transaction() as registry:
                 app = _find_app(registry, app_id)
                 app["framework"] = framework
+                if framework == "docker":
+                    app["build_config"] = app_snapshot["build_config"]
                 app["static_export"] = static_export
                 if static_export:
                     app["static_root"] = static_root
@@ -4198,6 +4454,14 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 )
                 app["last_deploy"] = record["date"]
                 app["deployed_commit"] = commit or None
+                if build_result.get("image"):
+                    app["container_image"] = build_result["image"]
+                else:
+                    app.pop("container_image", None)
+                if docker_images:
+                    app["compose_images"] = docker_images
+                else:
+                    app.pop("compose_images", None)
                 app.pop("pending_update", None)
                 app["port"] = app_snapshot["port"]
                 if staged:
@@ -4291,6 +4555,17 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                     if release_dir.is_dir() and not release_dir.is_symlink():
                         shutil.rmtree(release_dir)
                         record["release_available"] = False
+            if docker_image and docker_image != previous_app.get("container_image") and not rollback_error:
+                try:
+                    _remove_docker_image(app_id, docker_image)
+                except (OSError, RuntimeError, ValueError) as cleanup_exc:
+                    record["error"] = f"{record['error']}; failed Docker image cleanup: {cleanup_exc}"
+            if not rollback_error:
+                for image in docker_images:
+                    try:
+                        _remove_docker_image(app_id, image)
+                    except (OSError, RuntimeError, ValueError) as cleanup_exc:
+                        record["error"] = f"{record['error']}; failed Docker image cleanup: {cleanup_exc}"
             with _registry_transaction() as registry:
                 app = _find_app(registry, app_id)
                 stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
@@ -4324,6 +4599,18 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 _prune_releases(app)
         except (OSError, RuntimeError) as exc:
             cleanup_errors.append("Previous release cleanup: " + str(exc))
+        previous_image = previous_app.get("container_image")
+        if old_service_retired and previous_image and previous_image != docker_image:
+            try:
+                _remove_docker_image(app_id, previous_image)
+            except (OSError, RuntimeError, ValueError) as exc:
+                cleanup_errors.append("Previous Docker image cleanup: " + str(exc))
+        for image in previous_app.get("compose_images", []):
+            if image not in docker_images:
+                try:
+                    _remove_docker_image(app_id, image)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    cleanup_errors.append("Previous Docker Compose image cleanup: " + str(exc))
         if cleanup_errors:
             record["cleanup_error"] = "; ".join(cleanup_errors)
             _append_deployment_log(
@@ -4798,6 +5085,16 @@ def remove_app(app_id: str) -> Dict[str, Any]:
                 _systemctl("disable", "--now", service_path.name)
                 service_path.unlink()
                 _systemctl("daemon-reload")
+        _stop_docker_compose(app, config, remove_data=True)
+        if app.get("container_image"):
+            _remove_docker_image(app_id, app["container_image"])
+        for image in app.get("compose_images", []):
+            _remove_docker_image(app_id, image)
+        docker_environment = _docker_environment_file_path(app_id)
+        if docker_environment.is_symlink():
+            raise RuntimeError("Docker environment file must not be a symlink")
+        with contextlib.suppress(FileNotFoundError):
+            docker_environment.unlink()
         _remove_app_managed_files(paths, app_id)
         _remove_app_account(app, private_gid)
         with _registry_transaction() as registry:
@@ -4860,6 +5157,8 @@ def _build_parser() -> argparse.ArgumentParser:
     settings.add_argument("payload", nargs="?")
     for name in ("list", "overview", "deployments"):
         commands.add_parser(name)
+    commands.add_parser("docker-status")
+    commands.add_parser("docker-install")
     commands.add_parser("plugin-update-check")
     commands.add_parser("plugin-update")
     deployment_logs = commands.add_parser("deployment-logs")
@@ -4904,6 +5203,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.command == "docker-status":
+        return docker_status()
+    if args.command == "docker-install":
+        return install_or_update_docker()
     if args.command == "list":
         return list_apps()
     if args.command == "overview":

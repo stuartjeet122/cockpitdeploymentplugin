@@ -19,9 +19,10 @@ The project supports the following frameworks and fallback detection rules:
 - `node` — detected via `package.json` when not a Next.js app.
 - `python` — detected via `requirements.txt` or `pyproject.toml`.
 - `static` — detected via `index.html`.
+- `docker` — detected via a root-level `Dockerfile` or Compose manifest (`compose.yaml`, `compose.yml`, `docker-compose.yaml`, or `docker-compose.yml`); select it explicitly for custom paths.
 - `auto` — uses the framework detector before deployment.
 
-If detection is uncertain or the app uses a nonstandard startup pattern, the operator should supply a matching `build_config.start_command` rather than silently guessing.
+Dockerfile deployments use `build_config.dockerfile`, `build_config.app_directory`, and `build_config.container_port`; the Dockerfile's `CMD` or `ENTRYPOINT` starts the app. Compose deployments use `build_config.compose_file`, `build_config.compose_service`, `build_config.app_directory`, and `build_config.container_port`. Compose projects are managed as one app-scoped project: only the selected web service is published on host loopback, while other services remain internal. Host ports, host filesystem mounts, external volumes/networks, host namespaces, and privileged container settings are rejected. Compose updates restart the project in place to preserve app-scoped named volumes; they are not zero-downtime. For other frameworks, if detection is uncertain or the app uses a nonstandard startup pattern, supply a matching `build_config.start_command` rather than silently guessing.
 
 ## Backend development conventions
 
@@ -30,7 +31,7 @@ If detection is uncertain or the app uses a nonstandard startup pattern, the ope
 - All registry and config writes must be atomic JSON writes.
 - Registry and config reads must validate structure to handle corrupted files safely.
 - Use subprocess argument arrays (`subprocess.run([...])`) and enforce timeouts for all command execution.
-- Git and application build commands must run as the dedicated unprivileged service account, never as root.
+- Git and non-Docker application build commands must run as the dedicated unprivileged service account. Docker image builds and Compose project operations use the host Docker daemon; never give app accounts access to its root-equivalent socket, and deploy only trusted Dockerfiles or Compose projects.
 - Never read or mutate the legacy registry at `/home/stuserver/data/websites.json`.
 - Never accept arbitrary shell commands, arbitrary file paths, or unsafe Git URLs.
 - Handle missing apps, duplicate registrations, and port conflicts explicitly.
@@ -51,6 +52,8 @@ If detection is uncertain or the app uses a nonstandard startup pattern, the ope
 - Validate branch names and Git repo URLs before cloning or pulling.
 - Refuse to overwrite local Git changes. Only fast-forward clean repositories when safe.
 - Keep app runtime files under managed directories and restrict file ownership to dedicated service accounts.
+- Docker runtime ports must publish to host loopback only; containers drop Linux capabilities, use `no-new-privileges`, and receive configured resource limits.
+- Compose projects must not publish host ports or mount host paths; external volumes/networks and host namespace or privileged-container settings are rejected.
 
 ## Deployment architecture
 
@@ -60,7 +63,8 @@ If detection is uncertain or the app uses a nonstandard startup pattern, the ope
 - Retain only the current release and the latest deployment record for each app; an in-progress deployment is separately abortable.
 - A systemd timer checks configured repository branches every five minutes and deploys new commits using the same safe fast-forward workflow.
 - Each app gets its own service account, systemd unit, logs, config directory, and loopback-bound runtime port.
-- Dynamic apps run on `127.0.0.1` only, never on a public interface.
+- Dynamic non-Docker apps run on `127.0.0.1` only, never on a public interface.
+- Docker containers bind their internal service to `0.0.0.0` and are published only on the assigned `127.0.0.1` host port; a root-owned systemd unit invokes Docker without sharing the daemon socket with the app account.
 - Static apps should use direct Nginx path routing with the minimum runtime footprint. Do not spin up an unnecessary Python HTTP server unless a deployment explicitly requires it.
 
 ## Directory structure

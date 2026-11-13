@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, call as mock_call, patch
 
+import backend.adapters as adapters
 import backend.app_manager as manager
 from backend.adapters import NextJSAdapter, detect_framework, get_adapter, inspect_project
 
@@ -66,6 +67,8 @@ class AppManagerTests(unittest.TestCase):
             ("python-requirements", {"requirements.txt": "flask\n"}, "python"),
             ("python-pyproject", {"pyproject.toml": "[project]\nname = 'demo'\n"}, "python"),
             ("node", {"package.json": '{"scripts":{"start":"node server.js"}}'}, "node"),
+            ("dockerfile", {"Dockerfile": "FROM scratch\n"}, "docker"),
+            ("docker-compose", {"compose.yaml": "services: {}\n"}, "docker"),
             ("static", {"index.html": "<html></html>"}, "static"),
         )
         for name, files, expected in cases:
@@ -74,6 +77,47 @@ class AppManagerTests(unittest.TestCase):
                 for filename, contents in files.items():
                     (repo / filename).write_text(contents, encoding="utf-8")
                 self.assertEqual(detect_framework(repo), expected)
+
+    def test_docker_status_and_apt_install_flow(self):
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with patch.object(manager.shutil, "which", return_value="/usr/bin/docker"), patch.object(
+            manager, "run_command", side_effect=[
+                subprocess.CompletedProcess([], 0, stdout="Docker version 27.0\n", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="27.0.1\n", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="v2.29.0\n", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="active\n", stderr=""),
+            ],
+        ):
+            status = manager.docker_status()
+        self.assertTrue(status["installed"])
+        self.assertTrue(status["daemon_active"])
+        self.assertTrue(status["compose_available"])
+        self.assertEqual(status["engine_version"], "27.0.1")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            os_release = Path(temporary) / "os-release"
+            os_release.write_text('ID="ubuntu"\n', encoding="utf-8")
+            commands = [
+                ["apt-get", "update"],
+                ["apt-get", "install", "--yes", "docker.io", "docker-compose-v2"],
+                ["systemctl", "enable", "--now", "docker.service"],
+                ["/usr/bin/docker", "--version"],
+                ["/usr/bin/docker", "version", "--format", "{{.Server.Version}}"],
+                ["/usr/bin/docker", "compose", "version", "--short"],
+                ["systemctl", "show", "docker.service", "--property=ActiveState", "--value"],
+            ]
+            outputs = [success, success, success, success,
+                       subprocess.CompletedProcess([], 0, stdout="27.0.1\n", stderr=""),
+                       subprocess.CompletedProcess([], 0, stdout="v2.29.0\n", stderr=""),
+                       subprocess.CompletedProcess([], 0, stdout="active\n", stderr="")]
+            with patch.object(manager, "DEFAULT_OS_RELEASE_PATH", str(os_release)), patch.object(
+                manager, "_require_root"
+            ), patch.object(manager.shutil, "which", return_value="/usr/bin/docker"), patch.object(
+                manager, "run_command", side_effect=outputs
+            ) as run:
+                installed = manager.install_or_update_docker()
+            self.assertTrue(installed["updated"])
+            self.assertEqual([call.args[0] for call in run.call_args_list], commands)
 
     def python_payload(self, **overrides):
         payload = self.add_payload("Drums", framework="python", health_check_url="/api/health",
@@ -700,6 +744,19 @@ class AppManagerTests(unittest.TestCase):
         self.assertTrue(env_path.is_file())
         if os.name != "nt":
             self.assertEqual(env_path.stat().st_mode & 0o777, 0o640)
+
+    def test_docker_environment_sidecar_is_unquoted_and_root_private(self):
+        app = self.add_app("Docker App", framework="docker")["app"]
+        with patch.object(manager, "ensure_app_user", return_value=app["service_user"]), patch.object(
+            manager, "_account_ids", return_value=(1001, 1001)
+        ), patch.object(manager.os, "chown", create=True), patch.object(
+            manager, "_validate_environment_file_permissions"
+        ):
+            manager.save_environment_app(app["id"], 'API_KEY="secret value"\n')
+        docker_env = manager._docker_environment_file_path(app["id"])
+        self.assertEqual(docker_env.read_text(encoding="utf-8"), "API_KEY=secret value\n")
+        if os.name != "nt":
+            self.assertEqual(docker_env.stat().st_mode & 0o777, 0o600)
 
     def test_environment_file_rejects_symlink_before_read_or_write(self):
         app = self.add_app()["app"]
@@ -3442,6 +3499,188 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
 
 
 class FrameworkAdapterTests(unittest.TestCase):
+    def test_docker_adapter_builds_a_scoped_image_and_loopback_container(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            release = root / "release"
+            release.mkdir()
+            (source / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+            app = {
+                "id": "docker-demo",
+                "port": 8123,
+                "route": "/demo/",
+                "docker_tag": "0123456789abcdef",
+                "docker_environment_file": "/var/lib/cockpit/app-manager/environment/docker-demo.docker.env",
+                "resource_limits": {
+                    "memory_mb": 768, "cpu_percent": 150, "tasks_max": 96,
+                    "build_memory_mb": 768, "build_cpu_percent": 150, "build_tasks_max": 128,
+                },
+                "build_config": {"container_port": 4321},
+            }
+            result = get_adapter("docker").build(app, source, release, runner=runner)
+            self.assertEqual(runner.call_args.args[0][:5], [
+                "docker", "build", "--pull", "--tag", "cockpit-app-manager-docker-demo:0123456789abcdef",
+            ])
+            self.assertIn("768m", runner.call_args.args[0])
+            self.assertIn("150000", runner.call_args.args[0])
+            self.assertIn("APP_BASE_PATH=/demo", runner.call_args.args[0])
+            self.assertIn("PORT=4321", runner.call_args.args[0])
+            self.assertIn("--publish", result["start_command"])
+            self.assertIn("127.0.0.1:8123:4321", result["start_command"])
+            self.assertIn("--cap-drop=ALL", result["start_command"])
+            self.assertNotIn("--cap-add=NET_BIND_SERVICE", result["start_command"])
+            self.assertIn("--security-opt=no-new-privileges", result["start_command"])
+            self.assertEqual(result["image"], "cockpit-app-manager-docker-demo:0123456789abcdef")
+            self.assertFalse((source / "Dockerfile").is_symlink())
+            low_release = root / "low-release"
+            low_release.mkdir()
+            low_port_result = get_adapter("docker").build(
+                {**app, "docker_tag": "fedcba9876543210", "build_config": {"container_port": 80}},
+                source,
+                low_release,
+                runner=runner,
+            )
+            self.assertIn("--cap-add=NET_BIND_SERVICE", low_port_result["start_command"])
+
+    def test_docker_configuration_rejects_traversal_and_shell_start_commands(self):
+        valid = {
+            "name": "Docker Demo",
+            "repo_url": "https://github.com/example/docker-demo.git",
+            "branch": "main",
+            "framework": "docker",
+        }
+        for build_config in (
+            {"dockerfile": "../Dockerfile"},
+            {"dockerfile": "subdir/../Dockerfile"},
+            {"app_directory": "../app"},
+            {"container_port": True},
+            {"start_command": ["sh", "-c", "dangerous"]},
+            {"docker_mode": "compose", "compose_file": "../compose.yaml"},
+            {"docker_mode": "compose", "compose_service": "web/server"},
+        ):
+            with self.subTest(build_config=build_config), self.assertRaises(ValueError):
+                manager.validate_app_payload({**valid, "build_config": build_config})
+
+    def test_compose_adapter_builds_managed_project_and_limits_published_service(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            release = root / "release"
+            release.mkdir()
+            (source / "compose.yaml").write_text("services:\n  web:\n    build: .\n", encoding="utf-8")
+            (source / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            environment_file = root / "docker.env"
+            environment_file.write_text("API_KEY=private\n", encoding="utf-8")
+            project_dir = release / "app"
+            base_config = {
+                "services": {
+                    "web": {"build": {"context": str(project_dir), "dockerfile": "Dockerfile"}},
+                    "db": {"image": "postgres:16"},
+                },
+                "volumes": {"database": {}},
+            }
+            managed_config = {
+                **base_config,
+                "services": {
+                    **base_config["services"],
+                    "web": {
+                        **base_config["services"]["web"],
+                        "ports": [{"target": 4321, "published": "8123", "host_ip": "127.0.0.1"}],
+                        "env_file": [str(environment_file)],
+                        "cap_drop": ["ALL"],
+                        "security_opt": ["no-new-privileges:true"],
+                    },
+                    "db": {"image": "postgres:16", "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"]},
+                },
+                "volumes": {"database": {"name": "cockpit-app-manager-compose-demo_database"}},
+            }
+            runner = Mock(side_effect=[
+                subprocess.CompletedProcess([], 0, stdout=json.dumps(base_config), stderr=""),
+                subprocess.CompletedProcess([], 0, stdout=json.dumps(managed_config), stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            ])
+            result = get_adapter("docker").build(
+                {
+                    "id": "compose-demo",
+                    "port": 8123,
+                    "route": "/demo/",
+                    "docker_tag": "0123456789abcdef",
+                    "docker_environment_file": str(environment_file),
+                    "build_config": {
+                        "docker_mode": "compose",
+                        "compose_file": "compose.yaml",
+                        "compose_service": "web",
+                        "container_port": 4321,
+                    },
+                    "resource_limits": {"memory_mb": 768, "cpu_percent": 150, "tasks_max": 96},
+                },
+                source,
+                release,
+                runner=runner,
+            )
+            self.assertEqual(runner.call_count, 3)
+            self.assertIn("cockpit-app-manager-compose-demo", result["start_command"])
+            self.assertIn("--no-build", result["start_command"])
+            override_contents = (release / ".app-manager-compose.override.json").read_text(encoding="utf-8")
+            self.assertIn("127.0.0.1", override_contents)
+            self.assertIn("8123", override_contents)
+            self.assertIn('"cap_drop": [\n        "ALL"', override_contents)
+            self.assertIn("no-new-privileges:true", override_contents)
+            self.assertNotIn("--volumes", result["stop_command"])
+            self.assertEqual(
+                result["images"],
+                ["cockpit-app-manager-compose-demo-web-4b5e57f6:0123456789abcdef"],
+            )
+
+    def test_compose_validation_rejects_host_ports_and_bind_mounts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            for service in (
+                {"ports": [{"target": 80, "published": "8080"}]},
+                {"volumes": [{"type": "bind", "source": "/etc", "target": "/host"}]},
+            ):
+                with self.subTest(service=service), self.assertRaises(ValueError):
+                    adapters._validate_compose_config(
+                        {"services": {"web": service}},
+                        project,
+                        "web",
+                        "cockpit-app-manager-demo",
+                    )
+
+    def test_compose_detection_preserves_explicit_legacy_dockerfile_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (project / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+            self.assertEqual(adapters.docker_deployment_mode({}, project), "compose")
+            self.assertEqual(
+                adapters.docker_deployment_mode({"dockerfile": "deploy/Dockerfile"}, project),
+                "dockerfile",
+            )
+
+    def test_docker_project_inspection_checks_dockerfile_and_warns_about_trust(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = inspect_project(root, "docker", {})
+            self.assertTrue(any("Dockerfile not found" in error for error in report["errors"]))
+            (root / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            report = inspect_project(root, "docker", {})
+            self.assertFalse(report["errors"])
+            self.assertTrue(any("trusted repositories" in warning for warning in report["warnings"]))
+            self.assertEqual(report["tools"], {"docker": None})
+
+    def test_compose_project_inspection_accepts_a_compose_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "compose.yaml").write_text("services:\n  web:\n    image: nginx\n", encoding="utf-8")
+            report = inspect_project(root, "docker", {})
+            self.assertFalse(report["errors"])
+            self.assertTrue(any("selected service" in warning for warning in report["warnings"]))
+
     def test_managed_node_converts_to_pnpm_before_vite_build(self):
         from backend.adapters import NodeAdapter
         with tempfile.TemporaryDirectory() as temporary:
@@ -3993,6 +4232,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotIn("CPUAccounting=", template)
         self.assertIn("CapabilityBoundingSet=", template)
         self.assertNotIn("CAP_NET_BIND_SERVICE", service)
+
         self.assertNotIn("AmbientCapabilities=", service)
         custom_route_service = manager._render_service(
             {**app, "route": "/public-site/"},
@@ -4008,6 +4248,33 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         read_write_paths = next(line for line in service.splitlines() if line.startswith("ReadWritePaths="))
         self.assertNotIn(manager._systemd_quote(str(paths["current"] / "app")), read_write_paths)
         self.assertNotIn(manager._systemd_quote(str(paths["releases"])), read_write_paths)
+
+    def test_docker_service_runs_daemon_client_as_root_with_managed_container_stop(self):
+        app = {"id": "docker-demo", "service_user": "app-docker-demo", "port": 8123, "framework": "docker"}
+        config = manager._default_config()
+        service = manager._render_service(
+            app, ["docker", "run", "--rm", "--name", "cockpit-app-manager-docker-demo-primary", "image"],
+            config,
+        )
+        self.assertIn("User=root\nGroup=root\n", service)
+        self.assertIn("ExecStop=/usr/bin/docker stop --time 10 cockpit-app-manager-docker-demo-primary", service)
+        self.assertIn(
+            f"Environment={manager._systemd_quote('DOCKER_CONFIG=' + str(Path(manager.DEFAULT_STATE_ROOT) / 'docker-cli'))}",
+            service,
+        )
+        self.assertIn(
+            manager._systemd_quote(str(Path(manager.DEFAULT_STATE_ROOT) / "docker-cli")),
+            next(line for line in service.splitlines() if line.startswith("ReadWritePaths=")),
+        )
+        compose_service = manager._render_service(
+            {**app, "docker_stop_command": ["docker", "compose", "down", "--volumes"]},
+            ["docker", "compose", "up"],
+            config,
+        )
+        self.assertIn('ExecStop="docker" "compose" "down" "--volumes"', compose_service)
+        self.assertNotIn(f"EnvironmentFile=-{manager._app_paths('docker-demo', config)['environment']}", service)
+        self.assertIn("NoNewPrivileges=true", service)
+        self.assertIn("CapabilityBoundingSet=\n", service)
 
     def test_environment_file_directive_is_unquoted_and_escapes_systemd_specifiers(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(
