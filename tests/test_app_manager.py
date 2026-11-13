@@ -4651,6 +4651,20 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('systemctl enable --now cockpit-app-manager-npm-cache.service', installer)
         self.assertIn("_assert_npm_cache_service()", installer)
 
+    def test_shared_cache_preflight_reports_administrator_setup_and_checks_versions(self):
+        project = Path(__file__).resolve().parent.parent
+        installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
+        preflight = installer.split("preflight() {", 1)[1].split("install_files() {", 1)[0]
+        self.assertIn('missing_cache_tools+=("$required_command")', preflight)
+        self.assertIn("Missing shared JavaScript cache tools:", preflight)
+        self.assertIn("sudo npm install --global --prefix /usr/local --ignore-scripts pnpm@10 verdaccio@6", preflight)
+        self.assertIn('dpkg --compare-versions "${node_version#v}" ge 18.18.0', preflight)
+        self.assertIn('[[ "${verdaccio_version#v}" == 6.* ]]', preflight)
+        self.assertIn('dpkg --compare-versions "$pnpm_version" ge 10.3.0', preflight)
+        self.assertNotRegex(preflight, r"(?m)^\s*(?:sudo\s+)?npm\s+install")
+        self.assertNotIn("systemctl restart", preflight)
+        self.assertNotIn("systemctl enable", preflight)
+
     def test_standalone_frontend_assets_are_referenced_and_installed(self):
         project = Path(__file__).resolve().parent.parent
         cockpit_dir = project / "cockpit"

@@ -22,6 +22,52 @@ sudo bash ./scripts/install.sh
 
 The shared JavaScript cache additionally requires Node.js 18.18 or newer, pnpm 10.3+ within the 10.x series, and Verdaccio 6.x installed in `/usr/local/bin` or `/usr/bin`. Install these host tools through your normal administrator-approved package process before running the installer; it will not replace existing global Node tools automatically. The cache uses the standard `/etc/cockpit/app-manager` configuration location. Port 4873 must be free on first installation. Other runtimes still need their own tools.
 
+### Upgrading from an npm-only installation
+
+An older installation may not have pnpm or Verdaccio. In that case **Check for
+updates** fails during installer preflight, before copying plugin files or
+changing application services. Retrying the update alone cannot provision these
+new host prerequisites. The previous plugin and application releases remain in use.
+
+On the Ubuntu host, first check the system-wide tools (not an interactive user's
+nvm installation):
+
+```bash
+env PATH=/usr/local/bin:/usr/bin:/bin node --version
+env PATH=/usr/local/bin:/usr/bin:/bin npm --version
+env PATH=/usr/local/bin:/usr/bin:/bin pnpm --version
+env PATH=/usr/local/bin:/usr/bin:/bin verdaccio --version
+```
+
+An administrator must provision a supported system-wide Node.js/npm if missing.
+The cache floor is Node 18.18; Next.js 16 applications require at least Node 20.9.
+Prefer a currently supported Node.js LTS release compatible with the applications.
+After reviewing existing global tool versions and the package source, an
+administrator can provision missing pnpm/Verdaccio with:
+
+```bash
+cd /
+sudo npm install --global --prefix /usr/local --ignore-scripts 'pnpm@10' 'verdaccio@6'
+/usr/local/bin/pnpm --version
+/usr/local/bin/verdaccio --version
+```
+
+This explicitly installs administrator-selected host tools, suppressing package
+installation hooks; App Manager never runs this command automatically. Do not
+force-overwrite conflicting binaries, disable TLS verification, install into an
+application release, or change global ownership to work around an installation
+error. User-home nvm/Corepack shims are not available to the isolated services.
+Once the version/path checks pass, retry **Check for updates** and verify that the
+managed loopback cache starts. Then redeploy the failed application.
+
+A previous `npm ci` error listing missing platform packages is a separate,
+incomplete-lockfile problem. Missing Linux packages can matter even when the lock
+was generated on Windows. The new manager imports npm locks into pnpm in the
+release only; this does not certify or repair the source lockfile. If dependency
+validation still fails, repair and validate that application's lockfile in its
+source repository, not under `/opt/webapps/.../releases`. Do not replace frozen
+installs with a silent non-frozen fallback or delete the running release.
+
 The installer requires Ubuntu, root privileges, Python 3.9 or newer, systemd, Cockpit 318 or newer, Nginx, Git with SSH signing support, `ssh-keygen`, `logrotate`, `runuser` and `setpriv` from `util-linux`, and `ss` from `iproute2`. Install the runtime and package manager needed by each application separately, including `python3-venv` for Python apps. Preflight rejects missing host tools before installation. It checks backend imports both before and after installation. It installs the self-contained stylesheet and offline Lucide icons with the other Cockpit assets under `/usr/share/cockpit/app-manager`, the backend and adapter module under the dedicated root-owned, readable/traversable `/usr/libexec/cockpit/app-manager` directory, and state under `/var/lib/cockpit/app-manager`. Cockpit plugin/code directories are normalized to mode `0755`, and installed code/assets are readable by Cockpit; sensitive state remains root-only rather than being made globally writable. No CDN or Node.js runtime is needed by the plugin UI itself. It does not recursively change ownership of shared Cockpit directories or `/opt/webapps`, and it preserves existing registry/configuration data on repeat installation.
 
 Application Git and build commands switch directly to the dedicated app UID and group using `setpriv`, without opening an interactive PAM session. The root timer helper retains `CAP_SETUID` through `AmbientCapabilities` because systemd 259's seccomp setup can otherwise remove it despite the bounding set. Before executing app commands, `setpriv` clears supplementary groups and inheritable/ambient capabilities; changing to the app UID drops permitted/effective capabilities. `no_new_privs` prevents privilege escalation, and the timer's systemd sandbox remains in effect. There is no root fallback if switching identity fails. After updating the plugin, existing automatic-deployment warnings clear on the next successful repository check; a previous failure's retry backoff can delay that check by up to one hour.

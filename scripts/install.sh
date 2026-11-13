@@ -50,18 +50,31 @@ preflight() {
   done
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' ||
     fail "Python 3.9 or newer is required."
+  local missing_cache_tools=()
   for required_command in node pnpm verdaccio; do
-    command -v "$required_command" >/dev/null 2>&1 ||
-      fail "Shared JavaScript cache requires $required_command in /usr/local/bin or /usr/bin; install Node.js, pnpm 10.3+ (10.x), and Verdaccio 6.x first."
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+      missing_cache_tools+=("$required_command")
+      continue
+    fi
     case "$(command -v "$required_command")" in
       /usr/bin/*|/usr/local/bin/*) ;;
       *) fail "$required_command must be installed in /usr/bin or /usr/local/bin for isolated services." ;;
     esac
   done
+  if [[ "${#missing_cache_tools[@]}" -gt 0 ]]; then
+    fail "Missing shared JavaScript cache tools: ${missing_cache_tools[*]}. Provision system-wide Node.js 18.18+ and npm first if absent. Then, after administrator review, run: sudo npm install --global --prefix /usr/local --ignore-scripts pnpm@10 verdaccio@6 . Verify /usr/local/bin or /usr/bin contains the tools, then retry the plugin update. No application services were changed by this preflight failure."
+  fi
+  local node_version verdaccio_version
+  node_version="$(cd /; node --version)" || fail "Could not query the system-wide Node.js version."
+  dpkg --compare-versions "${node_version#v}" ge 18.18.0 ||
+    fail "Shared JavaScript cache requires Node.js 18.18 or newer; provision a supported system-wide Node.js release before retrying."
   local pnpm_version
   pnpm_version="$(cd /; pnpm --version)"
   [[ "$pnpm_version" == 10.* ]] && dpkg --compare-versions "$pnpm_version" ge 10.3.0 ||
     fail "Managed builds require pnpm 10.3 or newer within the tested 10.x series."
+  verdaccio_version="$(cd /; verdaccio --version)" || fail "Could not query the system-wide Verdaccio version."
+  [[ "${verdaccio_version#v}" == 6.* ]] ||
+    fail "Shared JavaScript cache requires Verdaccio 6.x; provision the supported major version before retrying."
   [[ -f "$APP_DIR/config/npm-cache.json" && -f "$APP_DIR/templates/npm-cache.service" ]] ||
     fail "Shared registry cache configuration or service template is missing."
   local cache_unit="$SYSTEMD_DEST/cockpit-app-manager-npm-cache.service"
