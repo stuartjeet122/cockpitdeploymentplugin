@@ -3636,6 +3636,7 @@ class FrameworkAdapterTests(unittest.TestCase):
             override_service = json.loads(override_contents)["services"]["web"]
             self.assertEqual(override_service["pids_limit"], 96)
             self.assertEqual(override_service["deploy"]["resources"]["limits"]["pids"], 96)
+            self.assertEqual(override_service["environment"]["APP_BASE_PATH"], "/demo")
             self.assertIn('"cap_drop": [\n        "ALL"', override_contents)
             self.assertIn("no-new-privileges:true", override_contents)
             self.assertNotIn("--volumes", result["stop_command"])
@@ -4242,12 +4243,14 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotIn("CAP_NET_BIND_SERVICE", service)
 
         self.assertNotIn("AmbientCapabilities=", service)
-        custom_route_service = manager._render_service(
-            {**app, "route": "/public-site/"},
-            ["/opt/webapps/demo/current/app/server"],
-            config,
-        )
-        self.assertIn('Environment="APP_BASE_PATH=/public-site"', custom_route_service)
+        for framework in ("nextjs", "node", "go", "python", "docker"):
+            with self.subTest(framework=framework):
+                custom_route_service = manager._render_service(
+                    {**app, "framework": framework, "route": "/public-site/"},
+                    ["/opt/webapps/demo/current/app/server"],
+                    config,
+                )
+                self.assertIn('Environment="APP_BASE_PATH=/public-site"', custom_route_service)
         expected_write_paths = "ReadWritePaths=" + " ".join(
             manager._systemd_quote(str(path))
             for path in (paths["home"], paths["config"], paths["logs"])
@@ -4555,7 +4558,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             )
             self.assertEqual(request_path, upstream_path)
 
-        for framework in ("go", "node", "python"):
+        for framework in ("go", "node", "python", "docker"):
             stripped_prefix = manager._render_nginx_config(app_id, 8123, template, framework)
             self.assertIn("location ^~ /website1/ {\n" + environment_guard, stripped_prefix)
             proxy_pass = next(line for line in stripped_prefix.splitlines() if "proxy_pass " in line)
