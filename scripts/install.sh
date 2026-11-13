@@ -142,6 +142,7 @@ install_files() {
 
   install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"
   install -o root -g root -m 0644 "$APP_DIR/backend/adapters.py" "$BACKEND_DEST/adapters.py"
+  install -o root -g root -m 0644 "$APP_DIR/backend/runtime_checks.py" "$BACKEND_DEST/runtime_checks.py"
   install -o root -g root -m 0644 "$APP_DIR/backend/prepare_next_assets.cjs" "$BACKEND_DEST/prepare_next_assets.cjs"
   install -o root -g root -m 0644 "$APP_DIR/config/defaults.json" "$CONFIG_DEST/defaults.json"
   install -o root -g root -m 0644 "$APP_DIR/templates/nginx.conf.tpl" "$CONFIG_DEST/templates/nginx.conf.tpl"

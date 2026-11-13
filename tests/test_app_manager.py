@@ -75,6 +75,276 @@ class AppManagerTests(unittest.TestCase):
                     (repo / filename).write_text(contents, encoding="utf-8")
                 self.assertEqual(detect_framework(repo), expected)
 
+    def python_payload(self, **overrides):
+        payload = self.add_payload("Drums", framework="python", health_check_url="/api/health",
+            build_config={"start_command": ["{venv}/python", "-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1", "--port", "{port}", "--root-path", "{base_path}"]},
+            storage_directories=["uploads", "processed", "exports", "jobs"],
+            python_services={"redis": True, "worker": {"command": ["{venv}/python", "-m", "celery", "-A", "backend.app.workers.celery_app:celery_app", "worker", "--pool=prefork", "--concurrency=1"]}})
+        payload.update(overrides)
+        return payload
+
+    def test_python_service_policy_roundtrips_and_rejects_unsafe_settings(self):
+        payload = self.python_payload()
+        with patch.object(manager, "get_listening_ports", return_value=set()), patch.object(manager, "_socket_port_available", return_value=True):
+            app = manager.add_app(payload)["app"]
+        stored = manager._find_app(manager.get_registry(), app["id"])
+        self.assertEqual(stored["python_services"]["access_control"], "blocked")
+        self.assertEqual(stored["python_services"]["worker"]["stop_timeout_seconds"], 300)
+        for change in ({"upload_limit_mb": True}, {"model_files": ["../secret"]}, {"access_control": "public"}, {"worker": []}, {"drum_prerequisites": True}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                manager.validate_app_payload(self.python_payload(python_services={**payload["python_services"], **change}))
+        payload["build_config"]["start_command"][-6] = "0.0.0.0"
+        with self.assertRaises(ValueError):
+            manager.validate_app_payload(payload)
+
+    def test_worker_unit_shares_storage_and_environment_but_has_own_limits_and_logs(self):
+        app = manager.validate_app_payload(self.python_payload())
+        app.update(port=8123, service_user="app-drums")
+        app["python_services"]["worker"]["resource_limits"]["memory_mb"] = 4096
+        config = manager.get_config()
+        paths = manager._app_paths(app["id"], config)
+        worker = manager._render_service(manager._worker_app(app), ["/venv/python", "-m", "celery"], config)
+        web = manager._render_service(app, ["/venv/python", "-m", "uvicorn"], config)
+        for content in (worker, web):
+            self.assertIn(f"EnvironmentFile=-{paths['environment']}", content)
+            self.assertIn("APP_STORAGE_JOBS=", content)
+            self.assertIn("ReadOnlyPaths=" + manager._systemd_quote(str(paths["storage"] / "models")), content)
+            self.assertIn("QT_QPA_PLATFORM=offscreen", content)
+            self.assertIn("NUMBA_CACHE_DIR=", content)
+            self.assertIn("ProtectSystem=strict", content)
+        self.assertIn("worker-stdout.log", worker)
+        self.assertIn("MemoryMax=4096M", worker)
+        self.assertIn("KillMode=mixed\nSendSIGKILL=yes\nTimeoutStopSec=300", worker)
+        self.assertNotIn("worker-stdout.log", web)
+        self.assertEqual(manager._service_path(manager._worker_app(app)).name, "cockpit-app-drums@worker.service")
+
+    def test_python_upload_and_access_rules_only_affect_the_app_location(self):
+        settings = manager.validate_app_payload(self.python_payload())["python_services"]
+        template = Path(__file__).resolve().parents[1] / "templates" / "nginx.conf.tpl"
+        rendered = manager._render_nginx_config("drums", 8123, template_path=template, framework="python", python_services=settings)
+        self.assertIn("client_max_body_size 101m;", rendered)
+        self.assertIn("deny all;", rendered)
+        self.assertIn("location ^~ /drums/", rendered)
+        self.assertNotIn("client_max_body_size", manager._render_nginx_config("other", 8124, template_path=template, framework="python"))
+
+    def test_worker_handover_refuses_a_live_or_unknown_cgroup(self):
+        app = {"id": "drums"}
+        for output, allowed in (("ActiveState=active\nMainPID=1\nControlGroup=\n", False), ("", False), ("ActiveState=inactive\nMainPID=0\nControlGroup=\n", True)):
+            with self.subTest(output=output), patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, stdout=output)):
+                if allowed:
+                    manager._assert_worker_stopped(app)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        manager._assert_worker_stopped(app)
+
+    def test_python_prerequisites_are_unprivileged_nonmutating_and_secret_free(self):
+        app = manager.validate_app_payload(self.python_payload())
+        app.update(port=8123, service_user="app-drums")
+        report = {"checks": [], "errors": [], "warnings": [], "passed": True}
+        with patch.object(manager, "_environment_values_app", return_value={"REDIS_URL": "redis://:secret@localhost/4"}), patch.object(manager, "_run_as_user", return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps(report))) as run:
+            self.assertTrue(manager._python_prerequisites(app, manager.get_config())["passed"])
+        self.assertEqual(run.call_args.args[0], "app-drums")
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertNotIn("secret", str(run.call_args.args))
+        from backend.runtime_checks import redis_ping, check_runtime
+        for url in ("", "redis://example.com/0", "redis://localhost", "http://localhost/0"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                redis_ping(url)
+        with patch.dict(os.environ, {"REDIS_URL": "redis://:secret@localhost/4"}), patch("backend.runtime_checks.socket.create_connection", side_effect=OSError("secret")):
+            result = check_runtime({"redis": True}, Path("/models"))
+        self.assertFalse(result["passed"])
+        self.assertNotIn("secret", json.dumps(result))
+
+    def test_redis_probe_only_authenticates_selects_and_pings_with_timeouts(self):
+        from backend.runtime_checks import redis_ping
+        connection = Mock()
+        connection.__enter__ = Mock(return_value=connection)
+        connection.__exit__ = Mock(return_value=False)
+        response = Mock()
+        response.readline.side_effect = [b"+OK\r\n", b"+OK\r\n", b"+PONG\r\n"]
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        connection.makefile.return_value = response
+        with patch("backend.runtime_checks.socket.create_connection", return_value=connection) as connect:
+            redis_ping("redis://drums:s%40cret@127.0.0.1:6380/4")
+        connect.assert_called_once_with(("127.0.0.1", 6380), timeout=3)
+        connection.settimeout.assert_called_once_with(3)
+        self.assertEqual([entry.args[0] for entry in connection.sendall.call_args_list], [
+            b"*3\r\n$4\r\nAUTH\r\n$5\r\ndrums\r\n$6\r\ns@cret\r\n",
+            b"*2\r\n$6\r\nSELECT\r\n$1\r\n4\r\n",
+            b"*1\r\n$4\r\nPING\r\n",
+        ])
+
+    def test_model_prerequisites_reject_empty_writable_and_missing_files(self):
+        from backend.runtime_checks import check_runtime
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model.onnx"
+            for contents, writable, expected in ((None, False, False), (b"", False, False), (b"checkpoint", True, False), (b"checkpoint", False, True)):
+                with self.subTest(contents=contents, writable=writable):
+                    if contents is not None:
+                        model.write_bytes(contents)
+                    with patch("backend.runtime_checks.os.access", return_value=writable):
+                        result = check_runtime({"model_files": ["model.onnx"]}, root)
+                    artifact = next(check for check in result["checks"] if check["name"].startswith("Model:"))
+                    self.assertEqual(artifact["passed"], expected)
+
+    def test_native_runtime_stops_worker_before_web_and_confirms_both_stopped(self):
+        app = {"id": "drums", "service_user": "app-drums"}
+        events = []
+        with patch.object(manager.Path, "exists", return_value=True), patch.object(manager, "_verified_service_bytes"), patch.object(manager, "_stop_worker", side_effect=lambda app: events.append("worker-stopped")), patch.object(manager, "_systemctl", side_effect=lambda *args: events.append(args)), patch.object(manager, "_assert_service_stopped", side_effect=lambda app: events.append("web-stopped")):
+            manager._stop_native_runtime(app)
+        self.assertEqual(events, ["worker-stopped", ("stop", "cockpit-app-drums.service"), "web-stopped"])
+        with patch.object(manager.Path, "exists", return_value=True), patch.object(manager, "_stop_worker", side_effect=RuntimeError("still running")), patch.object(manager, "_systemctl") as systemctl:
+            with self.assertRaises(RuntimeError):
+                manager._stop_native_runtime(app)
+            systemctl.assert_not_called()
+
+    def test_worker_restart_and_logs_target_only_the_worker(self):
+        with patch.object(manager, "get_listening_ports", return_value=set()), patch.object(manager, "_socket_port_available", return_value=True):
+            app = manager.add_app(self.python_payload())["app"]
+        events = []
+        with patch.object(manager, "_require_root"), patch.object(manager, "_stop_worker", side_effect=lambda app: events.append("stop")), patch.object(manager, "_start_worker", side_effect=lambda app: events.append("start")), patch.object(manager, "worker_status_app", return_value={"ok": True}):
+            manager.restart_worker_app(app["id"])
+        self.assertEqual(events, ["stop", "start"])
+        with patch.object(manager, "_tail_log", return_value="worker output") as tail:
+            result = manager.logs_app(app["id"], worker=True)
+        self.assertIn("worker output", result["logs"])
+        self.assertEqual([entry.args[0].name for entry in tail.call_args_list], ["worker-stdout.log", "worker-stderr.log"])
+
+    def test_native_app_restart_failure_stops_both_and_records_failure(self):
+        with patch.object(manager, "get_listening_ports", return_value=set()), patch.object(manager, "_socket_port_available", return_value=True):
+            app = manager.add_app(self.python_payload())["app"]
+        with patch.object(manager, "_require_root"), patch.object(manager.Path, "exists", return_value=True), patch.object(manager, "_verified_service_bytes"), patch.object(manager, "_stop_native_runtime") as stop, patch.object(manager, "_systemctl", side_effect=RuntimeError("restart failed")), patch.object(manager, "_start_worker") as start:
+            with self.assertRaisesRegex(RuntimeError, "restart failed"):
+                manager.restart_app(app["id"])
+        self.assertEqual(stop.call_count, 2)
+        start.assert_not_called()
+        self.assertEqual(manager._find_app(manager.get_registry(), app["id"])["status"], "failed")
+
+    def test_native_runtime_logs_redact_environment_and_redis_credentials(self):
+        with patch.object(manager, "get_listening_ports", return_value=set()), patch.object(manager, "_socket_port_available", return_value=True):
+            app = manager.add_app(self.python_payload())["app"]
+        with patch.object(manager, "_environment_values_app", return_value={"REDIS_URL": "redis://:s%40cret@localhost/4", "API_KEY": "private-key"}), patch.object(manager, "_tail_log", return_value="s@cret private-key redis://:s%40cret@localhost/4"):
+            for worker in (False, True):
+                result = manager.logs_app(app["id"], worker=worker)
+                self.assertNotIn("s@cret", result["logs"])
+                self.assertNotIn("private-key", result["logs"])
+                self.assertNotIn("s%40cret", result["logs"])
+
+    def test_native_deployment_handover_recovers_both_services_and_preserves_data(self):
+        for failure in (None, "api", "worker", "stop", "rollback"):
+            with self.subTest(failure=failure):
+                payload = self.python_payload(name="Drums " + str(failure))
+                with patch.object(manager, "get_listening_ports", return_value=set()), patch.object(manager, "_socket_port_available", return_value=True):
+                    app = manager.add_app(payload)["app"]
+                paths = manager._app_paths(app["id"], manager.get_config())
+                for key in ("source", "releases", "current", "storage"):
+                    paths[key].mkdir(parents=True, exist_ok=True)
+                data = paths["storage"] / "job.json"
+                data.write_text("persistent", encoding="utf-8")
+                units = {name: Path(self.temp_dir.name) / f"{app['id']}-{name}.service" for name in ("web", "worker")}
+                saved = {}
+                for name, path in units.items():
+                    path.write_text(f"# Managed by Cockpit App Manager\nDescription=Cockpit App Manager - {app['id']}\nUser={app['service_user']}\nold-{name}\n", encoding="utf-8")
+                    saved[name] = path.read_bytes()
+                with manager._registry_transaction() as registry:
+                    manager._find_app(registry, app["id"])["status"] = "running"
+                states = {"web": "active", "worker": "active"}
+                events = []
+                starts = 0
+
+                def systemctl(*args, **kwargs):
+                    nonlocal starts
+                    events.append(args)
+                    kind = "worker" if units["worker"].name in args else "web"
+                    if args[0] == "stop":
+                        if kind == "worker" and failure == "stop":
+                            raise RuntimeError("worker still running")
+                        states[kind] = "inactive"
+                    if args[0] in {"start", "restart"}:
+                        if kind == "worker":
+                            starts += 1
+                            self.assertEqual(states["worker"], "inactive")
+                            if failure == "worker" and starts == 1:
+                                raise RuntimeError("worker startup failed")
+                            if failure == "rollback" and starts == 2:
+                                raise RuntimeError("rollback worker startup failed")
+                        states[kind] = "active"
+                    output = states[kind] if "--value" in args else f"ActiveState={states[kind]}\nMainPID={'0' if states[kind] == 'inactive' else '42'}\nControlGroup=\n"
+                    return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+                def build(candidate, source, release, **kwargs):
+                    self.assertEqual(candidate["port"], app["port"])
+                    (release / "app").mkdir()
+                    return {"start_command": [str(release / "app" / ".venv" / "bin" / "python"), "-m", "uvicorn"]}
+
+                adapter = Mock()
+                adapter.build.side_effect = build
+                with contextlib.ExitStack() as stack:
+                    mocks = {
+                        "_require_root": Mock(), "ensure_app_user": Mock(return_value=app["service_user"]),
+                        "_setup_app_directories": Mock(return_value=paths), "clone_or_update_repo": Mock(),
+                        "_assert_deployed_ancestor": Mock(), "_deployment_preflight": Mock(return_value={"passed": True}),
+                        "_python_prerequisites": Mock(return_value={"errors": []}),
+                        "git_output": Mock(return_value="a" * 40), "_account_ids": Mock(return_value=(1001, 1001)),
+                        "_environment_values_app": Mock(return_value={}), "get_adapter": Mock(return_value=adapter),
+                        "_prepare_release_directory": Mock(side_effect=lambda path, user: path.mkdir()),
+                        "_seal_release": Mock(), "_retire_legacy_root_service": Mock(),
+                        "_service_path": Mock(side_effect=lambda candidate: units["worker" if candidate.get("_worker") else "web"]),
+                        "_systemctl": Mock(side_effect=systemctl),
+                        "_wait_for_health": Mock(side_effect=[False, True] if failure == "api" else [True, True, True]),
+                        "_startup_failure": Mock(return_value="api unhealthy"), "_assert_loopback_binding": Mock(),
+                        "_atomic_symlink": Mock(side_effect=lambda *args: events.append(("symlink",))),
+                        "_activate_nginx_config": Mock(return_value={"active": True, "message": "active"}),
+                        "_prune_releases": Mock(),
+                    }
+                    for name, replacement in mocks.items():
+                        stack.enter_context(patch.object(manager, name, replacement))
+                    if failure in {"api", "worker", "stop"}:
+                        with self.assertRaises(RuntimeError):
+                            manager.deploy_app(app["id"])
+                    else:
+                        deployed = manager.deploy_app(app["id"])
+                        if failure == "rollback":
+                            active_units = {name: path.read_bytes() for name, path in units.items()}
+                            with self.assertRaisesRegex(RuntimeError, "Rollback failed"):
+                                manager.rollback_app(app["id"], deployed["deployment"]["id"])
+                            for name, path in units.items():
+                                self.assertEqual(path.read_bytes(), active_units[name])
+                stored = manager._find_app(manager.get_registry(), app["id"])
+                record = stored["deployments"][0]
+                self.assertEqual(data.read_text(encoding="utf-8"), "persistent")
+                self.assertNotIn("candidate_port", stored)
+                self.assertEqual(states, {"web": "active", "worker": "active"})
+                if failure == "stop":
+                    self.assertTrue(Path(record["release"]).is_dir())
+                    self.assertIn("rollback_error", record)
+                    self.assertEqual(starts, 0)
+                elif failure in {"api", "worker"}:
+                    self.assertFalse(Path(record["release"]).exists())
+                    self.assertEqual(units["worker"].read_bytes(), saved["worker"])
+                    self.assertEqual(units["web"].read_bytes(), saved["web"])
+                    self.assertEqual(stored["status"], "running")
+                else:
+                    self.assertEqual(starts, 3 if failure == "rollback" else 1)
+                    self.assertLess(events.index(("stop", units["worker"].name)), events.index(("start", units["worker"].name)))
+                    self.assertIn(str(Path(record["release"]) / "app"), units["worker"].read_text(encoding="utf-8"))
+
+    def test_interrupted_native_activation_is_not_reported_as_unchanged(self):
+        app = self.add_app()["app"]
+        deployment = "20261113120000-abcdef12"
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored["status"] = "deploying"
+            stored["deployments"] = [{"id": deployment, "status": "deploying", "build_status": "running", "runtime_activation": True}]
+        result = subprocess.CompletedProcess([], 0, stdout="LoadState=not-found\nActiveState=inactive\nSubState=dead\nJob=\n")
+        with patch.object(manager, "run_command", return_value=result):
+            self.assertTrue(manager._abort_interrupted_deployment(app["id"], deployment))
+        stored = manager._find_app(manager.get_registry(), app["id"])
+        self.assertEqual(stored["status"], "failed")
+        self.assertIn("API and worker together", stored["deployments"][0]["error"])
+
     def test_invalid_settings_never_replace_the_working_configuration(self):
         original = manager.get_config()
         path = Path(manager.DEFAULT_CONFIG_PATH)
@@ -3399,6 +3669,42 @@ class FrameworkAdapterTests(unittest.TestCase):
             result = get_adapter("python").build({"port": 8123}, source, root / "release", runner=runner)
             self.assertEqual(result["start_command"], [str(root / "release" / "app" / ".venv" / "bin" / "gunicorn"), "--bind", "127.0.0.1:8123", "app:app"])
             self.assertEqual(runner.call_args_list[0].args[0], ["python3", "-m", "venv", ".venv"])
+
+    def test_python_asgi_substitutions_do_not_use_a_shell_or_install_gunicorn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "requirements.txt").write_text("uvicorn\n", encoding="utf-8")
+            command = ["{venv}/python", "-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1", "--port", "{port}", "--root-path", "{base_path}"]
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+            result = get_adapter("python").build(
+                {"port": 8123, "route": "/drums/", "build_config": {"start_command": command}},
+                source, root / "release", runner=runner,
+            )
+            self.assertEqual(result["start_command"][-3:], ["8123", "--root-path", "/drums"])
+            self.assertEqual(result["start_command"][0], str(root / "release" / "app" / ".venv" / "bin") + "/python")
+            self.assertEqual(command[0], "{venv}/python")
+            self.assertEqual(runner.call_count, 2)
+            from backend.adapters import python_command
+            with self.assertRaisesRegex(ValueError, "shell expansion"):
+                python_command(["uvicorn", "--port", "$PORT"], {"port": 8123}, source)
+
+    def test_native_python_never_copies_model_data_or_environment_into_releases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            for name in ("models", "storage"):
+                (source / name).mkdir()
+                (source / name / "keep").write_text("persistent", encoding="utf-8")
+            (source / ".env").write_text("TOKEN=secret", encoding="utf-8")
+            (source / "requirements.txt").write_text("", encoding="utf-8")
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+            get_adapter("python").build({"port": 8123, "python_services": {"redis": True}}, source, root / "release", runner=runner)
+            for name in ("models", "storage", ".env"):
+                self.assertFalse((root / "release" / "app" / name).exists())
+                self.assertTrue((source / name).exists())
 
     def test_python_custom_start_resolves_the_release_virtual_environment(self):
         with tempfile.TemporaryDirectory() as temporary:

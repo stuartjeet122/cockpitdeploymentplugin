@@ -201,6 +201,17 @@ Public registry downloads are shared across applications. Each app keeps its own
 
 Inspect cache failures with `journalctl -u cockpit-app-manager-npm-cache.service`. Ordinary uninstall stops/removes the verified cache unit and configuration but retains cached downloads; destructive app cleanup also leaves this shared cache untouched. Cache/state directories may be removed manually by an administrator only after stopping the cache service. Reinstall/redeploy to apply conversion to existing applications; running releases are not rewritten.
 
+## Native multi-service Python APIs
+
+Python apps can opt into a loopback Uvicorn API and one native Celery worker,
+shared persistent storage/environment, read-only models, bounded prerequisite
+checks, separate worker controls/limits/logs and per-app upload/access rules.
+See the [native Python deployment runbook](docs/native-python.md) for configuration,
+administrator setup, failure recovery and the proposed drum API changes.
+The separate drum API repository is unchanged; compatibility requires those
+approved changes and real disposable-Ubuntu acceptance checks. Routes are blocked
+by default until an administrator explicitly confirms upstream authentication.
+
 ## Development tests
 
 The optional real package-tool checks use temporary pnpm/Verdaccio tools and a local fixture upstream, without modifying global tools. On a POSIX development host run `APP_MANAGER_TEST_PACKAGE_TOOLS=1 npm exec --yes --package=pnpm@10 --package=verdaccio@6 -- node --test tests/ui.test.cjs`. They verify pnpm build hooks, frozen production installation, registration/publishing rejection, and one cached tarball download across two independent app stores. Actual systemd isolation still requires disposable Ubuntu testing.

@@ -253,6 +253,7 @@ remove_managed_app_data() {
       apps_preserved=1
       continue
     fi
+    remove_managed_unit "$app_id" "@worker"
     remove_managed_unit "$app_id"
     remove_managed_unit "$app_id" "@secondary"
     if [[ "$APP_CLEANUP_BLOCKED" -eq 1 ]]; then
@@ -355,6 +356,7 @@ remove_default_plugin_files() {
   remove_owned_file "${CONFIG_DEST}/templates/app.service.tpl" "# Managed by Cockpit App Manager"
   remove_owned_file "${BACKEND_DEST}/app-manager" 'APP_NAME = "app-manager"'
   remove_owned_file "${BACKEND_DEST}/adapters.py" "class NextJSAdapter"
+  remove_owned_file "${BACKEND_DEST}/runtime_checks.py" "def check_runtime"
 
   remove_empty_directory "${CONFIG_DEST}/templates"
   if [[ "$BACKEND_DEST" == "/usr/libexec/cockpit" ]]; then

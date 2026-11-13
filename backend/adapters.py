@@ -21,13 +21,20 @@ class CommandRunner(Protocol):
     def __call__(self, command: Sequence[str], cwd: Path, timeout: int, *, preserve_stdout: bool = False) -> subprocess.CompletedProcess: ...
 
 
-def _copy_source(repo_path: Path, release_dir: Path, group_id: Optional[int] = None, route: Optional[str] = None) -> Path:
+def _copy_source(repo_path: Path, release_dir: Path, group_id: Optional[int] = None, route: Optional[str] = None,
+                 excluded_roots: Sequence[str] = ()) -> Path:
     app_dir = release_dir / "app"
+    default_ignore = shutil.ignore_patterns(".git", "node_modules", ".venv", "__pycache__", ".pytest_cache")
+    def ignore(directory: str, names: List[str]) -> set:
+        excluded = set(default_ignore(directory, names))
+        if Path(directory) == repo_path:
+            excluded.update(name for name in names if name in excluded_roots or excluded_roots and name.startswith(".env"))
+        return excluded
     shutil.copytree(
         repo_path,
         app_dir,
         symlinks=True,
-        ignore=shutil.ignore_patterns(".git", "node_modules", ".venv", "__pycache__", ".pytest_cache"),
+        ignore=ignore,
     )
     _validate_copy_symlinks(app_dir)
     if route:
@@ -1031,6 +1038,26 @@ class NodeAdapter(FrameworkAdapter):
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
+def python_command(command: Sequence[str], app: Dict[str, Any], app_dir: Path) -> List[str]:
+    replacements = {
+        "{port}": str(app["port"]),
+        "{venv}": str(app_dir / ".venv" / "bin"),
+        "{base_path}": app.get("route", "/").rstrip("/"),
+    }
+    resolved = []
+    for argument in command:
+        for token, value in replacements.items():
+            argument = argument.replace(token, value)
+        if "{" in argument or "}" in argument or "$" in argument:
+            raise ValueError("Python commands accept only {port}, {venv}, and {base_path} substitutions; not shell expansion")
+        resolved.append(argument)
+    if "/" not in resolved[0] and "\\" not in resolved[0]:
+        executable = app_dir / ".venv" / "bin" / resolved[0]
+        if executable.is_file():
+            resolved[0] = str(executable)
+    return resolved
+
+
 class PythonAdapter(FrameworkAdapter):
     name = "python"
 
@@ -1050,7 +1077,8 @@ class PythonAdapter(FrameworkAdapter):
         log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         del log
-        app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
+        app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"),
+                       excluded_roots=("storage", "models") if app.get("python_services") else ())
         _run_build(runner, ["python3", "-m", "venv", ".venv"], app_dir, timeout, "Creating Python virtual environment")
         python = str(app_dir / ".venv" / "bin" / "python")
         if (app_dir / "requirements.txt").is_file():
@@ -1069,21 +1097,19 @@ class PythonAdapter(FrameworkAdapter):
                 timeout,
                 "Installing Python application",
             )
-        _run_build(
-            runner,
-            [python, "-m", "pip", "install", "--disable-pip-version-check", "gunicorn"],
-            app_dir,
-            timeout,
-            "Installing Gunicorn",
-        )
+        if not app.get("build_config", {}).get("start_command"):
+            _run_build(
+                runner,
+                [python, "-m", "pip", "install", "--disable-pip-version-check", "gunicorn"],
+                app_dir,
+                timeout,
+                "Installing Gunicorn",
+            )
         start = _configured_start(
             app,
             [str(app_dir / ".venv" / "bin" / "gunicorn"), "--bind", f"127.0.0.1:{app['port']}", "app:app"],
         )
-        if "/" not in start[0] and "\\" not in start[0]:
-            executable = app_dir / ".venv" / "bin" / start[0]
-            if executable.is_file():
-                start = [str(executable), *start[1:]]
+        start = python_command(start, app, app_dir)
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 

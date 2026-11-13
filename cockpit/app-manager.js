@@ -317,6 +317,9 @@
                 <button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>
                 <button type="button" data-action="health" data-id="${appId}"${runtimeUnavailable}>${icon("activity")} Check health</button>
                 <button type="button" data-action="preflight" data-id="${appId}"${unavailable}>${icon("search")} Run preflight</button>
+                ${app.python_services?.worker ? `<button type="button" data-action="worker-status" data-id="${appId}">${icon("activity")} Worker status</button>
+                <button type="button" data-action="worker-logs" data-id="${appId}">${icon("square-terminal")} Worker logs</button>
+                <button type="button" data-action="worker-restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart worker</button>` : ""}
                 <button type="button" data-action="metrics" data-id="${appId}">${icon("activity")} Metrics and storage</button>
                 <button type="button" data-action="edit" data-id="${appId}"${unavailable}>${icon("settings-2")} Edit configuration</button>
                 <button type="button" data-action="pull" data-id="${appId}"${unavailable}>${icon("download")} Pull repository</button>
@@ -541,7 +544,7 @@
         payload.build_config.start_command = command;
       }
       const environmentRows = parseEnvironmentContent(environment);
-      const reserved = new Set(["HOME", "PATH", "PORT", "HOST", "NODE_ENV", "APP_BASE_PATH", "APP_CONFIG_DIR", "APP_DATA_DIR"]);
+      const reserved = new Set(["HOME", "PATH", "PORT", "HOST", "NODE_ENV", "APP_BASE_PATH", "APP_CONFIG_DIR", "APP_DATA_DIR", "APP_MODELS_DIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "NUMBA_CACHE_DIR", "QT_QPA_PLATFORM"]);
       const blocked = environmentRows.find((row) => reserved.has(row.key) || row.key.startsWith("APP_STORAGE_"));
       if (blocked) throw new Error(`${blocked.key} is managed automatically and cannot be overridden.`);
       const content = serializeEnvironmentRows(environmentRows);
@@ -685,6 +688,17 @@
         <label>Build configuration (JSON object)<textarea name="build_config" rows="5">${escapeHtml(JSON.stringify(app.build_config || {}, null, 2))}</textarea></label>
         <label>Minimum runtime versions (JSON object)<textarea name="runtime_requirements" rows="3">${escapeHtml(JSON.stringify(app.runtime_requirements || {}, null, 2))}</textarea></label>
       </div></details>
+      <details class="am-advanced"><summary>Native Python services</summary><div class="am-form-grid">
+        <label class="am-checkbox"><input type="checkbox" name="native_python"${Object.keys(app.python_services || {}).length ? " checked" : ""}> Enable native Python services</label>
+        <label class="am-checkbox"><input type="checkbox" name="native_redis"${app.python_services?.redis ? " checked" : ""}> Administrator-provisioned private Redis</label>
+        <label class="am-checkbox"><input type="checkbox" name="native_drum"${app.python_services?.drum_prerequisites ? " checked" : ""}> Drum audio prerequisites</label>
+        <label>Worker command (JSON argument array)<textarea name="worker_command" rows="4">${escapeHtml(JSON.stringify(app.python_services?.worker?.command || []))}</textarea></label>
+        <label>Worker shutdown timeout (seconds)<input name="worker_timeout" type="number" min="10" max="3600" value="${escapeHtml(app.python_services?.worker?.stop_timeout_seconds ?? 300)}"></label>
+        ${Object.entries({ memory_mb: ["Worker memory (MiB)", 1024], cpu_percent: ["Worker CPU (%)", 100], tasks_max: ["Worker process limit", 256] }).map(([key, [label, fallback]]) => `<label>${label}<input type="number" name="worker_${key}" min="1" max="${key === "memory_mb" ? 1048576 : 10000}" value="${escapeHtml(app.python_services?.worker?.resource_limits?.[key] ?? fallback)}"></label>`).join("")}
+        <label>Model artifact paths (relative to shared/models)<textarea name="model_files" rows="3">${escapeHtml((app.python_services?.model_files || []).join("\n"))}</textarea></label>
+        <label>Upload body limit (MiB)<input name="upload_limit_mb" type="number" min="1" max="1024" value="${escapeHtml(app.python_services?.upload_limit_mb ?? 101)}"></label>
+        <label>Route access<select name="native_access"><option value="blocked"${app.python_services?.access_control !== "external-auth" ? " selected" : ""}>Blocked at Nginx</option><option value="external-auth"${app.python_services?.access_control === "external-auth" ? " selected" : ""}>Administrator-confirmed upstream authentication</option></select></label>
+      </div></details>
       <details class="am-advanced"><summary>Deployment schedule (UTC)</summary><div class="am-form-grid">
         <label>Window start<input type="time" name="window_start" value="${escapeHtml(app.deployment_window?.start || "")}"></label>
         <label>Window end<input type="time" name="window_end" value="${escapeHtml(app.deployment_window?.end || "")}"></label>
@@ -700,6 +714,22 @@
       payload.runtime_requirements = parseBuildConfig(payload.runtime_requirements || "{}");
       payload.required_environment = payload.required_environment.split(/[\s,]+/).filter(Boolean);
       payload.storage_directories = payload.storage_directories.split(/[\s,]+/).filter(Boolean);
+      payload.python_services = {};
+      if (form.elements.native_python.checked) {
+        let command;
+        try { command = JSON.parse(payload.worker_command || "[]"); } catch (_error) { throw new Error("Worker command must be a JSON argument array."); }
+        if (!Array.isArray(command)) throw new Error("Worker command must be a JSON argument array.");
+        payload.python_services = {
+          redis: form.elements.native_redis.checked, drum_prerequisites: form.elements.native_drum.checked,
+          model_files: payload.model_files.split(/[\s,]+/).filter(Boolean),
+          upload_limit_mb: Number(payload.upload_limit_mb), access_control: payload.native_access,
+          ...(command.length ? { worker: { command, stop_timeout_seconds: Number(payload.worker_timeout), resource_limits: {
+            memory_mb: Number(payload.worker_memory_mb), cpu_percent: Number(payload.worker_cpu_percent), tasks_max: Number(payload.worker_tasks_max),
+          } } } : {}),
+        };
+        if (payload.native_access === "external-auth" && !window.confirm("Confirm authentication/access control protects this entire application prefix and every route to the origin. CORS is not authentication.")) return false;
+      }
+      for (const key of ["native_python", "native_redis", "native_drum", "native_access", "worker_command", "worker_timeout", "worker_memory_mb", "worker_cpu_percent", "worker_tasks_max", "model_files", "upload_limit_mb"]) delete payload[key];
       payload.auto_deploy = form.elements.auto_deploy.checked;
       if (Boolean(payload.window_start) !== Boolean(payload.window_end)) throw new Error("Set both UTC deployment window times or leave both empty.");
       payload.deployment_window = payload.window_start ? { start: payload.window_start, end: payload.window_end } : {};
@@ -1268,6 +1298,16 @@
     }
     if (action === "logs") {
       showLogs(appId);
+      return;
+    }
+    if (["worker-status", "worker-logs", "worker-restart"].includes(action)) {
+      if (action === "worker-restart" && !window.confirm(`Restart the worker for "${app.name}"? Running work may be terminated after its shutdown timeout.`)) return;
+      await runOperation(async () => {
+        const result = await callBackend(action, [appId]);
+        openDialog(`Worker: ${app.name}`, action === "worker-logs"
+          ? `<pre class="am-log-output">${escapeHtml(result.logs || result.message || "No worker logs")}</pre>`
+          : `<dl class="am-settings-paths">${Object.entries(result.worker || {}).map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>`);
+      }, "", false);
       return;
     }
     if (action === "metrics" || action === "preflight" || action === "review-update" || action === "deploy" && app.deployment_mode === "approval") {

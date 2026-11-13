@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 try:
     import fcntl
@@ -48,9 +48,9 @@ except ImportError:  # pragma: no cover - Windows has no POSIX group database
     grp = None
 
 try:
-    from .adapters import detect_framework, get_adapter, inspect_project, validate_go_package
+    from .adapters import detect_framework, get_adapter, inspect_project, validate_go_package, python_command
 except ImportError:  # pragma: no cover - direct execution after installation
-    from adapters import detect_framework, get_adapter, inspect_project, validate_go_package
+    from adapters import detect_framework, get_adapter, inspect_project, validate_go_package, python_command
 
 APP_NAME = "app-manager"
 DEFAULT_STATE_ROOT = "/var/lib/cockpit/app-manager"
@@ -425,6 +425,62 @@ def _public_url_for_route(route: str) -> str:
     return f"{DEFAULT_PUBLIC_ORIGIN}{route}"
 
 
+def _validate_python_services(value: Any, framework: str, build: Dict[str, Any]) -> Dict[str, Any]:
+    if value == {}:
+        return {}
+    if not isinstance(value, dict) or set(value) - {"worker", "model_files", "redis", "drum_prerequisites", "upload_limit_mb", "access_control"}:
+        raise ValueError("python_services contains unsupported settings")
+    if framework != "python":
+        raise ValueError("python_services requires the explicit python framework")
+    command = build.get("start_command", [])
+    if command[:3] != ["{venv}/python", "-m", "uvicorn"]:
+        raise ValueError("Python services require an explicit {venv}/python -m uvicorn web command")
+    for flag, expected in (("--host", "127.0.0.1"), ("--port", "{port}")):
+        if command.count(flag) != 1 or command.index(flag) + 1 >= len(command) or command[command.index(flag) + 1] != expected:
+            raise ValueError(f"Uvicorn requires {flag} {expected}")
+    if any(part.startswith(("--host=", "--port=", "--fd", "--uds", "--env-file", "--reload")) for part in command):
+        raise ValueError("Uvicorn binding overrides, reload and environment files are not supported")
+    python_command(command, {"port": 8100}, Path("/release/app"))
+    result = dict(value)
+    for key in ("redis", "drum_prerequisites"):
+        if not isinstance(value.get(key, False), bool):
+            raise ValueError(f"python_services.{key} must be a boolean")
+    limit = value.get("upload_limit_mb", 101)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1024:
+        raise ValueError("upload_limit_mb must be an integer from 1 to 1024")
+    access = value.get("access_control", "blocked")
+    if access not in {"blocked", "external-auth"}:
+        raise ValueError("access_control must be blocked or external-auth (administrator-protected upstream)")
+    files = value.get("model_files", [])
+    if not isinstance(files, list) or len(files) > 32 or any(
+        not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)*", name)
+        or any(part in {".", ".."} for part in name.split("/")) for name in files
+    ):
+        raise ValueError("model_files must be relative artifact paths below shared/models")
+    if value.get("drum_prerequisites") and (not files or not value.get("redis")):
+        raise ValueError("Drum prerequisites require explicit model_files and redis=true")
+    worker = value.get("worker")
+    if worker is None:
+        result.pop("worker", None)
+    if worker is not None:
+        if not isinstance(worker, dict) or set(worker) - {"command", "resource_limits", "stop_timeout_seconds"}:
+            raise ValueError("worker must contain command, resource_limits and stop_timeout_seconds only")
+        args = worker.get("command")
+        if not isinstance(args, list) or not args or any(not isinstance(part, str) or not part or any(ord(char) < 32 or ord(char) == 127 for char in part) for part in args):
+            raise ValueError("Worker command must be an argument array")
+        if args[:3] != ["{venv}/python", "-m", "celery"] or args.count("worker") != 1 or args.count("--concurrency=1") != 1 or args.count("--pool=prefork") != 1:
+            raise ValueError("Worker requires {venv}/python -m celery ... worker --pool=prefork --concurrency=1")
+        if any(part.startswith(("-c", "-P", "-B", "-D", "--beat", "--detach", "--autoscale", "--pool", "--concurrency", "--config", "--workdir")) and part not in {"--pool=prefork", "--concurrency=1"} for part in args):
+            raise ValueError("Worker pool/concurrency overrides, detach and beat are not supported")
+        python_command(args, {"port": 8100}, Path("/release/app"))
+        timeout = worker.get("stop_timeout_seconds", 300)
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 10 <= timeout <= 3600:
+            raise ValueError("Worker stop timeout must be from 10 to 3600 seconds")
+        result["worker"] = {**worker, "resource_limits": _resource_limits(worker.get("resource_limits", {})), "stop_timeout_seconds": timeout}
+    result.update(upload_limit_mb=limit, access_control=access, model_files=files)
+    return result
+
+
 def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Application payload must be a JSON object")
@@ -475,6 +531,7 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Description must be a string of at most 2000 printable characters")
     result["description"] = description
     result["resource_limits"] = _resource_limits(payload.get("resource_limits", {}))
+    result["python_services"] = _validate_python_services(payload.get("python_services", {}), framework, build_config)
     enabled = payload.get("auto_deploy", True)
     if not isinstance(enabled, bool):
         raise ValueError("auto_deploy must be a boolean")
@@ -507,6 +564,10 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("deployment_mode must be automatic or approval")
     result.update(required_environment=list(dict.fromkeys(required)), runtime_requirements=requirements,
                   storage_directories=list(dict.fromkeys(["data", *storage])), deployment_mode=mode)
+    if result["python_services"] and "models" in storage:
+        raise ValueError("models is administrator-managed read-only storage, not a writable storage directory")
+    if result["python_services"].get("drum_prerequisites") and not {"uploads", "processed", "exports", "jobs"}.issubset(storage):
+        raise ValueError("Drum APIs require uploads, processed, exports and jobs persistent directories")
     if len(result["storage_directories"]) > 16:
         raise ValueError("storage_directories allows at most 16 names including data")
     if "port" in payload and payload["port"] is not None:
@@ -1522,6 +1583,12 @@ def _parse_environment_data(contents: str) -> Tuple[str, Dict[str, str]]:
             "APP_CONFIG_DIR",
             "APP_DATA_DIR",
             "APP_STORAGE_DIR",
+            "APP_MODELS_DIR",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+            "NUMBA_CACHE_DIR",
+            "QT_QPA_PLATFORM",
         }:
             raise ValueError(f"Environment key {key!r} is reserved by App Manager")
         if key.startswith("APP_STORAGE_"):
@@ -1696,7 +1763,7 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         if app.get("service_slot", "primary") not in {"primary", "secondary"}:
             raise ValueError("Invalid managed service slot in registry")
         normalized_policy = validate_app_payload(app)
-        for key in ("auto_deploy", "deployment_window", "resource_limits", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode"):
+        for key in ("auto_deploy", "deployment_window", "resource_limits", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode", "python_services"):
             app[key] = normalized_policy[key]
         expected_paths = _app_paths(app_id, config)
         expected_user = _account_name(app_id)
@@ -1796,6 +1863,7 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
             "runtime_requirements": normalized["runtime_requirements"],
             "storage_directories": normalized["storage_directories"],
             "deployment_mode": normalized["deployment_mode"],
+            "python_services": normalized["python_services"],
             "port": port,
             "public_url": None,
             "source_path": str(paths["source"]),
@@ -2198,6 +2266,8 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         current["slug"] = app_id
         candidate = {**current, **payload}
         normalized = validate_app_payload(candidate)
+        if app.get("python_services") and not normalized["python_services"] and app.get("deployments"):
+            raise ValueError("Cannot remove native Python policy from a deployed application; retain it to manage installed services safely")
         for other in registry["apps"]:
             if other.get("id") == app_id:
                 continue
@@ -2219,7 +2289,7 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError(f"Port {port} is already in use")
         with _registry_transaction() as registry2:
             app = _find_app(registry2, app_id)
-            for key in ("name", "repo_url", "branch", "framework", "route", "description", "health_check_url", "build_config", "resource_limits", "auto_deploy", "deployment_window", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode", "port", "public_url"):
+            for key in ("name", "repo_url", "branch", "framework", "route", "description", "health_check_url", "build_config", "resource_limits", "auto_deploy", "deployment_window", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode", "python_services", "port", "public_url"):
                 if key in normalized:
                     app[key] = normalized[key]
             app["slug"] = app_id
@@ -2230,6 +2300,8 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _service_path(app: Dict[str, Any]) -> Path:
     validate_app_id(app["id"])
+    if app.get("_worker"):
+        return Path("/etc/systemd/system") / f"cockpit-app-{app['id']}@worker.service"
     slot = app.get("service_slot", "primary")
     if slot not in {"primary", "secondary"}:
         raise ValueError("Invalid managed service slot")
@@ -2318,6 +2390,26 @@ def _render_service(
         else ""
     )
     limits = _resource_limits(app.get("resource_limits", {}))
+    worker = app.get("_worker", False)
+    services = app.get("python_services", {})
+    if worker:
+        limits = _resource_limits(services["worker"].get("resource_limits", {}))
+    native_environment = ""
+    if services:
+        native_environment = "".join(
+            f"Environment={_systemd_quote(key + '=' + value)}\n"
+            for key, value in {
+                "APP_MODELS_DIR": str(paths["storage"] / "models"),
+                "XDG_CACHE_HOME": str(paths["home"] / "cache"),
+                "XDG_CONFIG_HOME": str(paths["home"] / "config"),
+                "XDG_RUNTIME_DIR": str(paths["home"] / "qt-runtime"),
+                "NUMBA_CACHE_DIR": str(paths["home"] / "cache" / "numba"),
+                "QT_QPA_PLATFORM": "offscreen",
+            }.items()
+        )
+    log_prefix = "worker-" if worker else ""
+    shutdown = (f"KillSignal=SIGTERM\nKillMode=mixed\nSendSIGKILL=yes\nTimeoutStopSec={services['worker']['stop_timeout_seconds']}\n" if worker else "")
+    models_read_only = f"ReadOnlyPaths={_systemd_quote(str(paths['storage'] / 'models'))}\n" if services else ""
     storage_environment = "".join(
         f"Environment={_systemd_quote('APP_STORAGE_' + name.upper().replace('-', '_') + '=' + str(paths['storage'] / name))}\n"
         for name in app.get("storage_directories", ["data"])
@@ -2342,7 +2434,9 @@ def _render_service(
         f"Environment={_systemd_quote('APP_DATA_DIR=' + str(paths['storage'] / 'data'))}\n"
         f"Environment={_systemd_quote('APP_STORAGE_DIR=' + str(paths['storage']))}\n"
         f"{storage_environment}"
+        f"{native_environment}"
         f"Environment={_systemd_quote('HOME=' + str(paths['home']))}\n"
+        f"{shutdown}"
         "Restart=on-failure\n"
         "RestartSec=5\n"
         "MemoryAccounting=true\n"
@@ -2350,14 +2444,15 @@ def _render_service(
         f"MemoryMax={limits['memory_mb']}M\n"
         f"CPUQuota={limits['cpu_percent']}%\n"
         f"TasksMax={limits['tasks_max']}\n"
-        f"StandardOutput=append:{paths['logs'] / 'stdout.log'}\n"
-        f"StandardError=append:{paths['logs'] / 'stderr.log'}\n"
+        f"StandardOutput=append:{paths['logs'] / (log_prefix + 'stdout.log')}\n"
+        f"StandardError=append:{paths['logs'] / (log_prefix + 'stderr.log')}\n"
         "NoNewPrivileges=true\n"
         "PrivateTmp=true\n"
         "PrivateDevices=true\n"
         "ProtectSystem=strict\n"
         "ProtectHome=true\n"
         f"ReadOnlyPaths={_systemd_quote(str(paths['releases']))}\n"
+        f"{models_read_only}"
         "ProtectKernelTunables=true\n"
         "ProtectKernelModules=true\n"
         "ProtectControlGroups=true\n"
@@ -2381,6 +2476,7 @@ def _render_nginx_config(
     config: Optional[Dict[str, Any]] = None,
     route: Optional[str] = None,
     static_root: Optional[str] = None,
+    python_services: Optional[Dict[str, Any]] = None,
 ) -> str:
     app_id = validate_app_id(app_id)
     route = validate_app_route(route, app_id)
@@ -2425,6 +2521,8 @@ def _render_nginx_config(
             f"location ^~ {route} {{\n"
             f"{environment_guard}"
             f"    proxy_pass http://127.0.0.1:{port}{proxy_uri};\n"
+            + (f"    client_max_body_size {python_services['upload_limit_mb']}m;\n" + ("    deny all;\n" if python_services.get("access_control", "blocked") == "blocked" else "") if python_services else "")
+            +
             "    proxy_http_version 1.1;\n"
             "    proxy_set_header Host $host;\n"
             "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
@@ -2783,6 +2881,7 @@ def _activate_nginx_config_locked(
         config=config,
         route=app.get("route"),
         static_root=app.get("static_root"),
+        python_services=app.get("python_services"),
     )
     previous_content = _write_nginx_snippet(snippet_path, rendered)
     site_path: Optional[Path] = None
@@ -2873,7 +2972,7 @@ def _write_service(
     config: Dict[str, Any],
     working_directory: Optional[Path] = None,
 ) -> Path:
-    service = _render_service(app, start_command, config, working_directory, release_dir if "service_slot" in app else None)
+    service = _render_service(app, start_command, config, working_directory, release_dir if "service_slot" in app or app.get("python_services") else None)
     service_path = _service_path(app)
     _verified_service_bytes(app, service_path)
     service_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2915,6 +3014,60 @@ def _systemctl(*args: str, timeout: int = COMMAND_TIMEOUT_SECONDS) -> subprocess
     result = run_command(["systemctl", *args], timeout=timeout)
     _command_error(result, f"systemctl {' '.join(args)}")
     return result
+
+
+def _worker_app(app: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(app, _worker=True)
+
+
+def _assert_service_stopped(app: Dict[str, Any]) -> None:
+    result = _systemctl("show", _service_path(app).name,
+                        "--property=ActiveState,MainPID,ControlGroup", timeout=5)
+    state = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
+    if state.get("ActiveState") not in {"inactive", "failed"} or state.get("MainPID") != "0":
+        raise RuntimeError("Service is not confirmed stopped; retaining releases and refusing replacement")
+    group = state.get("ControlGroup")
+    if group:
+        if not group.startswith("/") or ".." in group.split("/"):
+            raise RuntimeError("Invalid service cgroup")
+        events = Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.events"
+        if not events.exists() or "populated 0" not in events.read_text(encoding="ascii").splitlines():
+            raise RuntimeError("Service cgroup is not confirmed empty; retaining releases")
+
+
+def _assert_worker_stopped(app: Dict[str, Any]) -> None:
+    _assert_service_stopped(_worker_app(app))
+
+
+def _stop_worker(app: Dict[str, Any]) -> None:
+    worker_app = _worker_app(app)
+    unit = _service_path(worker_app)
+    _verified_service_bytes(app, unit)
+    timeout = app.get("python_services", {}).get("worker", {}).get("stop_timeout_seconds", 3600)
+    _systemctl("stop", unit.name, timeout=timeout + 15)
+    _assert_worker_stopped(app)
+
+
+def _start_worker(app: Dict[str, Any]) -> None:
+    unit = _service_path(_worker_app(app))
+    _verified_service_bytes(app, unit)
+    _assert_worker_stopped(app)
+    _systemctl("enable", unit.name)
+    _systemctl("start", unit.name)
+    result = _systemctl("show", unit.name, "--property=ActiveState", "--value", timeout=5)
+    if result.stdout.strip() != "active":
+        raise RuntimeError("Worker failed to become active; inspect worker logs")
+
+
+def _stop_native_runtime(app: Dict[str, Any]) -> None:
+    worker = _service_path(_worker_app(app))
+    if worker.exists():
+        _stop_worker(app)
+    web = _service_path(app)
+    if web.exists():
+        _verified_service_bytes(app, web)
+        _systemctl("stop", web.name)
+        _assert_service_stopped(app)
 
 
 def _atomic_symlink(target: Path, link_path: Path) -> None:
@@ -3213,6 +3366,19 @@ def _setup_app_directories(app: Dict[str, Any], username: str, config: Dict[str,
 
     _, group_id = _account_ids(username)
     _setup_persistent_storage(app, username, config)
+    if app.get("python_services"):
+        models = paths["storage"] / "models"
+        _assert_no_symlink_components(models)
+        models.mkdir(mode=0o750, exist_ok=True)
+        os.chown(str(models), 0, group_id)
+        os.chmod(str(models), 0o750)
+        uid, _ = _account_ids(username)
+        for relative in ("cache", "cache/numba", "config", "qt-runtime"):
+            directory = paths["home"] / relative
+            _assert_no_symlink_components(directory)
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chown(str(directory), uid, group_id)
+            os.chmod(str(directory), 0o700)
     public_releases = {
         _resolved_path(Path(item["release"]))
         for item in app.get("deployments", [])
@@ -3512,7 +3678,8 @@ def abort_deployment_app(app_id: str, deployment_id: str) -> Dict[str, Any]:
     _append_deployment_log(log_path, "Abort requested")
     aborted = _abort_interrupted_deployment(app_id, deployment_id)
     if aborted:
-        _append_deployment_log(log_path, "Interrupted deployment marked aborted; application runtime left unchanged")
+        recovered = _find_app(get_registry(), app_id)["deployments"][0]
+        _append_deployment_log(log_path, recovered.get("error") or "Interrupted deployment marked aborted")
     return {"ok": True, "app_id": app_id, "deployment_id": deployment_id, "aborting": not aborted, "aborted": aborted}
 
 
@@ -3549,6 +3716,12 @@ def _abort_interrupted_deployment(app_id: str, deployment_id: str) -> bool:
                 or properties.get("Job") not in {"", "0"}
             ):
                 return False
+            if latest.get("runtime_activation"):
+                latest.update({"status": "failed", "build_status": "failed", "abortable": False,
+                    "error": "Native runtime activation was interrupted; inspect API and worker together before retrying. All releases and persistent data retained"})
+                app["status"] = "failed"
+                app["updated_at"] = now_iso()
+                return True
             latest.update({
                 "status": "aborted", "build_status": "aborted", "abortable": False,
                 "error": "Deployment worker exited before completing cancellation; application runtime left unchanged",
@@ -3645,11 +3818,42 @@ def _deployment_preflight(app: Dict[str, Any], source: Path, username: str, conf
     return report
 
 
+def _python_prerequisites(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    settings = app.get("python_services", {})
+    if not settings:
+        return {"checks": [], "errors": [], "warnings": [], "passed": True}
+    paths = _app_paths(app["id"], config)
+    for relative in ["", *settings.get("model_files", [])]:
+        _assert_no_symlink_components(paths["storage"] / "models" / relative)
+    try:
+        result = _run_as_user(app["service_user"], ["python3", "-I", str(Path(__file__).with_name("runtime_checks.py")),
+            json.dumps(settings), str(paths["storage"] / "models")], timeout=30,
+            environment=_environment_values_app(app["id"]), preserve_stdout=True)
+        if result.returncode:
+            raise ValueError("Probe failed")
+        report = json.loads(result.stdout)
+        if not isinstance(report, dict) or not isinstance(report.get("checks"), list) or not isinstance(report.get("errors"), list):
+            raise ValueError("Invalid probe response")
+        return report
+    except (OSError, RuntimeError, ValueError):
+        message = "Cannot run Python prerequisite checks as the application account; provision Python and deploy/setup the account first"
+        return {"checks": [{"name": "Python prerequisites", "passed": False, "message": message}], "errors": [message], "warnings": [], "passed": False}
+
+
+def prerequisites_app(app_id: str) -> Dict[str, Any]:
+    _require_root()
+    app = dict(_find_app(get_registry(), app_id))
+    report = _python_prerequisites(app, get_config())
+    return {"ok": True, "checked_at": now_iso(), **report}
+
+
 def preflight_app(app_id: str) -> Dict[str, Any]:
     _require_root()
     config = get_config()
     with _app_lock(app_id):
         app = dict(_find_app(get_registry(), app_id))
+        if app.get("python_services"):
+            return prerequisites_app(app_id)
         host = _host_preflight(app, config)
         if host["errors"]:
             return {"ok": True, "passed": False, "checked_at": now_iso(), **host}
@@ -3766,6 +3970,12 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
         previous_unit_path = _service_path(previous_app)
         old_service_retired = True
         route_activated = False
+        native = bool(app_snapshot.get("python_services"))
+        worker_path = _service_path(_worker_app(app_snapshot))
+        previous_worker_content = None
+        previous_worker_active = False
+        native_activation = False
+        native_recovered = False
         try:
             deployment_log = _deployment_log_path(app_id, release_id, create=True)
             _prune_deployment_logs(app_id, release_id)
@@ -3782,6 +3992,14 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             username = ensure_app_user(app_id)
             paths = _setup_app_directories(app_snapshot, username, config)
             current_release = paths["current"].resolve(strict=False) if paths["current"].exists() or paths["current"].is_symlink() else None
+            if native:
+                previous_worker_content = _verified_service_bytes(app_snapshot, worker_path)
+                if previous_worker_content is not None:
+                    state = _systemctl("show", worker_path.name, "--property=ActiveState", "--value", timeout=5)
+                    previous_worker_active = state.stdout.strip() == "active"
+                prerequisites = _python_prerequisites(app_snapshot, config)
+                if prerequisites["errors"]:
+                    raise RuntimeError("Python prerequisites failed: " + "; ".join(prerequisites["errors"]))
             _validate_approval(app_snapshot, approved_commit)
             host_report = _host_preflight(app_snapshot, config)
             if host_report["errors"]:
@@ -3821,7 +4039,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             service_path = _service_path(app_snapshot)
             previous_service_content = _verified_service_bytes(app_snapshot, service_path)
             expects_runtime = framework != "static" or bool(app_snapshot.get("build_config", {}).get("start_command"))
-            if expects_runtime and current_release is not None and previous_service_content is not None and previous_app.get("status") == "running":
+            if not native and expects_runtime and current_release is not None and previous_service_content is not None and previous_app.get("status") == "running":
                 staged = True
                 old_service_retired = False
                 with _registry_transaction() as registry:
@@ -3901,6 +4119,20 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                     raise RuntimeError("Framework adapter returned a non-directory working directory")
                 working_directory = paths["current"] / "app" / relative_build_directory
             if runtime_required:
+                if native:
+                    with _registry_transaction() as registry:
+                        _find_app(registry, app_id)["deployments"][0]["runtime_activation"] = True
+                    record["runtime_activation"] = True
+                    native_activation = True
+                    _append_deployment_log(deployment_log, "Stopping worker and API for coordinated activation; worker updates are not zero-downtime")
+                    _stop_native_runtime(app_snapshot)
+                    if app_snapshot["python_services"].get("worker"):
+                        worker_command = python_command(app_snapshot["python_services"]["worker"]["command"], app_snapshot, release_dir / "app")
+                        _write_service(_worker_app(app_snapshot), release_dir,
+                                       _release_command_path(worker_command, release_dir, paths["current"]), config)
+                    elif previous_worker_content is not None:
+                        _systemctl("disable", worker_path.name)
+                        _restore_service_file(worker_path, None)
                 _write_service(app_snapshot, release_dir, command, config, working_directory)
                 unit_written = True
                 _systemctl("daemon-reload")
@@ -3922,6 +4154,8 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
                     raise RuntimeError(_startup_failure(app_snapshot, config, Path(build_result["start_command"][0])))
                 _assert_loopback_binding(app_snapshot, int(config["command_timeout_seconds"]))
+                if native and app_snapshot["python_services"].get("worker"):
+                    _start_worker(app_snapshot)
             elif hosting_framework == "static":
                 static_release_root = release_dir / "app" / _static_root_relative_path(static_root)
                 if not (static_release_root / "index.html").is_file():
@@ -3981,7 +4215,27 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                     _append_deployment_log(deployment_log, message)
             rollback_error = None
             try:
-                if staged:
+                if native_activation:
+                    _stop_native_runtime(app_snapshot)
+                    if service_path is not None:
+                        _restore_service_file(service_path, previous_service_content)
+                    _restore_service_file(worker_path, previous_worker_content)
+                    if paths is not None:
+                        if current_release is not None and current_release.is_dir():
+                            _atomic_symlink(current_release, paths["current"])
+                        elif paths["current"].is_symlink():
+                            paths["current"].unlink()
+                    _systemctl("daemon-reload")
+                    if previous_service_content is not None and previous_app.get("status") == "running":
+                        _systemctl("restart", service_path.name)
+                        if not _wait_for_health(previous_app, int(config["health_timeout_seconds"])):
+                            raise RuntimeError("Previous API did not recover its health check; worker remains stopped")
+                    if previous_worker_content is not None and previous_worker_active:
+                        _start_worker(previous_app)
+                    if route_activated:
+                        _activate_nginx_config(previous_app, previous_app["framework"], config)
+                    native_recovered = True
+                elif staged:
                     if route_activated:
                         previous_route_app = dict(previous_app, route=previous_app.get("active_route") or previous_app["route"])
                         previous_framework = "static" if _is_static_app(previous_app) else previous_app["framework"]
@@ -3997,7 +4251,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                     _systemctl("daemon-reload")
                     if not runtime_required and previous_service_content is not None:
                         _systemctl("enable", service_path.name)
-                if not staged and activation_attempted and paths is not None and current_release is not None and current_release.is_dir():
+                if not native_recovered and not staged and activation_attempted and paths is not None and current_release is not None and current_release.is_dir():
                     _atomic_symlink(current_release, paths["current"])
                     if previous_service_content is not None and service_path is not None:
                         if app_snapshot.get("status") == "running":
@@ -4010,14 +4264,14 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                     else:
                         if runtime_required and service_path is not None:
                             _systemctl("stop", service_path.name)
-                elif not staged and activation_attempted and previous_service_content is None:
+                elif not native_recovered and not staged and activation_attempted and previous_service_content is None:
                     if paths is not None and paths["current"].is_symlink():
                         paths["current"].unlink()
                     if runtime_required and service_path is not None:
                         _systemctl("stop", service_path.name)
             except Exception as rollback_exc:
                 rollback_error = str(rollback_exc)
-            if activation_attempted and current_release is None and runtime_required and service_path is not None:
+            if not native and activation_attempted and current_release is None and runtime_required and service_path is not None:
                 with contextlib.suppress(Exception):
                     _systemctl("disable", "--now", service_path.name)
             record.update({
@@ -4116,20 +4370,43 @@ def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any
         if not service_path.exists():
             raise RuntimeError("Application service is not installed")
         previous_running = app.get("status") == "running"
+        native = bool(app.get("python_services"))
+        worker_path = _service_path(_worker_app(app))
+        saved_web = _verified_service_bytes(app, service_path) if native else None
+        saved_worker = _verified_service_bytes(app, worker_path) if native else None
         try:
+            if native:
+                _stop_native_runtime(app)
+                command = python_command(app["build_config"]["start_command"], app, release / "app")
+                _write_service(app, release, _release_command_path(command, release, paths["current"]), config)
+                if app["python_services"].get("worker"):
+                    command = python_command(app["python_services"]["worker"]["command"], app, release / "app")
+                    _write_service(_worker_app(app), release, _release_command_path(command, release, paths["current"]), config)
+                _systemctl("daemon-reload")
             _atomic_symlink(release, paths["current"])
             _systemctl("restart", service_path.name)
             if not _wait_for_health(app, int(config["health_timeout_seconds"])):
                 raise RuntimeError("Rolled-back application did not pass its health check")
+            if native:
+                _assert_loopback_binding(app, int(config["command_timeout_seconds"]))
+                if app["python_services"].get("worker"):
+                    _start_worker(app)
         except Exception as exc:
             recovery_error = None
             try:
+                if native:
+                    _stop_native_runtime(app)
+                    _restore_service_file(service_path, saved_web)
+                    _restore_service_file(worker_path, saved_worker)
+                    _systemctl("daemon-reload")
                 if current_release is not None and current_release.is_dir():
                     _atomic_symlink(current_release, paths["current"])
                     if previous_running:
                         _systemctl("restart", service_path.name)
                         if not _wait_for_health(app, int(config["health_timeout_seconds"])):
                             raise RuntimeError("The previous release did not recover its health check")
+                        if native and saved_worker is not None:
+                            _start_worker(app)
                     else:
                         _systemctl("stop", service_path.name)
                 else:
@@ -4157,7 +4434,8 @@ def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any
                 "status": "rolled_back",
                 "error": None,
             })
-        return {"ok": True, "app_id": app_id, "release": str(release), "service_user": username}
+        return {"ok": True, "app_id": app_id, "release": str(release), "service_user": username,
+            "warning": "Code rollback cannot undo persistent-data changes; restore a consistent backup separately if needed"}
 
 
 def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
@@ -4188,23 +4466,36 @@ def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
         service_path = _service_path(app_snapshot)
         if not service_path.exists():
             raise RuntimeError(f"Application service {service_path.name} is not installed; deploy it first")
-        _systemctl(action_name, service_path.name)
+        native = bool(app_snapshot.get("python_services"))
         active_app = dict(app_snapshot, route=app_snapshot.get("active_route") or app_snapshot["route"])
-        if action_name in {"start", "restart"}:
-            try:
+        try:
+            if native:
+                _verified_service_bytes(app_snapshot, service_path)
+                if action_name in {"stop", "restart"}:
+                    _stop_native_runtime(app_snapshot)
+            if action_name != "stop" or not native:
+                _systemctl(action_name, service_path.name)
+            if action_name in {"start", "restart"}:
                 if not _wait_for_health(active_app, int(config["health_timeout_seconds"])):
                     raise RuntimeError(f"Application did not pass its health check after {action_name}")
                 _assert_loopback_binding(active_app, int(config["command_timeout_seconds"]))
-            except RuntimeError:
-                try:
+                if native and _service_path(_worker_app(app_snapshot)).exists():
+                    if action_name == "start":
+                        _stop_worker(app_snapshot)
+                    _start_worker(app_snapshot)
+        except (RuntimeError, OSError):
+            try:
+                if native:
+                    _stop_native_runtime(app_snapshot)
+                else:
                     _systemctl("stop", service_path.name)
-                finally:
-                    with _registry_transaction() as registry:
-                        stored = _find_app(registry, app_id)
-                        stored["status"] = "failed"
-                        stored["updated_at"] = now_iso()
-                        stored.pop("health", None)
-                raise
+            finally:
+                with _registry_transaction() as registry:
+                    stored = _find_app(registry, app_id)
+                    stored["status"] = "failed"
+                    stored["updated_at"] = now_iso()
+                    stored.pop("health", None)
+            raise
         status = "stopped" if action_name == "stop" else "running"
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
@@ -4226,15 +4517,43 @@ def restart_app(app_id: str) -> Dict[str, Any]:
     return _service_action(app_id, "restart")
 
 
-def logs_app(app_id: str, lines: int = 100) -> Dict[str, Any]:
+def worker_status_app(app_id: str) -> Dict[str, Any]:
+    app = _find_app(get_registry(), app_id)
+    if not app.get("python_services", {}).get("worker"):
+        raise ValueError("No worker is configured")
+    unit = _service_path(_worker_app(app))
+    result = _systemctl("show", unit.name, "--property=ActiveState,SubState,MemoryCurrent,TasksCurrent,NRestarts", timeout=5)
+    properties = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
+    return {"ok": True, "app_id": app_id, "unit": unit.name, "worker": properties}
+
+
+def restart_worker_app(app_id: str) -> Dict[str, Any]:
+    _require_root()
+    with _app_lock(app_id):
+        app = _find_app(get_registry(), app_id)
+        if not app.get("python_services", {}).get("worker"):
+            raise ValueError("No worker is configured")
+        _stop_worker(app)
+        try:
+            _start_worker(app)
+        except Exception:
+            _stop_worker(app)
+            raise
+    return worker_status_app(app_id)
+
+
+def logs_app(app_id: str, lines: int = 100, *, worker: bool = False) -> Dict[str, Any]:
     validate_app_id(app_id)
     if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= 1000:
         raise ValueError("Log line count must be between 1 and 1000")
     app = _find_app(get_registry(), app_id)
     config = get_config()
     paths = _app_paths(app_id, config)
-    stdout_log = paths["logs"] / "stdout.log"
-    stderr_log = paths["logs"] / "stderr.log"
+    if worker and not app.get("python_services", {}).get("worker"):
+        raise ValueError("No worker is configured")
+    prefix = "worker-" if worker else ""
+    stdout_log = paths["logs"] / (prefix + "stdout.log")
+    stderr_log = paths["logs"] / (prefix + "stderr.log")
     output = _tail_log(stdout_log, lines)
     errors = _tail_log(stderr_log, lines)
     combined = []
@@ -4251,15 +4570,26 @@ def logs_app(app_id: str, lines: int = 100) -> Dict[str, Any]:
         ),
         None,
     )
-    if latest is not None:
+    if latest is not None and not worker:
         deployment_path = _deployment_log_path(app_id, latest["id"])
         deployment_output = _tail_log(deployment_path, lines)
         if deployment_output:
             combined.append("[latest deployment]\n" + deployment_output)
+    text = "\n".join(combined)
+    if app.get("python_services"):
+        environment = _environment_values_app(app_id)
+        sensitive = list(environment.values())
+        if environment.get("REDIS_URL"):
+            try:
+                parsed = urlsplit(environment["REDIS_URL"])
+                sensitive.extend(unquote(value) for value in (parsed.username, parsed.password) if value)
+            except ValueError:
+                pass
+        text = _redact_text(text, sensitive)
     return {
         "ok": True,
         "app_id": app_id,
-        "logs": "\n".join(combined),
+        "logs": text,
         "message": None if combined else "No application logs are available",
     }
 
@@ -4450,6 +4780,13 @@ def remove_app(app_id: str) -> Dict[str, Any]:
         paths, private_gid = _validate_app_removal_paths(app, config)
         _remove_nginx_config(app_id, config)
         _retire_legacy_root_service(app)
+        if app.get("python_services"):
+            _stop_native_runtime(app)
+            worker_path = _service_path(_worker_app(app))
+            if worker_path.exists():
+                _systemctl("disable", worker_path.name)
+                _restore_service_file(worker_path, None)
+                _systemctl("daemon-reload")
         for slot in ("primary", "secondary"):
             service_path = _service_path(dict(app, service_slot=slot))
             if service_path.exists():
@@ -4540,7 +4877,7 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy = commands.add_parser("deploy")
     deploy.add_argument("app_id")
     deploy.add_argument("--deployment-id")
-    for name in ("pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "open", "preflight", "metrics", "review-update"):
+    for name in ("pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "open", "preflight", "prerequisites", "worker-status", "worker-restart", "worker-logs", "metrics", "review-update"):
         command = commands.add_parser(name)
         command.add_argument("app_id")
     logs = commands.add_parser("logs")
@@ -4595,6 +4932,12 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         return action(args.app_id, args.action_name)
     if args.command == "logs":
         return logs_app(args.app_id, args.lines)
+    if args.command == "worker-logs":
+        return logs_app(args.app_id, worker=True)
+    if args.command == "worker-status":
+        return worker_status_app(args.app_id)
+    if args.command == "worker-restart":
+        return restart_worker_app(args.app_id)
     if args.command == "rollback":
         return rollback_app(args.app_id, args.release_id)
     if args.command in {"health", "health-check", "check-health"}:
@@ -4603,6 +4946,8 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         return open_app(args.app_id)
     if args.command == "preflight":
         return preflight_app(args.app_id)
+    if args.command == "prerequisites":
+        return prerequisites_app(args.app_id)
     if args.command == "metrics":
         return metrics_app(args.app_id)
     if args.command == "review-update":

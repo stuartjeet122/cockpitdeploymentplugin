@@ -374,7 +374,7 @@ test("application editing submits automatic deployment policy and numeric resour
   try {
     ui.document.querySelector('[data-action="edit"][data-id="portal"]').click();
     const form = ui.document.querySelector(".am-dialog-form");
-    assert.equal(form.querySelectorAll("details:not([open])").length, 3);
+    assert.equal(form.querySelectorAll("details:not([open])").length, 4);
     assert.equal(form.elements.auto_deploy.closest("label").className, "am-checkbox");
     form.elements.port.value = "8080";
     form.checkValidity();
@@ -429,7 +429,6 @@ test("successful service transitions override older health observations", async 
     assert.equal(ui.document.querySelectorAll(".am-app-card").length, 0);
   } finally { ui.dom.window.close(); }
 });
-
 test("forbidden public probes are blocked without marking a healthy runtime failed", async () => {
   const ui = await loadUi({ list: { apps: [{ ...fixtureApps[0], health: {
     checked_at: new Date().toISOString(), service_state: "active", local_healthy: true,
@@ -1013,12 +1012,37 @@ test("setup rejects managed storage variables before registration", async () => 
     form.elements.name.value = "Shop";
     form.elements.name.dispatchEvent(new ui.window.Event("input"));
     ui.document.querySelector("#setupNext").click();
-    for (const key of ["APP_DATA_DIR", "APP_STORAGE_DIR", "APP_STORAGE_UPLOADS"]) {
+    for (const key of ["APP_DATA_DIR", "APP_STORAGE_DIR", "APP_STORAGE_UPLOADS", "APP_MODELS_DIR", "NUMBA_CACHE_DIR", "XDG_RUNTIME_DIR"]) {
       form.elements.environment.value = `${key}=/tmp/unmanaged`;
       ui.document.querySelector("#setupNext").click();
       assert.equal(form.querySelector('[data-setup-step="1"]').hidden, false);
       assert.match(ui.document.querySelector(".am-dialog-error").textContent, /managed automatically/);
     }
     assert.equal(ui.calls.some((record) => record.command === "add"), false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("native Python configuration and worker operations use structured commands", async () => {
+  const native = { redis: true, model_files: ["oaf/model.onnx"], access_control: "blocked", worker: { command: ["{venv}/python", "-m", "celery", "worker", "--pool=prefork", "--concurrency=1"], resource_limits: { memory_mb: 4096 } } };
+  const ui = await loadUi({ list: { apps: [{ ...fixtureApps[0], framework: "python", python_services: native }] }, "worker-status": { worker: { ActiveState: "active" } }, "worker-logs": { logs: "worker-only output" } });
+  try {
+    ui.document.querySelector('[data-action="worker-status"]').click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /active/);
+    ui.document.querySelector('[data-action="worker-logs"]').click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerDialog").textContent, /worker-only output/);
+    ui.document.querySelector('[data-action="edit"]').click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    assert.equal(form.elements.native_python.checked, true);
+    assert.equal(form.elements.worker_memory_mb.value, "4096");
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const payload = JSON.parse(ui.calls.find(record => record.command === "edit").values[1]);
+    assert.deepEqual(payload.python_services.worker.command, native.worker.command);
+    assert.equal(payload.python_services.worker.resource_limits.memory_mb, 4096);
+    assert.equal(payload.python_services.upload_limit_mb, 101);
+    assert.equal(payload.python_services.access_control, "blocked");
+    assert.equal(payload.worker_command, undefined);
   } finally { ui.dom.window.close(); }
 });

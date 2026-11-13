@@ -1,5 +1,5 @@
 # Managed by Cockpit App Manager
-/var/log/cockpit-app-manager/*/stdout.log /var/log/cockpit-app-manager/*/stderr.log {
+/var/log/cockpit-app-manager/*/stdout.log /var/log/cockpit-app-manager/*/stderr.log /var/log/cockpit-app-manager/*/worker-stdout.log /var/log/cockpit-app-manager/*/worker-stderr.log {
     daily
     maxsize 10M
     rotate 5
