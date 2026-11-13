@@ -1038,6 +1038,13 @@ class NodeAdapter(FrameworkAdapter):
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
 
 
+def python_interpreter(build_config: Dict[str, Any]) -> str:
+    executable = build_config.get("python_interpreter", "python3")
+    if not isinstance(executable, str) or not re.fullmatch(r"python3(?:\.(?:9|[1-9][0-9]))?", executable):
+        raise ValueError("build_config.python_interpreter must be python3 or a versioned system command such as python3.12")
+    return executable
+
+
 def python_command(command: Sequence[str], app: Dict[str, Any], app_dir: Path) -> List[str]:
     replacements = {
         "{port}": str(app["port"]),
@@ -1079,7 +1086,8 @@ class PythonAdapter(FrameworkAdapter):
         del log
         app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"),
                        excluded_roots=("storage", "models") if app.get("python_services") else ())
-        _run_build(runner, ["python3", "-m", "venv", ".venv"], app_dir, timeout, "Creating Python virtual environment")
+        interpreter = python_interpreter(app.get("build_config", {}))
+        _run_build(runner, [interpreter, "-m", "venv", ".venv"], app_dir, timeout, "Creating Python virtual environment")
         python = str(app_dir / ".venv" / "bin" / "python")
         if (app_dir / "requirements.txt").is_file():
             _run_build(

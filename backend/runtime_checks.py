@@ -50,7 +50,9 @@ def check_runtime(settings: dict, models: Path) -> dict:
         checks.append({"name": name, "passed": passed, "message": success if passed else failure})
 
     minimum = (3, 11) if settings.get("drum_prerequisites") else (3, 9)
-    check("Python", lambda: sys.version_info >= minimum, "Supported Python", f"Administrator must provision Python {minimum[0]}.{minimum[1]} or newer")
+    supported = sys.version_info[:2] >= minimum and (not settings.get("drum_prerequisites") or sys.version_info[:2] <= (3, 13))
+    version_requirement = "Python 3.11-3.13 for the pinned drum dependencies" if settings.get("drum_prerequisites") else "Python 3.9 or newer"
+    check("Python", lambda: supported, "Supported Python", f"Administrator must provision {version_requirement} and select it with build_config.python_interpreter")
     check("venv", lambda: all(importlib.util.find_spec(name) is not None for name in ("venv", "ensurepip")),
           "venv and ensurepip available", "Administrator must provision matching Python venv/ensurepip support")
     if settings.get("redis"):

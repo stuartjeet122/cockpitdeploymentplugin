@@ -140,10 +140,12 @@ class AppManagerTests(unittest.TestCase):
     def test_python_prerequisites_are_unprivileged_nonmutating_and_secret_free(self):
         app = manager.validate_app_payload(self.python_payload())
         app.update(port=8123, service_user="app-drums")
+        app["build_config"]["python_interpreter"] = "python3.12"
         report = {"checks": [], "errors": [], "warnings": [], "passed": True}
         with patch.object(manager, "_environment_values_app", return_value={"REDIS_URL": "redis://:secret@localhost/4"}), patch.object(manager, "_run_as_user", return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps(report))) as run:
             self.assertTrue(manager._python_prerequisites(app, manager.get_config())["passed"])
         self.assertEqual(run.call_args.args[0], "app-drums")
+        self.assertEqual(run.call_args.args[1][0], "python3.12")
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
         self.assertNotIn("secret", str(run.call_args.args))
         from backend.runtime_checks import redis_ping, check_runtime
@@ -154,6 +156,42 @@ class AppManagerTests(unittest.TestCase):
             result = check_runtime({"redis": True}, Path("/models"))
         self.assertFalse(result["passed"])
         self.assertNotIn("secret", json.dumps(result))
+
+    def test_python_interpreter_validation_and_preflight_use_the_selected_version(self):
+        payload = self.python_payload()
+        payload["build_config"]["python_interpreter"] = "python3.12"
+        app = manager.validate_app_payload(payload)
+        self.assertEqual(app["build_config"]["python_interpreter"], "python3.12")
+        with tempfile.TemporaryDirectory() as temporary, patch.object(manager, "_host_preflight", return_value={"checks": [], "errors": [], "warnings": []}), patch.object(manager, "_run_as_user", return_value=subprocess.CompletedProcess([], 0, stdout="Python 3.12.8", stderr="")) as run:
+            source = Path(temporary)
+            (source / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+            report = manager._deployment_preflight(app, source, "app-drums", manager.get_config())
+        run.assert_called_once_with("app-drums", ["python3.12", "--version"], timeout=10)
+        self.assertTrue(report["passed"])
+        self.assertIn("python3.12", report["checks"][0]["message"])
+        payload["build_config"]["python_interpreter"] = "/tmp/python3.12"
+        with self.assertRaises(ValueError):
+            manager.validate_app_payload(payload)
+
+    def test_drum_prerequisites_reject_python_outside_the_pinned_dependency_range(self):
+        from backend.runtime_checks import check_runtime
+        for version, supported in (((3, 10), False), ((3, 11), True), ((3, 12), True), ((3, 13), True), ((3, 14), False)):
+            with self.subTest(version=version), patch("backend.runtime_checks.sys.version_info", version), patch("backend.runtime_checks.shutil.which", return_value=None), patch("backend.runtime_checks.ctypes.CDLL", side_effect=OSError), patch("backend.runtime_checks.subprocess.run", side_effect=OSError):
+                result = check_runtime({"drum_prerequisites": True}, Path("/models"))
+                self.assertEqual(result["checks"][0]["passed"], supported)
+                if not supported:
+                    self.assertIn("Python 3.11-3.13", result["checks"][0]["message"])
+
+    def test_missing_selected_python_fails_preflight_without_falling_back(self):
+        app = manager.validate_app_payload(self.python_payload())
+        app["build_config"]["python_interpreter"] = "python3.12"
+        with tempfile.TemporaryDirectory() as temporary, patch.object(manager, "_host_preflight", return_value={"checks": [], "errors": [], "warnings": []}), patch.object(manager, "_run_as_user", side_effect=FileNotFoundError("python3.12 missing")) as run:
+            source = Path(temporary)
+            (source / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+            report = manager._deployment_preflight(app, source, "app-drums", manager.get_config())
+        self.assertFalse(report["passed"])
+        self.assertIn("python3.12", report["errors"][0])
+        run.assert_called_once_with("app-drums", ["python3.12", "--version"], timeout=10)
 
     def test_redis_probe_only_authenticates_selects_and_pings_with_timeouts(self):
         from backend.runtime_checks import redis_ping
@@ -3669,6 +3707,23 @@ class FrameworkAdapterTests(unittest.TestCase):
             result = get_adapter("python").build({"port": 8123}, source, root / "release", runner=runner)
             self.assertEqual(result["start_command"], [str(root / "release" / "app" / ".venv" / "bin" / "gunicorn"), "--bind", "127.0.0.1:8123", "app:app"])
             self.assertEqual(runner.call_args_list[0].args[0], ["python3", "-m", "venv", ".venv"])
+
+    def test_python_uses_explicit_versioned_interpreter_only_for_venv_creation(self):
+        from backend.adapters import python_interpreter
+        for invalid in (None, "python", "python3.8", "/usr/bin/python3.12", "python3.12 -I", "../python3.12", "python3.12;id"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                python_interpreter({"python_interpreter": invalid})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "requirements.txt").write_text("flask\n", encoding="utf-8")
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+            result = get_adapter("python").build(
+                {"port": 8123, "build_config": {"python_interpreter": "python3.12"}}, source, root / "release", runner=runner)
+            self.assertEqual(runner.call_args_list[0].args[0], ["python3.12", "-m", "venv", ".venv"])
+            self.assertEqual(runner.call_args_list[1].args[0][0], str(root / "release" / "app" / ".venv" / "bin" / "python"))
+            self.assertIn(".venv", result["start_command"][0])
 
     def test_python_asgi_substitutions_do_not_use_a_shell_or_install_gunicorn(self):
         with tempfile.TemporaryDirectory() as temporary:

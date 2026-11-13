@@ -247,6 +247,19 @@ Public registry downloads are shared across applications. Each app keeps its own
 
 Inspect cache failures with `journalctl -u cockpit-app-manager-npm-cache.service`. Ordinary uninstall stops/removes the verified cache unit and configuration but retains cached downloads; destructive app cleanup also leaves this shared cache untouched. Cache/state directories may be removed manually by an administrator only after stopping the cache service. Reinstall/redeploy to apply conversion to existing applications; running releases are not rewritten.
 
+### Selecting Python for an application
+
+Python deployments default to the host's `python3`. In **Edit configuration**,
+add `"python_interpreter": "python3.12"` to the existing **Build configuration**
+JSON object to select a separately provisioned version. Keep the existing
+`start_command` and other settings. Preflight, native prerequisite checks and
+venv creation use that command; a missing command fails without fallback.
+Only `python3` or versioned names such as `python3.12` are accepted, not paths
+or shell strings. The interpreter and matching venv support must be installed
+by an administrator on the service account's system PATH. Redeploy to create
+a new venv; do not replace Ubuntu's system Python. The inspected drum dependency
+pins target Python 3.11-3.13, not 3.14.
+
 ## Native multi-service Python APIs
 
 Python apps can opt into a loopback Uvicorn API and one native Celery worker,

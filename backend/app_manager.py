@@ -48,9 +48,9 @@ except ImportError:  # pragma: no cover - Windows has no POSIX group database
     grp = None
 
 try:
-    from .adapters import detect_framework, get_adapter, inspect_project, validate_go_package, python_command
+    from .adapters import detect_framework, get_adapter, inspect_project, validate_go_package, python_command, python_interpreter
 except ImportError:  # pragma: no cover - direct execution after installation
-    from adapters import detect_framework, get_adapter, inspect_project, validate_go_package, python_command
+    from adapters import detect_framework, get_adapter, inspect_project, validate_go_package, python_command, python_interpreter
 
 APP_NAME = "app-manager"
 DEFAULT_STATE_ROOT = "/var/lib/cockpit/app-manager"
@@ -502,6 +502,7 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Build configuration must be a JSON object")
     _validate_app_directory_setting(build_config.get("app_directory"))
     validate_go_package(build_config.get("go_package"))
+    python_interpreter(build_config)
     if "start_command" in build_config:
         command = build_config["start_command"]
         if not isinstance(command, list) or not command or not all(
@@ -3793,11 +3794,13 @@ def _deployment_preflight(app: Dict[str, Any], source: Path, username: str, conf
     report["framework"] = app["framework"]
     report["project_directory"] = project["project_directory"]
     for tool, minimum in {**project["tools"], **app.get("runtime_requirements", {})}.items():
+        executable = python_interpreter(app.get("build_config", {})) if tool == "python3" and app["framework"] == "python" else tool
+        label = f"{tool} ({executable})" if executable != tool else tool
         declared_minimum = project["tools"].get(tool)
         if declared_minimum and minimum:
             minimum = max((minimum, declared_minimum), key=lambda version: tuple(int(part) for part in version.split(".")) + (0,) * (3 - len(version.split("."))))
         try:
-            result = _run_as_user(username, [tool, "version" if tool == "go" else "--version"], timeout=10)
+            result = _run_as_user(username, [executable, "version" if tool == "go" else "--version"], timeout=10)
             output = (result.stdout or "") + " " + (result.stderr or "")
             match = re.search(r"(?:v|go)?([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", output)
             actual = tuple(int(part or 0) for part in match.groups()) if match else None
@@ -3805,11 +3808,11 @@ def _deployment_preflight(app: Dict[str, Any], source: Path, username: str, conf
             if needed:
                 needed += (0,) * (3 - len(needed))
             passed = result.returncode == 0 and (needed is None or actual is not None and actual >= needed)
-            message = f"{tool}: " + (".".join(map(str, actual)) if actual else "version unavailable")
+            message = f"{label}: " + (".".join(map(str, actual)) if actual else "version unavailable")
             if minimum:
                 message += f"; minimum {minimum}"
         except (OSError, RuntimeError) as exc:
-            passed, message = False, f"{tool}: {type(exc).__name__}; runtime is unavailable"
+            passed, message = False, f"{label}: {type(exc).__name__}; runtime is unavailable"
         report["checks"].append({"name": tool, "passed": passed, "message": message})
         if not passed:
             report["errors"].append(message)
@@ -3825,8 +3828,9 @@ def _python_prerequisites(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[s
     paths = _app_paths(app["id"], config)
     for relative in ["", *settings.get("model_files", [])]:
         _assert_no_symlink_components(paths["storage"] / "models" / relative)
+    interpreter = python_interpreter(app.get("build_config", {}))
     try:
-        result = _run_as_user(app["service_user"], ["python3", "-I", str(Path(__file__).with_name("runtime_checks.py")),
+        result = _run_as_user(app["service_user"], [interpreter, "-I", str(Path(__file__).with_name("runtime_checks.py")),
             json.dumps(settings), str(paths["storage"] / "models")], timeout=30,
             environment=_environment_values_app(app["id"]), preserve_stdout=True)
         if result.returncode:
@@ -3836,7 +3840,7 @@ def _python_prerequisites(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[s
             raise ValueError("Invalid probe response")
         return report
     except (OSError, RuntimeError, ValueError):
-        message = "Cannot run Python prerequisite checks as the application account; provision Python and deploy/setup the account first"
+        message = f"Cannot run {interpreter} prerequisite checks as the application account; provision that interpreter and matching venv support, and deploy/setup the account first"
         return {"checks": [{"name": "Python prerequisites", "passed": False, "message": message}], "errors": [message], "warnings": [], "passed": False}
 
 

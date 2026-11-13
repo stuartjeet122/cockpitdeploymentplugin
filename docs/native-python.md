@@ -64,6 +64,7 @@ fields; keep the real Git remote and credentials separate:
   "health_check_url": "/api/health",
   "auto_deploy": false,
   "build_config": {
+    "python_interpreter": "python3.12",
     "start_command": [
       "{venv}/python", "-m", "uvicorn", "backend.app.main:app",
       "--host", "127.0.0.1", "--port", "{port}",
@@ -109,6 +110,28 @@ Commands are arrays, not shell programs. Only `{port}`, `{venv}` (the release's
 Explicit commands skip the default Gunicorn installation. Repository builds,
 pip hooks and app modules execute only as the dedicated unprivileged account.
 
+`build_config.python_interpreter` selects the versioned system command used
+for preflight, native prerequisite probes and release venv creation. The default
+remains `python3`; accepted overrides are names such as `python3.11`, `python3.12`
+and `python3.13`, never shell strings or arbitrary executable paths. The selected
+command must already be on the isolated service account's system PATH. Missing
+interpreters fail without falling back to the system Python. The API and worker
+then use the same release venv through `{venv}/python`.
+
+For the inspected drum pins, provision Python 3.11-3.13 alongside Ubuntu's
+system Python, preferably 3.12 for the initial validation. Do not change
+`/usr/bin/python3`, use alternatives to replace it, or reuse a venv created by
+another interpreter. Updating this setting takes effect on the next deployment,
+not an app restart. Administrator-provisioned Python must include matching
+venv/ensurepip support; App Manager installs neither the interpreter nor OS packages.
+
+If pip downloads `numpy-2.2.6.tar.gz` or `scipy-1.15.3.tar.gz` under Python 3.14,
+it is falling back to source builds rather than compatible wheels. A missing
+Fortran compiler is then a downstream failure, not a reason to provision a full
+scientific build toolchain on the production server. Select a compatible
+interpreter first. This does not certify every model package or pin: validate
+the complete requirements and real CPU imports on disposable Ubuntu before use.
+
 Save `REDIS_URL` and JSON `CORS_ORIGINS` using Cockpit's environment editor.
 Both units read the same protected environment file outside Git and releases.
 Do not put credentials in command arrays or configuration JSON. Do not log
@@ -121,7 +144,8 @@ logs cannot be guaranteed secret-free by the deployment manager.
 The manager never installs OS packages or configures Redis. On a disposable
 Ubuntu host, an administrator must review and provision:
 
-- Python 3.11+ with its matching venv/ensurepip package (for example `python3-venv`).
+- Python 3.11-3.13 with its matching venv/ensurepip package. The package for
+  Ubuntu's default interpreter alone may not supply venv support for an additional version.
 - FFmpeg, libsndfile (usually `libsndfile1`), Fontconfig and suitable notation fonts.
 - A headless-compatible MuseScore executable matching the API's search names:
   `mscore3`, `musescore3`, `drum-musescore`, or `mscore`. Package names and versions
@@ -157,7 +181,7 @@ Use the exact relative filenames listed in `model_files`, not `.gitkeep` files.
 No model download or repository code is run by a prerequisite check.
 
 **Run preflight** for native apps (or CLI `prerequisites <app-id>`) reads only:
-Python version and venv modules, private Redis, executable lookup, libsndfile,
+Selected Python version (3.11-3.13 for the drum profile) and venv modules, private Redis, executable lookup, libsndfile,
 Fontconfig's font listing and nonempty/readable/non-writable artifacts. It does
 not clone/pull, import the API, create a venv, initialize storage, or install
 packages. Missing checks are reported in Cockpit. Account creation is a separate
