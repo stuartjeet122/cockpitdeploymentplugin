@@ -4,6 +4,7 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN_DEST="${APP_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/app-manager}"
 DOCKER_MANAGER_PLUGIN_DEST="${DOCKER_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/docker-manager}"
+NGINX_MANAGER_PLUGIN_DEST="${NGINX_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/nginx-manager}"
 BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"
 CONFIG_DEST="${APP_MANAGER_CONFIG_DEST:-/etc/cockpit/app-manager}"
 STATE_ROOT="${APP_MANAGER_STATE_ROOT:-/var/lib/cockpit/app-manager}"
@@ -111,8 +112,15 @@ preflight() {
     -f "$APP_DIR/cockpit/docker-manager/docker-manager.css" &&
     -f "$APP_DIR/cockpit/docker-manager/docker-manager.js" ]] ||
     fail "Docker Manager plugin assets are missing."
-  [[ "$PLUGIN_DEST" != "$DOCKER_MANAGER_PLUGIN_DEST" ]] ||
-    fail "App Manager and Docker Manager must use separate Cockpit plugin directories."
+  [[ -f "$APP_DIR/cockpit/nginx-manager/manifest.json" &&
+    -f "$APP_DIR/cockpit/nginx-manager/index.html" &&
+    -f "$APP_DIR/cockpit/nginx-manager/nginx-manager.css" &&
+    -f "$APP_DIR/cockpit/nginx-manager/nginx-manager.js" ]] ||
+    fail "Nginx Manager plugin assets are missing."
+  [[ "$PLUGIN_DEST" != "$DOCKER_MANAGER_PLUGIN_DEST" &&
+    "$PLUGIN_DEST" != "$NGINX_MANAGER_PLUGIN_DEST" &&
+    "$DOCKER_MANAGER_PLUGIN_DEST" != "$NGINX_MANAGER_PLUGIN_DEST" ]] ||
+    fail "App Manager, Docker Manager, and Nginx Manager must use separate Cockpit plugin directories."
   [[ -f "$APP_DIR/backend/app_manager.py" && -f "$APP_DIR/backend/adapters.py" ]] ||
     fail "Required backend modules are missing."
   [[ -f "$APP_DIR/backend/prepare_next_assets.cjs" ]] || fail "Next.js asset preparation helper is missing."
@@ -126,6 +134,7 @@ preflight() {
 
   require_directory_path "$PLUGIN_DEST"
   require_directory_path "$DOCKER_MANAGER_PLUGIN_DEST"
+  require_directory_path "$NGINX_MANAGER_PLUGIN_DEST"
   require_directory_path "$BACKEND_DEST"
   require_directory_path "$CONFIG_DEST"
   require_directory_path "$STATE_ROOT"
@@ -144,6 +153,7 @@ preflight() {
 install_files() {
   install -d -o root -g root -m 0755 "$PLUGIN_DEST"
   install -d -o root -g root -m 0755 "$DOCKER_MANAGER_PLUGIN_DEST"
+  install -d -o root -g root -m 0755 "$NGINX_MANAGER_PLUGIN_DEST"
   # /usr/libexec/cockpit is shared with Cockpit; create only this plugin's
   # dedicated subdirectory and never change shared directory ownership.
   install -d -o root -g root -m 0755 "$BACKEND_DEST"
@@ -166,6 +176,10 @@ install_files() {
   install -o root -g root -m 0644 "$APP_DIR/cockpit/docker-manager/manifest.json" "$DOCKER_MANAGER_PLUGIN_DEST/manifest.json"
   install -o root -g root -m 0644 "$APP_DIR/cockpit/docker-manager/docker-manager.css" "$DOCKER_MANAGER_PLUGIN_DEST/docker-manager.css"
   install -o root -g root -m 0644 "$APP_DIR/cockpit/docker-manager/docker-manager.js" "$DOCKER_MANAGER_PLUGIN_DEST/docker-manager.js"
+  install -o root -g root -m 0644 "$APP_DIR/cockpit/nginx-manager/index.html" "$NGINX_MANAGER_PLUGIN_DEST/index.html"
+  install -o root -g root -m 0644 "$APP_DIR/cockpit/nginx-manager/manifest.json" "$NGINX_MANAGER_PLUGIN_DEST/manifest.json"
+  install -o root -g root -m 0644 "$APP_DIR/cockpit/nginx-manager/nginx-manager.css" "$NGINX_MANAGER_PLUGIN_DEST/nginx-manager.css"
+  install -o root -g root -m 0644 "$APP_DIR/cockpit/nginx-manager/nginx-manager.js" "$NGINX_MANAGER_PLUGIN_DEST/nginx-manager.js"
 
   install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"
   install -o root -g root -m 0644 "$APP_DIR/backend/adapters.py" "$BACKEND_DEST/adapters.py"
@@ -255,9 +269,10 @@ PY
 preflight
 install_files
 
-printf '\nCockpit App Manager and Docker Manager installed.\n'
+printf '\nCockpit App Manager, Docker Manager, and Nginx Manager installed.\n'
 printf 'Plugin directory: %s\n' "$PLUGIN_DEST"
 printf 'Docker Manager plugin directory: %s\n' "$DOCKER_MANAGER_PLUGIN_DEST"
+printf 'Nginx Manager plugin directory: %s\n' "$NGINX_MANAGER_PLUGIN_DEST"
 printf 'Backend command: %s\n' "$BACKEND_DEST/app-manager"
 printf 'State root: %s\n' "$STATE_ROOT"
 printf 'Cockpit privilege escalation: required by the plugin when launching the backend.\n'

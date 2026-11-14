@@ -4197,6 +4197,29 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             'install -o root -g root -m 0644 "$APP_DIR/cockpit/index.html" "$PLUGIN_DEST/index.html"',
             installer,
         )
+        nginx_plugin = cockpit_dir / "nginx-manager"
+        nginx_manifest = json.loads((nginx_plugin / "manifest.json").read_text(encoding="utf-8"))
+        nginx_html = (nginx_plugin / "index.html").read_text(encoding="utf-8")
+        nginx_frontend = (nginx_plugin / "nginx-manager.js").read_text(encoding="utf-8")
+        self.assertEqual(nginx_manifest["name"], "nginx-manager")
+        self.assertEqual(nginx_manifest["menu"]["nginx-manager"]["label"], "Nginx Manager")
+        self.assertEqual(nginx_manifest["menu"]["nginx-manager"]["order"], 62)
+        self.assertIn('class="nginx-mark"', nginx_html)
+        self.assertIn('aria-label="Create new website"', nginx_html)
+        self.assertIn('<script src="nginx-manager.js" defer></script>', nginx_html)
+        self.assertIn('const BACKEND = "/usr/libexec/cockpit/app-manager/app-manager";', nginx_frontend)
+        self.assertIn('superuser: "require"', nginx_frontend)
+        for command in (
+            '"nginx-overview"', '"nginx-conflicts"', '"nginx-site-save"',
+            'callBackend(`nginx-site-${action}`', '"nginx-test"', '"nginx-service"',
+        ):
+            self.assertIn(command, nginx_frontend)
+        for asset in ("index.html", "manifest.json", "nginx-manager.css", "nginx-manager.js"):
+            self.assertTrue((nginx_plugin / asset).is_file())
+        self.assertIn(
+            'install -o root -g root -m 0644 "$APP_DIR/cockpit/nginx-manager/nginx-manager.js" "$NGINX_MANAGER_PLUGIN_DEST/nginx-manager.js"',
+            installer,
+        )
         self.assertIn(
             'install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.css" "$PLUGIN_DEST/app-manager.css"',
             installer,
@@ -5005,8 +5028,12 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotIn('chown root:root "$PRODUCTION_ROOT"', installer)
         self.assertIn('BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"', installer)
         self.assertIn('DOCKER_MANAGER_PLUGIN_DEST="${DOCKER_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/docker-manager}"', installer)
+        self.assertIn('NGINX_MANAGER_PLUGIN_DEST="${NGINX_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/nginx-manager}"', installer)
         self.assertIn('install -o root -g root -m 0644 "$APP_DIR/cockpit/docker-manager/manifest.json" "$DOCKER_MANAGER_PLUGIN_DEST/manifest.json"', installer)
+        self.assertIn('install -o root -g root -m 0644 "$APP_DIR/cockpit/nginx-manager/manifest.json" "$NGINX_MANAGER_PLUGIN_DEST/manifest.json"', installer)
         self.assertIn('remove_owned_file "${DOCKER_MANAGER_PLUGIN_DEST}/manifest.json" \'"name": "docker-manager"\'', uninstaller)
+        self.assertIn('remove_owned_file "${NGINX_MANAGER_PLUGIN_DEST}/manifest.json" \'"name": "nginx-manager"\'', uninstaller)
+        self.assertIn('remove_owned_file "${NGINX_MANAGER_PLUGIN_DEST}/nginx-manager.js" "// Nginx Manager Cockpit UI loaded"', uninstaller)
         self.assertIn('install -d -o root -g root -m 0755 "$BACKEND_DEST"', installer)
         self.assertIn(
             'install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"',
@@ -5132,6 +5159,151 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         )
 
 
+class NginxManagerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        self.nginx_root = self.root / "etc" / "nginx"
+        self.conf_directory = self.nginx_root / "conf.d"
+        self.conf_directory.mkdir(parents=True)
+        self.www_root = self.root / "www"
+        self.www_root.mkdir()
+        self.socket_output = ""
+        self.commands = []
+        self.fail_nginx_test = False
+        self.config = manager._default_config()
+        self.config["command_timeout_seconds"] = 5
+
+        patches = (
+            patch.object(manager, "DEFAULT_STATE_ROOT", str(self.root / "state")),
+            patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(self.nginx_root)),
+            patch.object(manager, "NGINX_DOCUMENT_ROOTS", (str(self.root),)),
+            patch.object(manager, "get_config", return_value=self.config),
+            patch.object(manager, "_require_root"),
+            patch.object(manager, "run_command", side_effect=self._run_command),
+        )
+        for active_patch in patches:
+            active_patch.start()
+            self.addCleanup(active_patch.stop)
+
+    def _run_command(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:2] == ["nginx", "-T"]:
+            sections = []
+            if self.conf_directory.is_dir():
+                for path in sorted(self.conf_directory.glob("*.conf")):
+                    sections.append(f"# configuration file {path}:\n{path.read_text(encoding='utf-8')}\n")
+            return subprocess.CompletedProcess(command, 0, "".join(sections), "")
+        if command[:2] == ["nginx", "-t"]:
+            if self.fail_nginx_test:
+                return subprocess.CompletedProcess(command, 1, "", "configuration test failed")
+            return subprocess.CompletedProcess(command, 0, "syntax is ok", "test is successful")
+        if command[:2] == ["nginx", "-v"]:
+            return subprocess.CompletedProcess(command, 0, "", "nginx version: nginx/1.26.0")
+        if command[:3] == ["ss", "-H", "-ltnp"]:
+            return subprocess.CompletedProcess(command, 0, self.socket_output, "")
+        if command[:3] == ["systemctl", "is-active", "nginx"]:
+            return subprocess.CompletedProcess(command, 0, "active\n", "")
+        if command[:2] == ["systemctl", "reload"] or command[:2] == ["systemctl", "restart"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(f"Unexpected command: {command}")
+
+    def _payload(self, domain="app.example.com", **overrides):
+        payload = {
+            "site_id": None,
+            "domains": [domain],
+            "mode": "static",
+            "listen_port": 80,
+            "tls": False,
+            "document_root": str(self.www_root),
+            "enabled": True,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_create_enable_disable_and_inventory_managed_sites(self):
+        saved = manager.nginx_manager_save_site(self._payload(enabled=False))
+        site_id = saved["site"]["site_id"]
+        active_path, metadata_path = manager._nginx_manager_site_paths(site_id)
+        self.assertFalse(active_path.exists())
+        self.assertTrue(metadata_path.is_file())
+
+        manager.nginx_manager_set_enabled(site_id, True)
+        self.assertTrue(active_path.is_file())
+        overview = manager.nginx_manager_overview()
+        site = next(site for site in overview["sites"] if site["site_id"] == site_id)
+        self.assertTrue(site["enabled"])
+        self.assertEqual(site["listen_ports"], [80])
+
+        manager.nginx_manager_set_enabled(site_id, False)
+        overview = manager.nginx_manager_overview()
+        site = next(site for site in overview["sites"] if site["site_id"] == site_id)
+        self.assertFalse(site["enabled"])
+        self.assertEqual(site["listen_ports"], [80])
+
+    def test_conflicts_detect_exact_and_wildcard_domains_and_disabled_sites(self):
+        existing = self.conf_directory / "existing.conf"
+        existing.write_text(
+            "server { listen 80; server_name SHOP.example.com; }\n",
+            encoding="utf-8",
+        )
+
+        exact = manager.nginx_manager_conflicts(self._payload(domain="shop.example.com"))
+        self.assertTrue(any(item["type"] == "domain" and item["blocking"] for item in exact["conflicts"]), exact)
+
+        wildcard = manager.nginx_manager_conflicts(self._payload(domain="*.example.com"))
+        self.assertTrue(any(item["type"] == "domain" and item["blocking"] for item in wildcard["conflicts"]))
+
+        unrelated = manager.nginx_manager_conflicts(self._payload(domain="other.test"))
+        self.assertFalse(any(item["type"] == "domain" for item in unrelated["conflicts"]))
+
+        manager.nginx_manager_save_site(self._payload(domain="disabled.example.com", enabled=False))
+        disabled = manager.nginx_manager_conflicts(self._payload(domain="disabled.example.com"))
+        disabled_conflict = next(item for item in disabled["conflicts"] if item["type"] == "domain")
+        self.assertFalse(disabled_conflict["blocking"])
+
+    def test_conflicts_report_ports_held_by_other_processes(self):
+        self.socket_output = (
+            'LISTEN 0 128 0.0.0.0:80 0.0.0.0:* users:(("apache2",pid=123,fd=4))\n'
+        )
+        result = manager.nginx_manager_conflicts(self._payload())
+        self.assertTrue(any(item["type"] == "port" and "apache2" in item["message"] for item in result["conflicts"]))
+
+    def test_edit_test_failure_restores_existing_managed_configuration_and_metadata(self):
+        saved = manager.nginx_manager_save_site(self._payload())
+        site_id = saved["site"]["site_id"]
+        active_path, metadata_path = manager._nginx_manager_site_paths(site_id)
+        original_config = active_path.read_bytes()
+        original_metadata = metadata_path.read_bytes()
+        self.fail_nginx_test = True
+
+        with self.assertRaisesRegex(RuntimeError, "Could not save Nginx site"):
+            manager.nginx_manager_save_site(
+                self._payload(domain="updated.example.com", site_id=site_id)
+            )
+
+        self.assertEqual(active_path.read_bytes(), original_config)
+        self.assertEqual(metadata_path.read_bytes(), original_metadata)
+
+    def test_service_action_tests_configuration_before_reload(self):
+        result = manager.nginx_manager_service_action("reload")
+        self.assertEqual(result["action"], "reload")
+        self.assertEqual(self.commands[-2:], [["nginx", "-t"], ["systemctl", "reload", "nginx"]])
+
+    def test_validation_rejects_reserved_ports_and_invalid_domains(self):
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            manager._normalize_nginx_manager_site(self._payload(listen_port=8080))
+        with self.assertRaisesRegex(ValueError, "Site type"):
+            manager._normalize_nginx_manager_site(self._payload(mode=[]))
+        with self.assertRaisesRegex(ValueError, "valid hostname|Invalid domain"):
+            manager._normalize_nginx_manager_site(self._payload(domain="bad;domain.example"))
+        with self.assertRaisesRegex(ValueError, "allowed directories"):
+            manager._normalize_nginx_manager_site(
+                self._payload(document_root=str(self.root.parent / "outside"))
+            )
+
+
 @unittest.skipIf(os.name == "nt", "Uninstall integration tests require POSIX Bash and file permissions")
 class UninstallScriptTests(unittest.TestCase):
     def _write_registry(self, temp_root: Path, app_id: str, production_path=None) -> Path:
@@ -5193,6 +5365,7 @@ class UninstallScriptTests(unittest.TestCase):
         env.update({
             "APP_MANAGER_PLUGIN_DEST": str(temp_root / "usr" / "share" / "cockpit" / "app-manager"),
             "DOCKER_MANAGER_PLUGIN_DEST": str(temp_root / "usr" / "share" / "cockpit" / "docker-manager"),
+            "NGINX_MANAGER_PLUGIN_DEST": str(temp_root / "usr" / "share" / "cockpit" / "nginx-manager"),
             "APP_MANAGER_BACKEND_DEST": str(temp_root / "usr" / "libexec" / "cockpit" / "app-manager"),
             "APP_MANAGER_CONFIG_DEST": str(temp_root / "etc" / "cockpit" / "app-manager"),
             "APP_MANAGER_STATE_ROOT": str(temp_root / "var" / "lib" / "cockpit" / "app-manager"),
@@ -5269,6 +5442,30 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertTrue(docker_plugin.exists())
             self.assertFalse((docker_plugin / "manifest.json").exists())
             self.assertFalse((docker_plugin / "docker-manager.js").exists())
+
+    def test_default_uninstall_removes_verified_nginx_plugin_and_preserves_nginx_sites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            nginx_plugin = temp_root / "usr" / "share" / "cockpit" / "nginx-manager"
+            nginx_plugin.mkdir(parents=True)
+            (nginx_plugin / "index.html").write_text("<title>Nginx Manager</title>", encoding="utf-8")
+            (nginx_plugin / "manifest.json").write_text('{"name": "nginx-manager"}', encoding="utf-8")
+            (nginx_plugin / "nginx-manager.css").write_text(":root { --page: #f5f7fa; }", encoding="utf-8")
+            (nginx_plugin / "nginx-manager.js").write_text("// Nginx Manager Cockpit UI loaded", encoding="utf-8")
+            custom = nginx_plugin / "local-customization.js"
+            custom.write_text("custom", encoding="utf-8")
+            nginx_site = temp_root / "etc" / "nginx" / "sites-available" / "existing.conf"
+            nginx_site.parent.mkdir(parents=True)
+            nginx_site.write_text("server { server_name stuserver.online; }", encoding="utf-8")
+
+            result = self._run_uninstall(temp_root)
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertTrue(custom.exists())
+            self.assertTrue(nginx_plugin.exists())
+            self.assertFalse((nginx_plugin / "manifest.json").exists())
+            self.assertFalse((nginx_plugin / "nginx-manager.js").exists())
+            self.assertEqual(nginx_site.read_text(encoding="utf-8"), "server { server_name stuserver.online; }")
 
     def test_default_uninstall_preserves_unrecognized_files_in_plugin_directories(self):
         with tempfile.TemporaryDirectory() as tmp:

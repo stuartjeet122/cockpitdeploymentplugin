@@ -3,6 +3,7 @@ set -euo pipefail
 
 PLUGIN_DEST="${APP_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/app-manager}"
 DOCKER_MANAGER_PLUGIN_DEST="${DOCKER_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/docker-manager}"
+NGINX_MANAGER_PLUGIN_DEST="${NGINX_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/nginx-manager}"
 BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"
 CONFIG_DEST="${APP_MANAGER_CONFIG_DEST:-/etc/cockpit/app-manager}"
 STATE_ROOT="${APP_MANAGER_STATE_ROOT:-/var/lib/cockpit/app-manager}"
@@ -355,6 +356,10 @@ remove_default_plugin_files() {
   remove_owned_file "${DOCKER_MANAGER_PLUGIN_DEST}/manifest.json" '"name": "docker-manager"'
   remove_owned_file "${DOCKER_MANAGER_PLUGIN_DEST}/docker-manager.css" ".docker-manager {"
   remove_owned_file "${DOCKER_MANAGER_PLUGIN_DEST}/docker-manager.js" "// Docker Manager Cockpit UI loaded"
+  remove_owned_file "${NGINX_MANAGER_PLUGIN_DEST}/index.html" "<title>Nginx Manager</title>"
+  remove_owned_file "${NGINX_MANAGER_PLUGIN_DEST}/manifest.json" '"name": "nginx-manager"'
+  remove_owned_file "${NGINX_MANAGER_PLUGIN_DEST}/nginx-manager.css" "--page: #f5f7fa;"
+  remove_owned_file "${NGINX_MANAGER_PLUGIN_DEST}/nginx-manager.js" "// Nginx Manager Cockpit UI loaded"
   remove_owned_file "${CONFIG_DEST}/defaults.json" '"nginx_template"'
   remove_owned_file "${CONFIG_DEST}/npm-cache.json" '"_comment": "Managed by Cockpit App Manager"'
   remove_owned_file "${CONFIG_DEST}/templates/nginx.conf.tpl" "{{ app_route_location }}"
@@ -371,6 +376,7 @@ remove_default_plugin_files() {
   fi
   remove_empty_directory "$PLUGIN_DEST"
   remove_empty_directory "$DOCKER_MANAGER_PLUGIN_DEST"
+  remove_empty_directory "$NGINX_MANAGER_PLUGIN_DEST"
   remove_empty_directory "$CONFIG_DEST"
 }
 

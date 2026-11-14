@@ -313,6 +313,8 @@ const html = fs.readFileSync(path.join(root, "cockpit/index.html"), "utf8");
 const script = fs.readFileSync(path.join(root, "cockpit/app-manager.js"), "utf8");
 const dockerManagerHtml = fs.readFileSync(path.join(root, "cockpit/docker-manager/index.html"), "utf8");
 const dockerManagerScript = fs.readFileSync(path.join(root, "cockpit/docker-manager/docker-manager.js"), "utf8");
+const nginxManagerHtml = fs.readFileSync(path.join(root, "cockpit/nginx-manager/index.html"), "utf8");
+const nginxManagerScript = fs.readFileSync(path.join(root, "cockpit/nginx-manager/nginx-manager.js"), "utf8");
 const fixtureApps = [
   { id: "portal", name: "Customer Portal", framework: "nextjs", branch: "main", route: "/portal/", active_route: "/portal/", hosting_active: true, public_url: "https://stuserver.online/portal/", repo_url: "https://github.com/example/portal.git", port: 8100, status: "running", last_deploy: "2026-11-11T09:00:00Z", deployments: [] },
   { id: "docs", name: "Documentation", framework: "static", branch: "main", route: "/docs/", hosting_active: false, repo_url: "https://github.com/example/docs.git", port: 8101, status: "stopped", deployments: [] },
@@ -394,6 +396,48 @@ async function loadDockerManager(overrides = {}) {
   return { dom, window, document: window.document, calls };
 }
 
+async function loadNginxManager(overrides = {}) {
+  const dom = new JSDOM(nginxManagerHtml, {
+    runScripts: "outside-only",
+    url: "https://localhost/cockpit/nginx-manager/index.html",
+  });
+  const { window } = dom;
+  const calls = [];
+  window.confirm = () => true;
+  window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event("close")); };
+  const defaults = {
+    "nginx-overview": { nginx_version: "1.26.0", service_state: "active", sites: [], conflicts: [], warnings: [] },
+    "nginx-conflicts": { conflicts: [], warnings: [], can_enable: true },
+    "nginx-site-save": { message: "Website saved." },
+    "nginx-site-enable": { enabled: true },
+    "nginx-site-disable": { enabled: false },
+    "nginx-test": { passed: true, output: "syntax is ok" },
+    "nginx-service": { action: "reload", message: "Nginx reload completed successfully" },
+  };
+  window.cockpit = {
+    spawn(args) {
+      const [, command, ...values] = args;
+      const record = { command, values };
+      calls.push(record);
+      let stream;
+      const handler = overrides[command];
+      const promise = Promise.resolve()
+        .then(() => typeof handler === "function" ? handler(record) : handler || defaults[command] || {})
+        .then((result) => {
+          const output = JSON.stringify({ ok: true, ...result });
+          if (stream) { stream(output); return ""; }
+          return output;
+        });
+      promise.stream = (callback) => { stream = callback; return promise; };
+      return promise;
+    },
+  };
+  window.eval(nginxManagerScript);
+  await settle(window);
+  return { dom, window, document: window.document, calls };
+}
+
 async function settle(window) {
   for (let turn = 0; turn < 4; turn += 1) await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
@@ -439,6 +483,108 @@ test("Docker Manager is a distinct, branded Cockpit plugin and manages the host 
     await settle(ui.window);
     assert.equal(ui.calls.filter((record) => record.command === "docker-install").length, 1);
     assert.match(ui.document.querySelector("#globalNotice").textContent, /installed and running/);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Nginx Manager is an independent branded plugin with read-only host-site inventory", async () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "cockpit/nginx-manager/manifest.json"), "utf8"));
+  assert.equal(manifest.name, "nginx-manager");
+  assert.equal(manifest.menu["nginx-manager"].label, "Nginx Manager");
+  assert.match(nginxManagerHtml, /class="nginx-mark"/);
+  const managed = {
+    site_id: "a".repeat(32), name: "managed.example.com", domains: ["managed.example.com"],
+    mode: "proxy", upstream_port: 3000, listen_port: 80, listen_ports: [80, 443],
+    tls: true, enabled: true, managed: true, editable: true, path: "/etc/nginx/conf.d/managed.conf",
+  };
+  const unmanaged = {
+    site_id: null, name: "stuserver.online", domains: ["stuserver.online"],
+    mode: "external", listen_port: 443, listen_ports: [443], tls: true,
+    enabled: true, managed: false, editable: false, path: "/etc/nginx/sites-enabled/default",
+  };
+  const ui = await loadNginxManager({
+    "nginx-overview": { nginx_version: "1.26.0", service_state: "active", sites: [managed, unmanaged], conflicts: [], warnings: [] },
+  });
+  try {
+    assert.equal(ui.document.querySelectorAll(".site-card").length, 2);
+    assert.match(ui.document.querySelector("#siteCountCaption").textContent, /1 managed here/);
+    assert.ok(ui.document.querySelector(`[data-action="edit"][data-id="${"a".repeat(32)}"]`));
+    assert.equal(ui.document.querySelectorAll(".site-card:nth-child(2) [data-action='edit']").length, 0);
+    assert.equal(ui.document.querySelectorAll(".site-card:nth-child(2) [data-action='enable']").length, 0);
+    assert.match(ui.document.querySelector("#serviceState").textContent, /running/i);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Nginx Manager validates a new proxy website and saves only after conflict checks", async () => {
+  let savedSite = null;
+  const siteId = "b".repeat(32);
+  const ui = await loadNginxManager({
+    "nginx-overview": () => ({
+      nginx_version: "1.26.0", service_state: "active",
+      sites: savedSite ? [savedSite] : [], conflicts: [], warnings: [],
+    }),
+    "nginx-conflicts": (record) => {
+      const payload = JSON.parse(record.values[0]);
+      return { conflicts: [], can_enable: true, warnings: [], received: payload.domains };
+    },
+    "nginx-site-save": (record) => {
+      const payload = JSON.parse(record.values[0]);
+      savedSite = {
+        ...payload, site_id: siteId, name: payload.domains[0],
+        listen_ports: [payload.listen_port, ...(payload.tls ? [443] : [])],
+        managed: true, editable: true, path: `/etc/nginx/conf.d/${siteId}.conf`,
+      };
+      return { message: "Virtual host saved and enabled." };
+    },
+  });
+  try {
+    ui.document.querySelector('[data-action="create"]').click();
+    const form = ui.document.querySelector("#siteForm");
+    form.elements.domains.value = "shop.example.com, www.shop.example.com";
+    form.elements.mode.value = "proxy";
+    form.elements.mode.dispatchEvent(new ui.window.Event("change"));
+    form.elements.upstream_port.value = "3000";
+    form.elements.tls.checked = true;
+    form.elements.tls.dispatchEvent(new ui.window.Event("change"));
+    form.elements.certificate_file.value = "/etc/letsencrypt/live/shop/fullchain.pem";
+    form.elements.private_key_file.value = "/etc/letsencrypt/live/shop/privkey.pem";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+
+    const checked = ui.calls.find((record) => record.command === "nginx-conflicts");
+    const saved = ui.calls.find((record) => record.command === "nginx-site-save");
+    const payload = JSON.parse(saved.values[0]);
+    assert.deepEqual(JSON.parse(checked.values[0]).domains, ["shop.example.com", "www.shop.example.com"]);
+    assert.equal(payload.mode, "proxy");
+    assert.equal(payload.upstream_port, 3000);
+    assert.equal(payload.tls, true);
+    assert.equal(payload.certificate_file, "/etc/letsencrypt/live/shop/fullchain.pem");
+    assert.equal(ui.document.querySelector("#siteDialog").open, false);
+    assert.equal(ui.document.querySelectorAll(".site-card").length, 1);
+    assert.match(ui.document.querySelector("#globalNotice").textContent, /Reload Nginx/);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Nginx Manager blocks conflicted enabled sites and gates reload behind confirmation", async () => {
+  const ui = await loadNginxManager({
+    "nginx-conflicts": {
+      conflicts: [{ type: "domain", domain: "taken.example.com", port: 80, blocking: true, message: "Domain is already configured." }],
+      can_enable: false,
+    },
+  });
+  try {
+    ui.document.querySelector('[data-action="create"]').click();
+    const form = ui.document.querySelector("#siteForm");
+    form.elements.domains.value = "taken.example.com";
+    form.elements.document_root.value = "/var/www/taken";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.equal(ui.calls.some((record) => record.command === "nginx-site-save"), false);
+    assert.match(ui.document.querySelector("#formError").textContent, /already configured/);
+
+    ui.document.querySelector('[data-action="reload"]').click();
+    await settle(ui.window);
+    const service = ui.calls.find((record) => record.command === "nginx-service");
+    assert.deepEqual(service.values, ["reload"]);
   } finally { ui.dom.window.close(); }
 });
 
