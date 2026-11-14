@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Docker Manager</title>
+    <link rel="stylesheet" href="docker-manager.css" />
+    <script src="../base1/cockpit.js"></script>
+    <script src="docker-manager.js" defer></script>
+  </head>
+  <body>
+    <main class="docker-manager" aria-busy="true">
+      <header class="docker-header">
+        <div>
+          <p class="docker-eyebrow">Cockpit plugin</p>
+          <h1>Docker Manager</h1>
+          <p>Manage Docker Engine and Compose on this host.</p>
+        </div>
+        <span id="connectionStatus" role="status" aria-live="polite">Connecting…</span>
+      </header>
+
+      <div id="dockerError" class="docker-error" role="alert" aria-live="assertive" hidden></div>
+      <div id="dockerNotice" class="docker-notice" role="status" aria-live="polite" hidden></div>
+      <section class="docker-card" aria-labelledby="engineHeading">
+        <div class="docker-card-heading">
+          <div>
+            <h2 id="engineHeading">Docker Engine</h2>
+            <p>Docker Engine and Compose are installed from Ubuntu packages.</p>
+          </div>
+        </div>
+        <dl id="dockerStatus" class="docker-status" aria-live="polite">
+          <div><dt>Engine</dt><dd>Checking…</dd></div>
+          <div><dt>Daemon</dt><dd>Checking…</dd></div>
+          <div><dt>Compose</dt><dd>Checking…</dd></div>
+        </dl>
+        <div class="docker-actions">
+          <button id="installButton" class="docker-primary" type="button">Install / update Docker</button>
+          <button id="refreshButton" type="button">Check status</button>
+        </div>
+        <p class="docker-warning">Installing Docker uses APT and starts the privileged host daemon. Dockerfiles and Compose projects can execute code with host-daemon-level access; use only trusted projects. App Manager continues to configure Docker deployments separately.</p>
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "docker-manager",
+  "version": "1.0.0",
+  "requires": {
+    "cockpit": "318"
+  },
+  "menu": {
+    "docker-manager": {
+      "label": "Docker Manager",
+      "path": "index.html",
+      "order": 61
+    }
+  }
+}

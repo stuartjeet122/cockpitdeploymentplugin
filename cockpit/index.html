@@ -47,7 +47,6 @@
         <button id="tab-websites" class="am-tab tab active" type="button" role="tab" aria-selected="true" aria-controls="websites" tabindex="0" data-tab="websites"><i data-lucide="layout-grid" aria-hidden="true"></i>Applications <span id="appCount" class="am-tab-count">0</span></button>
         <button id="tab-deployments" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="deployments" tabindex="-1" data-tab="deployments"><i data-lucide="git-branch" aria-hidden="true"></i>Deployments</button>
         <button id="tab-overview" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="overview" tabindex="-1" data-tab="overview"><i data-lucide="activity" aria-hidden="true"></i>Activity</button>
-        <button id="tab-docker" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="docker" tabindex="-1" data-tab="docker"><i data-lucide="boxes" aria-hidden="true"></i>Docker</button>
         <button id="tab-settings" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="settings" tabindex="-1" data-tab="settings"><i data-lucide="settings-2" aria-hidden="true"></i>Settings</button>
       </nav>
 
@@ -96,33 +95,6 @@
           </div>
         </div>
         <div id="deploymentHistory"></div>
-      </section>
-
-      <section id="docker" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-docker" tabindex="0" hidden>
-        <div class="am-section-heading">
-          <div>
-            <h2>Docker</h2>
-            <p class="am-section-copy">Install or update Docker Engine and Compose, and check the daemon status.</p>
-          </div>
-        </div>
-        <section class="am-surface am-docker-panel" aria-labelledby="dockerHeading">
-          <div class="am-surface-heading">
-            <div>
-              <h3 id="dockerHeading">Docker Engine</h3>
-              <p>Uses Ubuntu packages and installs required dependencies through APT.</p>
-            </div>
-          </div>
-          <dl id="dockerStatus" class="am-settings-paths" aria-live="polite">
-            <div><dt>Engine</dt><dd>Checking…</dd></div>
-            <div><dt>Daemon</dt><dd>Checking…</dd></div>
-            <div><dt>Compose</dt><dd>Checking…</dd></div>
-          </dl>
-          <div class="am-header-actions am-docker-actions">
-            <button id="dockerInstallButton" class="am-button am-button--primary" type="button"><i data-lucide="download"></i> Install / update Docker</button>
-            <button id="dockerRefreshButton" class="am-button am-button--quiet" type="button"><i data-lucide="refresh-cw"></i> Check status</button>
-          </div>
-          <p class="am-field-hint">Dockerfile and Compose operations use the privileged host Docker daemon. Only deploy repositories you trust; Compose host ports and host filesystem mounts are blocked.</p>
-        </section>
       </section>
 
       <section id="settings" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">

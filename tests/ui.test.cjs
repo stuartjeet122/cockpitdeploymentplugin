@@ -311,6 +311,8 @@ test("shared registry reuses tarballs across isolated stores and rejects writes"
 
 const html = fs.readFileSync(path.join(root, "cockpit/index.html"), "utf8");
 const script = fs.readFileSync(path.join(root, "cockpit/app-manager.js"), "utf8");
+const dockerManagerHtml = fs.readFileSync(path.join(root, "cockpit/docker-manager/index.html"), "utf8");
+const dockerManagerScript = fs.readFileSync(path.join(root, "cockpit/docker-manager/docker-manager.js"), "utf8");
 const fixtureApps = [
   { id: "portal", name: "Customer Portal", framework: "nextjs", branch: "main", route: "/portal/", active_route: "/portal/", hosting_active: true, public_url: "https://stuserver.online/portal/", repo_url: "https://github.com/example/portal.git", port: 8100, status: "running", last_deploy: "2026-11-11T09:00:00Z", deployments: [] },
   { id: "docs", name: "Documentation", framework: "static", branch: "main", route: "/docs/", hosting_active: false, repo_url: "https://github.com/example/docs.git", port: 8101, status: "stopped", deployments: [] },
@@ -354,6 +356,34 @@ async function loadUi(overrides = {}, configureWindow) {
   return { dom, window, document: window.document, calls };
 }
 
+async function loadDockerManager(overrides = {}) {
+  const dom = new JSDOM(dockerManagerHtml, {
+    runScripts: "outside-only",
+    url: "https://localhost/cockpit/docker-manager/index.html",
+  });
+  const { window } = dom;
+  const calls = [];
+  window.confirm = () => true;
+  window.cockpit = {
+    spawn(args) {
+      const [, command, ...values] = args;
+      const record = { command, values };
+      calls.push(record);
+      let stream;
+      const promise = Promise.resolve().then(() => overrides[command] || {}).then((result) => {
+        const output = JSON.stringify({ ok: true, ...result });
+        if (stream) { stream(output); return ""; }
+        return output;
+      });
+      promise.stream = (callback) => { stream = callback; return promise; };
+      return promise;
+    },
+  };
+  window.eval(dockerManagerScript);
+  await settle(window);
+  return { dom, window, document: window.document, calls };
+}
+
 async function settle(window) {
   for (let turn = 0; turn < 4; turn += 1) await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
@@ -369,21 +399,25 @@ test("applications are the initial view and only active routes have public links
   } finally { ui.dom.window.close(); }
 });
 
-test("Docker tab reports Engine status and exposes an explicit install/update action", async () => {
+test("Docker management is a separate Cockpit plugin from App Manager", async () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "cockpit/docker-manager/manifest.json"), "utf8"));
+  assert.equal(manifest.name, "docker-manager");
+  assert.equal(manifest.menu["docker-manager"].label, "Docker Manager");
+  assert.equal(html.includes('data-tab="docker"'), false);
+
   const dockerStatus = {
     installed: true, daemon_active: true, engine_version: "27.0.1",
     compose_available: true, compose_version: "v2.29.0",
   };
-  const ui = await loadUi({ "docker-status": dockerStatus, "docker-install": { updated: true, ...dockerStatus } });
+  const ui = await loadDockerManager({ "docker-status": dockerStatus, "docker-install": { updated: true, ...dockerStatus } });
   try {
-    ui.document.querySelector('[data-tab="docker"]').click();
-    await settle(ui.window);
     assert.match(ui.document.querySelector("#dockerStatus").textContent, /27\.0\.1/);
     assert.match(ui.document.querySelector("#dockerStatus").textContent, /v2\.29\.0/);
-    ui.document.querySelector("#dockerInstallButton").click();
+    ui.document.querySelector("#installButton").click();
     await settle(ui.window);
     assert.equal(ui.calls.filter((record) => record.command === "docker-install").length, 1);
-    assert.match(ui.document.querySelector("#appManagerNotice").textContent, /installed and running/);
+    assert.match(ui.document.querySelector("#dockerNotice").textContent, /installed and running/);
+    assert.equal(ui.calls[0].command, "docker-status");
   } finally { ui.dom.window.close(); }
 });
 

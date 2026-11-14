@@ -1402,20 +1402,6 @@
 
   function bindTabs() {
     const tabs = Array.from(document.querySelectorAll('.am-app-manager [role="tab"][data-tab]'));
-    function renderDockerStatus(status) {
-      const rows = [
-        ["Engine", status.installed ? (status.engine_version || "Installed; version unavailable") : "Not installed"],
-        ["Daemon", status.daemon_active ? "Active" : "Inactive"],
-        ["Compose", status.compose_available ? (status.compose_version || "Installed") : "Not installed"],
-      ];
-      byId("dockerStatus").innerHTML = rows.map(([label, value]) =>
-        `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`
-      ).join("");
-      renderIcons();
-    }
-    async function refreshDockerStatus() {
-      renderDockerStatus(await callBackend("docker-status"));
-    }
     function activate(tab) {
       tabs.forEach((item) => {
         const selected = item === tab;
@@ -1431,9 +1417,6 @@
     tabs.forEach((tab) => {
       tab.addEventListener("click", () => {
         activate(tab);
-        if (tab.dataset.tab === "docker" && !state.busy) {
-          void runOperation(refreshDockerStatus, "", false);
-        }
       });
       tab.addEventListener("keydown", (event) => {
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -1447,15 +1430,6 @@
         tabs[nextIndex].focus();
         activate(tabs[nextIndex]);
       });
-    });
-    byId("dockerRefreshButton").addEventListener("click", () => {
-      void runOperation(refreshDockerStatus, "", false);
-    });
-    byId("dockerInstallButton").addEventListener("click", () => {
-      if (state.busy || !window.confirm("Install or update Docker Engine and Compose using Ubuntu APT packages?")) return;
-      void runOperation(async () => {
-        renderDockerStatus(await callBackend("docker-install"));
-      }, "Docker Engine and Compose are installed and running.", false);
     });
   }
 

@@ -4980,10 +4980,14 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
         uninstaller = (project / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
         cockpit_page = (project / "cockpit" / "index.html").read_text(encoding="utf-8")
+        docker_frontend = (project / "cockpit" / "docker-manager" / "docker-manager.js").read_text(encoding="utf-8")
         self.assertNotRegex(installer, r"\bchown\s+-R\b")
         self.assertNotIn('chown root:root "$BACKEND_DEST"', installer)
         self.assertNotIn('chown root:root "$PRODUCTION_ROOT"', installer)
         self.assertIn('BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"', installer)
+        self.assertIn('DOCKER_MANAGER_PLUGIN_DEST="${DOCKER_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/docker-manager}"', installer)
+        self.assertIn('install -o root -g root -m 0644 "$APP_DIR/cockpit/docker-manager/manifest.json" "$DOCKER_MANAGER_PLUGIN_DEST/manifest.json"', installer)
+        self.assertIn('remove_owned_file "${DOCKER_MANAGER_PLUGIN_DEST}/manifest.json" \'"name": "docker-manager"\'', uninstaller)
         self.assertIn('install -d -o root -g root -m 0755 "$BACKEND_DEST"', installer)
         self.assertIn(
             'install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"',
@@ -5025,6 +5029,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('"$STATE_ROOT/plugin-version.json"', installer)
         frontend = (project / "cockpit" / "app-manager.js").read_text(encoding="utf-8")
         self.assertIn('superuser: "require"', frontend)
+        self.assertIn('superuser: "require"', docker_frontend)
         self.assertIn('config.command_timeout_seconds ?? 30', frontend)
 
     def test_shared_cache_service_uses_private_systemd_storage_and_read_only_registry_rules(self):
@@ -5168,6 +5173,7 @@ class UninstallScriptTests(unittest.TestCase):
         userdel_log = temp_root / "userdel.log"
         env.update({
             "APP_MANAGER_PLUGIN_DEST": str(temp_root / "usr" / "share" / "cockpit" / "app-manager"),
+            "DOCKER_MANAGER_PLUGIN_DEST": str(temp_root / "usr" / "share" / "cockpit" / "docker-manager"),
             "APP_MANAGER_BACKEND_DEST": str(temp_root / "usr" / "libexec" / "cockpit" / "app-manager"),
             "APP_MANAGER_CONFIG_DEST": str(temp_root / "etc" / "cockpit" / "app-manager"),
             "APP_MANAGER_STATE_ROOT": str(temp_root / "var" / "lib" / "cockpit" / "app-manager"),
@@ -5224,6 +5230,26 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertFalse(config.exists())
             self.assertTrue((state_root / "apps.json").exists())
             self.assertTrue((production_root / "demo").exists())
+
+    def test_default_uninstall_removes_only_verified_docker_manager_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            docker_plugin = temp_root / "usr" / "share" / "cockpit" / "docker-manager"
+            docker_plugin.mkdir(parents=True)
+            (docker_plugin / "index.html").write_text("<title>Docker Manager</title>", encoding="utf-8")
+            (docker_plugin / "manifest.json").write_text('{"name": "docker-manager"}', encoding="utf-8")
+            (docker_plugin / "docker-manager.css").write_text(".docker-manager {", encoding="utf-8")
+            (docker_plugin / "docker-manager.js").write_text("// Docker Manager Cockpit UI loaded", encoding="utf-8")
+            unrelated = docker_plugin / "local-customization.js"
+            unrelated.write_text("custom", encoding="utf-8")
+
+            result = self._run_uninstall(temp_root)
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertTrue(unrelated.exists())
+            self.assertTrue(docker_plugin.exists())
+            self.assertFalse((docker_plugin / "manifest.json").exists())
+            self.assertFalse((docker_plugin / "docker-manager.js").exists())
 
     def test_default_uninstall_preserves_unrecognized_files_in_plugin_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
