@@ -1138,6 +1138,25 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(len(deployments), 1)
         self.assertEqual(deployments[0]["id"], "20261109220923-abcdef12")
 
+    def test_application_views_filter_frameworks_consistently(self):
+        website = self.add_app("Website", slug="website", framework="static")["app"]
+        container = self.add_app("Container", slug="container", framework="docker")["app"]
+        for app, deployment_id in ((website, "20261108220923-abcdef12"), (container, "20261109220923-abcdef12")):
+            with manager._registry_transaction() as registry:
+                stored = manager._find_app(registry, app["id"])
+                stored["deployments"] = [{"id": deployment_id, "date": deployment_id[:4] + "-" + deployment_id[4:6] + "-" + deployment_id[6:8], "status": "deployed"}]
+
+        self.assertEqual([app["id"] for app in manager.list_apps(framework="docker")["apps"]], ["container"])
+        self.assertEqual([app["id"] for app in manager.list_apps(exclude_framework="docker")["apps"]], ["website"])
+        self.assertEqual(manager.overview(framework="docker")["total_apps"], 1)
+        self.assertEqual(manager.overview(exclude_framework="docker")["total_apps"], 1)
+        self.assertEqual([item["app_id"] for item in manager.get_deployments(framework="docker")["deployments"]], ["container"])
+        self.assertEqual([item["app_id"] for item in manager.get_deployments(exclude_framework="docker")["deployments"]], ["website"])
+
+        arguments = manager._build_parser().parse_args(["list", "--framework", "docker"])
+        self.assertEqual(arguments.framework, "docker")
+        self.assertIsNone(arguments.exclude_framework)
+
     def test_deployment_log_pruning_keeps_only_the_current_attempt(self):
         app_id = "demo"
         previous_id = "20261108220923-abcdef12"

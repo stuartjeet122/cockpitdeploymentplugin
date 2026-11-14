@@ -364,18 +364,28 @@ async function loadDockerManager(overrides = {}) {
   const { window } = dom;
   const calls = [];
   window.confirm = () => true;
+  window.TextEncoder = TextEncoder;
+  window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event("close")); };
+  const defaults = {
+    list: { apps: [] }, overview: { total_apps: 0 }, deployments: { deployments: [] },
+    "docker-status": { installed: false, daemon_active: false, compose_available: false },
+    "env-save": { key_count: 1 },
+  };
   window.cockpit = {
     spawn(args) {
       const [, command, ...values] = args;
       const record = { command, values };
       calls.push(record);
       let stream;
-      const promise = Promise.resolve().then(() => overrides[command] || {}).then((result) => {
+      const handler = overrides[command];
+      const promise = Promise.resolve().then(() => typeof handler === "function" ? handler(record) : handler || defaults[command] || {}).then((result) => {
         const output = JSON.stringify({ ok: true, ...result });
         if (stream) { stream(output); return ""; }
         return output;
       });
       promise.stream = (callback) => { stream = callback; return promise; };
+      promise.input = (input) => { record.input = input; return promise; };
       return promise;
     },
   };
@@ -399,11 +409,22 @@ test("applications are the initial view and only active routes have public links
   } finally { ui.dom.window.close(); }
 });
 
-test("Docker management is a separate Cockpit plugin from App Manager", async () => {
+test("App Manager excludes Docker apps and reserves Docker setup for its own plugin", async () => {
+  const ui = await loadUi();
+  try {
+    assert.equal(ui.document.querySelector('#appFramework option[value="docker"]'), null);
+    assert.deepEqual(ui.calls.find((record) => record.command === "list").values, ["--exclude-framework", "docker"]);
+    assert.deepEqual(ui.calls.find((record) => record.command === "overview").values, ["--exclude-framework", "docker"]);
+    assert.deepEqual(ui.calls.find((record) => record.command === "deployments").values, ["--exclude-framework", "docker"]);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Docker Manager is a distinct, branded Cockpit plugin and manages the host Engine", async () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "cockpit/docker-manager/manifest.json"), "utf8"));
   assert.equal(manifest.name, "docker-manager");
   assert.equal(manifest.menu["docker-manager"].label, "Docker Manager");
   assert.equal(html.includes('data-tab="docker"'), false);
+  assert.match(dockerManagerHtml, /class="docker-mark"/);
 
   const dockerStatus = {
     installed: true, daemon_active: true, engine_version: "27.0.1",
@@ -411,74 +432,71 @@ test("Docker management is a separate Cockpit plugin from App Manager", async ()
   };
   const ui = await loadDockerManager({ "docker-status": dockerStatus, "docker-install": { updated: true, ...dockerStatus } });
   try {
-    assert.match(ui.document.querySelector("#dockerStatus").textContent, /27\.0\.1/);
-    assert.match(ui.document.querySelector("#dockerStatus").textContent, /v2\.29\.0/);
+    assert.match(ui.document.querySelector("#engineDetails").textContent, /27\.0\.1/);
+    assert.match(ui.document.querySelector("#engineDetails").textContent, /v2\.29\.0/);
+    assert.deepEqual(ui.calls.find((record) => record.command === "list").values, ["--framework", "docker"]);
     ui.document.querySelector("#installButton").click();
     await settle(ui.window);
     assert.equal(ui.calls.filter((record) => record.command === "docker-install").length, 1);
-    assert.match(ui.document.querySelector("#dockerNotice").textContent, /installed and running/);
-    assert.equal(ui.calls[0].command, "docker-status");
+    assert.match(ui.document.querySelector("#globalNotice").textContent, /installed and running/);
   } finally { ui.dom.window.close(); }
 });
 
-test("Docker application setup saves Dockerfile and container-port configuration", async () => {
-  let savedApps = [...fixtureApps];
-  const ui = await loadUi({
+test("Docker Manager registers Dockerfile apps with the Docker backend", async () => {
+  let savedApps = [];
+  const ui = await loadDockerManager({
     list: () => ({ apps: savedApps }),
     add: (record) => {
       const payload = JSON.parse(record.values[0]);
-      savedApps = [...savedApps, { ...payload, id: payload.slug, status: "stopped", deployments: [] }];
-      return { app: savedApps.at(-1) };
+      savedApps = [{ ...payload, id: payload.slug, status: "stopped", deployments: [] }];
+      return { app: savedApps[0] };
     },
   });
   try {
-    ui.document.querySelector("[data-open-add]").click();
-    const form = ui.document.querySelector(".am-dialog-form");
+    ui.document.querySelector("[data-open-create]").click();
+    const form = ui.document.querySelector("#dockerAppForm");
     form.elements.repo_url.value = "https://github.com/example/docker-shop.git";
     form.elements.name.value = "Docker Shop";
     form.elements.name.dispatchEvent(new ui.window.Event("input"));
-    ui.document.querySelector("#setupNext").click();
-    form.elements.framework.value = "docker";
     form.elements.dockerfile.value = "deploy/Dockerfile";
     form.elements.container_port.value = "8081";
+    form.elements.environment.value = 'DATABASE_URL="private-value"';
     form.elements.deploy_now.checked = false;
-    ui.document.querySelector("#setupNext").click();
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
+    assert.equal(payload.framework, "docker");
     assert.deepEqual(payload.build_config, {
       docker_mode: "dockerfile", dockerfile: "deploy/Dockerfile", container_port: 8081,
     });
-    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+    const environmentSave = ui.calls.find((record) => record.command === "env-save");
+    assert.equal(environmentSave.input, 'DATABASE_URL="private-value"\n');
+    assert.equal(ui.document.querySelector("#appDialog").open, false);
   } finally { ui.dom.window.close(); }
 });
 
-test("Docker application setup configures a Compose web service", async () => {
-  let savedApps = [...fixtureApps];
-  const ui = await loadUi({
+test("Docker Manager configures Compose apps and lists its managed containers", async () => {
+  let savedApps = [];
+  const ui = await loadDockerManager({
     list: () => ({ apps: savedApps }),
     add: (record) => {
       const payload = JSON.parse(record.values[0]);
-      savedApps = [...savedApps, { ...payload, id: payload.slug, status: "stopped", deployments: [] }];
-      return { app: savedApps.at(-1) };
+      savedApps = [{ ...payload, id: payload.slug, status: "running", port: 8100, hosting_active: true, active_route: payload.route, public_url: `https://stuserver.online${payload.route}`, deployments: [] }];
+      return { app: savedApps[0] };
     },
   });
   try {
-    ui.document.querySelector("[data-open-add]").click();
-    const form = ui.document.querySelector(".am-dialog-form");
+    ui.document.querySelector("[data-open-create]").click();
+    const form = ui.document.querySelector("#dockerAppForm");
     form.elements.repo_url.value = "https://github.com/example/compose-shop.git";
     form.elements.name.value = "Compose Shop";
     form.elements.name.dispatchEvent(new ui.window.Event("input"));
-    ui.document.querySelector("#setupNext").click();
-    form.elements.framework.value = "docker";
-    form.elements.framework.dispatchEvent(new ui.window.Event("change"));
     form.elements.docker_mode.value = "compose";
     form.elements.docker_mode.dispatchEvent(new ui.window.Event("change"));
     form.elements.compose_file.value = "deploy/compose.yaml";
     form.elements.compose_service.value = "frontend";
     form.elements.container_port.value = "8080";
     form.elements.deploy_now.checked = false;
-    ui.document.querySelector("#setupNext").click();
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
@@ -486,6 +504,8 @@ test("Docker application setup configures a Compose web service", async () => {
       docker_mode: "compose", compose_file: "deploy/compose.yaml",
       compose_service: "frontend", container_port: 8080,
     });
+    assert.equal(ui.document.querySelectorAll(".container-card").length, 1);
+    assert.match(ui.document.querySelector(".container-card").textContent, /127\.0\.0\.1:8100/);
   } finally { ui.dom.window.close(); }
 });
 

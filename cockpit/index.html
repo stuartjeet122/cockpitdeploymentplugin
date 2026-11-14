@@ -146,7 +146,6 @@
               <option value="node">Node.js</option>
               <option value="python">Python</option>
               <option value="static">Static HTML</option>
-              <option value="docker">Docker</option>
             </select>
           </div>
           <div class="am-form-grid__wide">
@@ -167,29 +166,6 @@
           <summary>Runtime options</summary>
           <div class="am-form-grid">
             <div class="am-form-grid__wide"><label for="appDirectory">Project directory <span class="am-optional">Optional</span></label><input id="appDirectory" name="app_directory" placeholder="apps/web" autocomplete="off" /></div>
-            <div class="am-form-grid am-form-grid__wide" data-docker-options hidden>
-              <div class="am-form-grid__wide">
-                <label for="appDockerMode">Docker deployment type</label>
-                <select id="appDockerMode" name="docker_mode">
-                  <option value="dockerfile">Dockerfile</option>
-                  <option value="compose">Docker Compose project</option>
-                </select>
-              </div>
-              <div class="am-form-grid__wide" data-dockerfile-options>
-                <label for="appDockerfile">Dockerfile path</label>
-                <input id="appDockerfile" name="dockerfile" value="Dockerfile" autocomplete="off" />
-              </div>
-              <div class="am-form-grid__wide" data-compose-options hidden>
-                <div class="am-form-grid">
-                  <div><label for="appComposeFile">Compose file</label><input id="appComposeFile" name="compose_file" value="compose.yaml" autocomplete="off" /></div>
-                  <div><label for="appComposeService">Web service</label><input id="appComposeService" name="compose_service" value="web" pattern="[a-z0-9][a-z0-9\x5f\x2d]{0,62}" autocomplete="off" /></div>
-                </div>
-              </div>
-              <div class="am-form-grid__wide">
-                <label for="appContainerPort">Container port</label>
-                <input id="appContainerPort" name="container_port" type="number" min="1" max="65535" value="3000" />
-              </div>
-            </div>
             <div class="am-form-grid__wide"><label for="appGoPackage">Go main package <span class="am-optional">Optional</span></label><input id="appGoPackage" name="go_package" placeholder="./cmd/server" autocomplete="off" pattern="\.(?:/[A-Za-z0-9_\-][A-Za-z0-9_.\-]*)*" /></div>
             <div class="am-form-grid__wide"><label for="appStartCommand">Start command <span class="am-optional">JSON argument array</span></label><textarea id="appStartCommand" name="start_command" rows="2" spellcheck="false" placeholder='["node", "dist/server.js"]'></textarea></div>
           </div>

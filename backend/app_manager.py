@@ -2002,8 +2002,27 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "app": app_record}
 
 
-def list_apps() -> Dict[str, Any]:
-    return {"apps": [app_metadata(app) for app in get_registry()["apps"]]}
+def _filtered_registry_apps(
+    framework: Optional[str] = None,
+    exclude_framework: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if framework is not None and framework not in FRAMEWORKS:
+        raise ValueError(f"Unsupported framework filter: {framework}")
+    if exclude_framework is not None and exclude_framework not in FRAMEWORKS:
+        raise ValueError(f"Unsupported framework exclusion: {exclude_framework}")
+    return [
+        app for app in get_registry()["apps"]
+        if (framework is None or app.get("framework") == framework)
+        and (exclude_framework is None or app.get("framework") != exclude_framework)
+    ]
+
+
+def list_apps(
+    framework: Optional[str] = None,
+    exclude_framework: Optional[str] = None,
+) -> Dict[str, Any]:
+    apps = _filtered_registry_apps(framework, exclude_framework)
+    return {"apps": [app_metadata(app) for app in apps]}
 
 
 def stats_for_apps(apps: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2024,13 +2043,19 @@ def stats_for_apps(apps: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def overview() -> Dict[str, Any]:
-    return stats_for_apps(list_apps()["apps"])
+def overview(
+    framework: Optional[str] = None,
+    exclude_framework: Optional[str] = None,
+) -> Dict[str, Any]:
+    return stats_for_apps(list_apps(framework, exclude_framework)["apps"])
 
 
-def get_deployments() -> Dict[str, Any]:
+def get_deployments(
+    framework: Optional[str] = None,
+    exclude_framework: Optional[str] = None,
+) -> Dict[str, Any]:
     deployments = []
-    for app in get_registry()["apps"]:
+    for app in _filtered_registry_apps(framework, exclude_framework):
         latest = app.get("deployments", [])[-1:] if app.get("deployments") else []
         deployments.extend(dict(item, app_id=app["id"]) for item in latest)
     return {"deployments": sorted(deployments, key=lambda item: item.get("date", ""), reverse=True)}
@@ -5156,7 +5181,9 @@ def _build_parser() -> argparse.ArgumentParser:
     settings = commands.add_parser("settings")
     settings.add_argument("payload", nargs="?")
     for name in ("list", "overview", "deployments"):
-        commands.add_parser(name)
+        command = commands.add_parser(name)
+        command.add_argument("--framework", choices=sorted(FRAMEWORKS))
+        command.add_argument("--exclude-framework", choices=sorted(FRAMEWORKS))
     commands.add_parser("docker-status")
     commands.add_parser("docker-install")
     commands.add_parser("plugin-update-check")
@@ -5208,11 +5235,11 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
     if args.command == "docker-install":
         return install_or_update_docker()
     if args.command == "list":
-        return list_apps()
+        return list_apps(args.framework, args.exclude_framework)
     if args.command == "overview":
-        return overview()
+        return overview(args.framework, args.exclude_framework)
     if args.command == "deployments":
-        return get_deployments()
+        return get_deployments(args.framework, args.exclude_framework)
     if args.command == "deployment-logs":
         return deployment_logs_app(args.app_id, args.deployment_id, status_only=args.status_only)
     if args.command == "deployment-abort":

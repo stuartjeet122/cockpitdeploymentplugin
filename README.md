@@ -1,6 +1,6 @@
 # Cockpit App Manager
 
-App Manager and Docker Manager are separate Cockpit navigation plugins installed together. App Manager registers and operates web applications; Docker Manager reports Docker Engine/Compose status and offers an explicit installation/update action. Both use the shared Python command-line backend.
+App Manager and Docker Manager are separate Cockpit navigation plugins installed together. App Manager registers and operates non-Docker web applications; Docker Manager registers Dockerfile and Compose apps, manages their deployments and containers, and reports Docker Engine status. Both use the shared Python command-line backend.
 
 The native Cockpit interface opens on Applications, with search, status filters, and a guided repository, configuration, and review flow. Environment variables can be saved before the first deployment; saved values are masked until explicitly revealed. Service controls, health checks, logs, and deployment settings remain available without leaving Cockpit. Only the current release and latest deployment record are kept. Deployments run independently of the browser session, so the live log can be reopened after a refresh; an active deployment can be aborted from the log dialog.
 
@@ -86,18 +86,18 @@ App Manager does not create a new virtual host or change Cloudflare Tunnel setti
 
 ## First deployment
 
-1. Open **App Manager** in Cockpit and select **New application**. Supply the HTTPS or SSH repository URL, application name, and production branch. Configure private-repository access for the dedicated application account on the host; never embed credentials in a repository URL.
-2. Select the framework or automatic detection, a unique application ID, and a public prefix such as `/shop/`. Set a health path that returns 2xx without authentication or redirects. Add the environment variables needed during build and runtime. Advanced configuration accepts a relative Next.js app directory, Dockerfile or Compose project settings, and explicit non-Docker start commands as JSON argument arrays.
+1. For a non-Docker app, open **App Manager** in Cockpit and select **New application**. For a Dockerfile or Compose app, open **Docker Manager** and select **Deploy container**. Supply the HTTPS or SSH repository URL, application name, and production branch. Configure private-repository access for the dedicated application account on the host; never embed credentials in a repository URL.
+2. Select the framework or automatic detection, a unique application ID, and a public prefix such as `/shop/`. Set a health path that returns 2xx without authentication or redirects. Add the environment variables needed during build and runtime. App Manager accepts a relative Next.js app directory and explicit non-Docker start commands as JSON argument arrays. Docker Manager accepts Dockerfile or Compose project settings.
 3. Review the public route, source, and environment variable names. Leave **Deploy now** enabled to save and deploy, or disable it to register without starting a deployment. Follow the deployment log; errors leave the last working release active when recovery succeeds.
 4. Open the public application only after activation succeeds. Editing a route does not move the active deployment immediately; redeploy to activate the new route. Environment edits require a restart or redeployment to affect a running process. The deployment log can be copied or downloaded as a `.txt` file from its dialog. For health checks, select a path that returns 2xx without authentication, redirects, or an edge-security challenge.
 
 ## Docker deployments
 
-Select **Docker** and choose **Dockerfile** or **Docker Compose project**. Dockerfile deployments accept a relative Dockerfile path and build directory. Compose deployments accept a relative Compose file, the web service name, and its internal listening port. Compose builds all project services and starts them under an app-scoped project name; only the selected web service is published on `127.0.0.1:<managed-port>`. Other services remain private on the Compose network. App Manager supplies `PORT`, `HOST=0.0.0.0`, `APP_BASE_PATH`, and saved environment values to the selected web service. Saved values are also available for Compose `${VARIABLE}` interpolation; only variables explicitly referenced by a service are passed to it. Do not reference secrets from Compose build arguments. App Manager resource limits apply to the selected service; configure limits for companion services in the Compose file. Compose named volumes persist across restarts and deployments and are deleted when the application is removed. Compose updates restart the project in place rather than using the Dockerfile deployment's parallel candidate, so a short interruption is possible.
+Open **Docker Manager** in Cockpit and select **Deploy container**. Choose **Dockerfile** or **Docker Compose project**. Dockerfile deployments accept a relative Dockerfile path and build directory. Compose deployments accept a relative Compose file, the web service name, and its internal listening port. Compose builds all project services and starts them under an app-scoped project name; only the selected web service is published on `127.0.0.1:<managed-port>`. Other services remain private on the Compose network. Docker Manager supplies `PORT`, `HOST=0.0.0.0`, `APP_BASE_PATH`, and saved environment values to the selected web service. Saved values are also available for Compose `${VARIABLE}` interpolation; only variables explicitly referenced by a service are passed to it. Do not reference secrets from Compose build arguments. Docker Manager resource limits apply to the selected service; configure limits for companion services in the Compose file. Compose named volumes persist across restarts and deployments and are deleted when the application is removed. Compose updates restart the project in place rather than using the Dockerfile deployment's parallel candidate, so a short interruption is possible.
 
-For host safety, Compose services may not publish their own host ports, mount host filesystem paths, use external volumes or networks, use host namespaces, or request privileged capabilities. App Manager drops all container capabilities and enables `no-new-privileges`; it grants only `NET_BIND_SERVICE` when the selected service listens on a privileged container port. App Manager manages the selected service's loopback port mapping; the Compose project can use internal service-to-service networking and app-scoped named volumes. Use Dockerfile `CMD`/`ENTRYPOINT` or Compose `command`; `start_command` is not used for Docker deployments.
+For host safety, Compose services may not publish their own host ports, mount host filesystem paths, use external volumes or networks, use host namespaces, or request privileged capabilities. Docker Manager drops all container capabilities and enables `no-new-privileges`; it grants only `NET_BIND_SERVICE` when the selected service listens on a privileged container port. Docker Manager manages the selected service's loopback port mapping; the Compose project can use internal service-to-service networking and app-scoped named volumes. Use Dockerfile `CMD`/`ENTRYPOINT` or Compose `command`; `start_command` is not used for Docker deployments.
 
-The separate **Docker Manager** Cockpit plugin reports Engine/Compose status and offers an explicit install/update action. It uses Ubuntu APT packages (`docker.io` and `docker-compose-v2`), installs their dependencies, and enables/starts `docker.service`; it does not add application service accounts to the Docker group. Docker Engine's privileged daemon performs image builds and Compose project operations, so Dockerfiles and Compose projects are trusted code with host-daemon-level risk. Deploy only repositories you trust; do not put credentials in Docker build arguments or copy secrets into images.
+Docker Manager lists the host's registered Docker applications in a responsive container dashboard with deployment progress, logs, service controls, and removal. Its **Engine** section reports Docker/Compose versions and offers an explicit install/update action. It uses Ubuntu APT packages (`docker.io` and `docker-compose-v2`), installs their dependencies, and enables/starts `docker.service`; it does not add application service accounts to the Docker group. Docker Engine's privileged daemon performs image builds and Compose project operations, so Dockerfiles and Compose projects are trusted code with host-daemon-level risk. Deploy only repositories you trust; do not put credentials in Docker build arguments or copy secrets into images.
 
 ## Runtime Operations
 
@@ -164,7 +164,10 @@ Never run the destructive uninstall path unless you intentionally want to remove
 The executable returns one JSON object on stdout for successful and failed operations; diagnostic errors are also written to stderr. Commands include:
 
 ```text
-list | overview | add <json> | edit <app-id> <json>
+list [--framework <name> | --exclude-framework <name>]
+overview [--framework <name> | --exclude-framework <name>]
+deployments [--framework <name> | --exclude-framework <name>]
+add <json> | edit <app-id> <json>
 deploy <app-id> | deployment-start <app-id> | deployment-abort <app-id> <deployment-id>
 deployment-logs <app-id> [deployment-id] [--status-only] | auto-deploy [--retry-now]
 pull <app-id>
@@ -174,7 +177,7 @@ preflight <app-id> | metrics <app-id>
 review-update <app-id> | approve <app-id> <reviewed-commit>
 env-get <app-id> | env-save <app-id>  # env-save reads content from stdin
 remove <app-id>
-deployments | settings [<json>]
+settings [<json>]
 plugin-update-check | plugin-update
 action <action> <app-id>
 ```
@@ -216,7 +219,7 @@ Applications must provide an appropriate start entry point. Framework adapters i
 
 ### Startup, assets, and public 403 responses
 
-For non-Docker frameworks, managed environment values are passed to build commands and loaded by systemd for dynamic app runtimes. Docker runtime values are stored separately and passed to the container; Docker builds receive only the non-secret `APP_BASE_PATH` and `PORT` build arguments. Applications read their process environment rather than requiring a `.env` file beside the source. Save values in App Manager before deploying. A restart updates runtime-only values, but Next.js `NEXT_PUBLIC_*`, Vite `VITE_*`, and other compiled browser configuration require a new deployment. Only framework-approved public variables belong in browser bundles; never expose database passwords or API secrets or put secrets in Docker build arguments or image layers. Plain static HTML has neither a server-side process environment nor an automatic environment substitution step.
+For non-Docker frameworks, managed environment values are passed to build commands and loaded by systemd for dynamic app runtimes. Docker runtime values are stored separately and passed to the container; Docker builds receive only the non-secret `APP_BASE_PATH` and `PORT` build arguments. Applications read their process environment rather than requiring a `.env` file beside the source. Save values in App Manager or Docker Manager before deploying, according to the framework. A restart updates runtime-only values, but Next.js `NEXT_PUBLIC_*`, Vite `VITE_*`, and other compiled browser configuration require a new deployment. Only framework-approved public variables belong in browser bundles; never expose database passwords or API secrets or put secrets in Docker build arguments or image layers. Plain static HTML has neither a server-side process environment nor an automatic environment substitution step.
 
 Every managed dynamic application receives its configured public route without the trailing slash as `APP_BASE_PATH`; proxied dynamic applications also receive that route in `X-Forwarded-Prefix`. App Manager does not rewrite arbitrary Swagger/OpenAPI documents: their `servers` (OpenAPI) or `basePath` (Swagger 2) must use the public route. Configure the app to derive that value from `APP_BASE_PATH` or honor `X-Forwarded-Prefix`; this is necessary for Swagger “Try it out” requests as well as other generated API clients. Static sites have no runtime process to configure, so their Swagger documents must already contain the public route.
 

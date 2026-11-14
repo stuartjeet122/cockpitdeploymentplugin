@@ -434,9 +434,9 @@
   async function refreshData() {
     try {
       const [overview, apps, deployments, settings] = await Promise.all([
-        callBackend("overview"),
-        callBackend("list"),
-        callBackend("deployments"),
+        callBackend("overview", ["--exclude-framework", "docker"]),
+        callBackend("list", ["--exclude-framework", "docker"]),
+        callBackend("deployments", ["--exclude-framework", "docker"]),
         callBackend("settings"),
       ]);
       renderApps(apps);
@@ -531,20 +531,10 @@
     let deployAfterSetup = true;
     const collect = (form) => {
       const values = Object.fromEntries(new FormData(form).entries());
-      const { app_directory, go_package, start_command, docker_mode, dockerfile, compose_file, compose_service, container_port, environment, deploy_now, ...payload } = values;
+      const { app_directory, go_package, start_command, environment, deploy_now, ...payload } = values;
       payload.build_config = {};
       if (app_directory.trim()) payload.build_config.app_directory = app_directory.trim();
       if (go_package.trim()) payload.build_config.go_package = go_package.trim();
-      if (payload.framework === "docker") {
-        payload.build_config.docker_mode = docker_mode;
-        if (docker_mode === "compose") {
-          payload.build_config.compose_file = compose_file.trim() || "compose.yaml";
-          payload.build_config.compose_service = compose_service.trim() || "web";
-        } else {
-          payload.build_config.dockerfile = dockerfile.trim() || "Dockerfile";
-        }
-        payload.build_config.container_port = Number(container_port);
-      }
       if (start_command.trim()) {
         let command;
         try { command = JSON.parse(start_command); } catch (_error) { throw new Error('Start command must be a JSON array, such as ["node", "server.js"].'); }
@@ -597,27 +587,6 @@
     const nameInput = form.elements.namedItem("name");
     const slugInput = form.elements.namedItem("slug");
     const routeInput = form.elements.namedItem("route");
-    const frameworkInput = form.elements.namedItem("framework");
-    const dockerOptions = form.querySelector("[data-docker-options]");
-    const containerPortInput = form.elements.namedItem("container_port");
-    const dockerModeInput = form.elements.namedItem("docker_mode");
-    const dockerfileOptions = form.querySelector("[data-dockerfile-options]");
-    const composeOptions = form.querySelector("[data-compose-options]");
-    const composeFileInput = form.elements.namedItem("compose_file");
-    const composeServiceInput = form.elements.namedItem("compose_service");
-    const updateDockerOptions = () => {
-      const dockerSelected = frameworkInput.value === "docker";
-      dockerOptions.hidden = !dockerSelected;
-      containerPortInput.required = dockerSelected;
-      const composeSelected = dockerSelected && dockerModeInput.value === "compose";
-      dockerfileOptions.hidden = !dockerSelected || composeSelected;
-      composeOptions.hidden = !composeSelected;
-      composeFileInput.required = composeSelected;
-      composeServiceInput.required = composeSelected;
-    };
-    frameworkInput.addEventListener("change", updateDockerOptions);
-    dockerModeInput.addEventListener("change", updateDockerOptions);
-    updateDockerOptions();
     form.elements.namedItem("branch").value = state.settings.default_branch || "main";
     const updatePreview = () => { byId("setupUrlPreview").textContent = `https://stuserver.online${routeInput.value || "/"}`; };
     const showStep = () => {
@@ -695,7 +664,7 @@
   }
 
   function editApplication(app) {
-    const frameworks = ["auto", "nextjs", "go", "node", "python", "static", "docker"];
+    const frameworks = ["auto", "nextjs", "go", "node", "python", "static"];
     const options = frameworks.map((framework) => `
       <option value="${framework}"${app.framework === framework ? " selected" : ""}>${framework === "auto" ? "Auto detect" : escapeHtml(framework)}</option>
     `).join("");
