@@ -41,7 +41,7 @@ Dockerfile deployments use `build_config.dockerfile`, `build_config.app_director
 - The Cockpit UI is plain HTML/JavaScript in `cockpit/`.
 - The plugin must remain a native Cockpit integration, not a standalone site.
 - UI actions should call the backend with structured JSON input and render backend responses cleanly.
-- Keep URL handling path-based (for example `/website1/`, `/api/`, etc.) rather than creating per-process subdomains.
+- Treat the application path as build/runtime configuration only; App Manager must not create domains or modify host web-server routing.
 
 ## Security requirements
 
@@ -65,7 +65,7 @@ Dockerfile deployments use `build_config.dockerfile`, `build_config.app_director
 - Each app gets its own service account, systemd unit, logs, config directory, and loopback-bound runtime port.
 - Dynamic non-Docker apps run on `127.0.0.1` only, never on a public interface.
 - Docker containers bind their internal service to `0.0.0.0` and are published only on the assigned `127.0.0.1` host port; a root-owned systemd unit invokes Docker without sharing the daemon socket with the app account.
-- Static apps should use direct Nginx path routing with the minimum runtime footprint. Do not spin up an unnecessary Python HTTP server unless a deployment explicitly requires it.
+- Static apps should be deployed as files with no unnecessary runtime process. Serving and virtual-host routing are configured separately by the host administrator.
 
 ## Directory structure
 
@@ -86,7 +86,6 @@ Dockerfile deployments use `build_config.dockerfile`, `build_config.app_director
 ├── templates/
 │   ├── auto-deploy.service
 │   ├── auto-deploy.timer
-│   ├── nginx.conf.tpl
 │   └── app.service.tpl
 ├── tests/
 │   └── test_app_manager.py
@@ -122,4 +121,4 @@ Dockerfile deployments use `build_config.dockerfile`, `build_config.app_director
 - Existing Go project at `/opt/stuserver-directory/stuserverwebsiteslist`
 - Existing systemd service `stuserver-websites`
 
-The App Manager must coexist with this environment and must route only under application-prefixed paths such as `/website1/` and `/api/` without disturbing the root site or its infrastructure.
+The App Manager must coexist with this environment without changing the root site or its infrastructure. Domain and virtual-host routing are managed separately from App Manager.

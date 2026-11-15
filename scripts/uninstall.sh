@@ -11,8 +11,6 @@ SOURCE_ROOT="${APP_MANAGER_SOURCE_ROOT:-${STATE_ROOT}/sources}"
 PRODUCTION_ROOT="${APP_MANAGER_PRODUCTION_ROOT:-/opt/webapps}"
 LOG_ROOT="${APP_MANAGER_LOG_ROOT:-/var/log/cockpit-app-manager}"
 SYSTEMD_DIR="${APP_MANAGER_SYSTEMD_DIR:-/etc/systemd/system}"
-NGINX_SNIPPET_DIR="${APP_MANAGER_NGINX_SNIPPET_DIR:-/etc/nginx/snippets/cockpit-app-manager}"
-NGINX_CONFIG_ROOT="${APP_MANAGER_NGINX_CONFIG_ROOT:-/etc/nginx}"
 
 DRY_RUN=0
 REMOVE_MANAGED_DATA=0
@@ -213,32 +211,6 @@ remove_managed_user() {
     fail "Could not remove verified App Manager account $username."
 }
 
-remove_managed_snippet() {
-  local app_id="$1"
-  local snippet="${NGINX_SNIPPET_DIR}/${app_id}.conf"
-  [[ -e "$snippet" || -L "$snippet" ]] || return 0
-  if [[ -L "$snippet" || ! -f "$snippet" ]] ||
-    ! grep -Fqx "# Managed by Cockpit App Manager: ${app_id}" "$snippet"; then
-    log "Leaving unverified Nginx snippet untouched: $snippet" >&2
-    APP_CLEANUP_BLOCKED=1
-    return 0
-  fi
-  if has_symlink_ancestor "$snippet"; then
-    fail "Refusing to modify an Nginx snippet beneath a symlink: $snippet"
-  fi
-
-  if [[ -d "$NGINX_CONFIG_ROOT" ]] &&
-    { grep -R -F -q -- "$snippet" "$NGINX_CONFIG_ROOT" ||
-      grep -R -F -q -- "$NGINX_SNIPPET_DIR" "$NGINX_CONFIG_ROOT" ||
-      grep -R -F -q -- "$(basename "$NGINX_SNIPPET_DIR")" "$NGINX_CONFIG_ROOT" ||
-      grep -R -F -q -- "${app_id}.conf" "$NGINX_CONFIG_ROOT"; }; then
-    log "Preserving active Nginx snippet because an existing Nginx config includes it: $snippet" >&2
-    APP_CLEANUP_BLOCKED=1
-    return 0
-  fi
-  safe_remove "$snippet"
-}
-
 remove_managed_app_data() {
   local registry_records
   registry_records="$(parse_registry_records)" || fail "The registry could not be validated; no managed app data was removed."
@@ -249,12 +221,6 @@ remove_managed_app_data() {
     is_valid_app_id "$app_id" || fail "Invalid application ID in registry."
 
     APP_CLEANUP_BLOCKED=0
-    remove_managed_snippet "$app_id"
-    if [[ "$APP_CLEANUP_BLOCKED" -eq 1 ]]; then
-      log "Preserving application, account, and service because its Nginx snippet is active or unverified: $app_id" >&2
-      apps_preserved=1
-      continue
-    fi
     remove_managed_unit "$app_id" "@worker"
     remove_managed_unit "$app_id"
     remove_managed_unit "$app_id" "@secondary"

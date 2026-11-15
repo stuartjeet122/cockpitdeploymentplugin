@@ -29,8 +29,7 @@ class UbuntuIntegrationTests(unittest.TestCase):
         cls.production = Path("/opt/webapps-integration")
         cls.logs = Path("/var/log/cockpit-app-manager-integration")
         cls.site = Path("/etc/nginx/conf.d/cockpit-app-manager-integration.conf")
-        cls.snippets = Path("/etc/nginx/snippets/cockpit-app-manager-integration")
-        cls.targets = (cls.state, cls.production, cls.logs, cls.site, cls.snippets)
+        cls.targets = (cls.state, cls.production, cls.logs, cls.site)
         if any(path.exists() or path.is_symlink() for path in cls.targets):
             raise RuntimeError("Integration paths already exist; refusing to overwrite them")
         if any(Path(f"/etc/systemd/system/cockpit-app-it-{framework}{suffix}.service").exists()
@@ -42,9 +41,6 @@ class UbuntuIntegrationTests(unittest.TestCase):
             "DEFAULT_STATE_ROOT": str(cls.state), "DEFAULT_CONFIG_PATH": str(cls.state / "config.json"),
             "DEFAULT_REGISTRY_PATH": str(cls.state / "apps.json"), "DEFAULT_SOURCE_ROOT": str(cls.state / "sources"),
             "DEFAULT_PRODUCTION_ROOT": str(cls.production), "DEFAULT_LOG_ROOT": str(cls.logs),
-            "DEFAULT_NGINX_SNIPPET_DIR": str(cls.snippets),
-            "NGINX_MANAGED_INCLUDE": f"include {cls.snippets}/*.conf;",
-            "DEFAULT_PUBLIC_ORIGIN": "http://127.0.0.1:18080",
         }
         for name, value in constants.items():
             cls.stack.enter_context(patch.object(manager, name, value))
@@ -82,13 +78,13 @@ class UbuntuIntegrationTests(unittest.TestCase):
         cls.site.unlink(missing_ok=True)
         cls.command(["nginx", "-t"])
         cls.command(["systemctl", "reload", "nginx"])
-        for path in (cls.snippets, cls.state, cls.production, cls.logs):
+        for path in (cls.state, cls.production, cls.logs):
             if path.exists():
                 shutil.rmtree(path)
 
-    def fetch(self, route):
+    def fetch(self, route, port=18080):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open("http://127.0.0.1:18080" + route, timeout=10) as response:
+        with opener.open(f"http://127.0.0.1:{port}" + route, timeout=10) as response:
             return response.status, response.read().decode()
 
     def test_auto_deploy_sandbox_can_run_app_commands(self):
@@ -202,12 +198,17 @@ class UbuntuIntegrationTests(unittest.TestCase):
                     return {"status": "cloned"}
                 with patch.object(manager, "clone_or_update_repo", side_effect=copy_fixture), patch.object(manager, "git_output", return_value="a" * 40):
                     first = manager.deploy_app(app_id)
-                self.assertEqual(self.fetch(app["route"])[0], 200)
-                self.assertIn("release-one", self.fetch(app["route"])[1])
+                if framework == "static":
+                    content = (manager._app_paths(app_id, manager.get_config())["current"] / "app" / "index.html").read_text()
+                    self.assertIn("release-one", content)
+                else:
+                    app_route = app["route"] if framework == "nextjs" else "/"
+                    self.assertEqual(self.fetch(app_route, app["port"])[0], 200)
+                    self.assertIn("release-one", self.fetch(app_route, app["port"])[1])
                 if framework == "go":
-                    self.assertIn("environment-loaded:release-one", self.fetch(app["route"])[1])
+                    self.assertIn("environment-loaded:release-one", self.fetch("/", app["port"])[1])
                 self.assertFalse(Path(app["source_path"]).exists())
-                self.assertTrue(manager.health_check_app(app_id)["public_healthy"])
+                self.assertTrue(manager.health_check_app(app_id)["healthy"])
                 persistent = manager._app_paths(app_id, manager.get_config())["storage"] / "data" / "saved.txt"
                 manager._run_as_user(app["service_user"], ["python3", "-c", "import os,pathlib;pathlib.Path(os.environ['APP_DATA_DIR']).joinpath('saved.txt').write_text('retained')"],
                                      environment={"APP_DATA_DIR": str(persistent.parent)})
@@ -222,7 +223,8 @@ class UbuntuIntegrationTests(unittest.TestCase):
                     with patch.object(manager, "clone_or_update_repo", side_effect=copy_fixture), patch.object(manager, "git_output", return_value="b" * 40), patch.object(manager, "_assert_deployed_ancestor"):
                         second = manager.deploy_app(app_id)
                     self.assertNotEqual(first["app"]["port"], second["app"]["port"])
-                    self.assertIn("release-two", self.fetch(app["route"])[1])
+                    app_route = app["route"] if framework == "nextjs" else "/"
+                    self.assertIn("release-two", self.fetch(app_route, second["app"]["port"])[1])
                     self.assertFalse(Path(first["deployment"]["release"]).exists())
                     self.assertEqual(persistent.read_text(), "retained")
                     manager.edit_app(app_id, {"health_check_url": "/never-ready", "build_config": {"start_command": ["/bin/false"]}})

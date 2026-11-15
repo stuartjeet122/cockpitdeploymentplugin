@@ -311,13 +311,9 @@ test("shared registry reuses tarballs across isolated stores and rejects writes"
 
 const html = fs.readFileSync(path.join(root, "cockpit/index.html"), "utf8");
 const script = fs.readFileSync(path.join(root, "cockpit/app-manager.js"), "utf8");
-const dockerManagerHtml = fs.readFileSync(path.join(root, "cockpit/docker-manager/index.html"), "utf8");
-const dockerManagerScript = fs.readFileSync(path.join(root, "cockpit/docker-manager/docker-manager.js"), "utf8");
-const nginxManagerHtml = fs.readFileSync(path.join(root, "cockpit/nginx-manager/index.html"), "utf8");
-const nginxManagerScript = fs.readFileSync(path.join(root, "cockpit/nginx-manager/nginx-manager.js"), "utf8");
 const fixtureApps = [
-  { id: "portal", name: "Customer Portal", framework: "nextjs", branch: "main", route: "/portal/", active_route: "/portal/", hosting_active: true, public_url: "https://stuserver.online/portal/", repo_url: "https://github.com/example/portal.git", port: 8100, status: "running", last_deploy: "2026-11-11T09:00:00Z", deployments: [] },
-  { id: "docs", name: "Documentation", framework: "static", branch: "main", route: "/docs/", hosting_active: false, repo_url: "https://github.com/example/docs.git", port: 8101, status: "stopped", deployments: [] },
+  { id: "portal", name: "Customer Portal", framework: "nextjs", branch: "main", route: "/portal/", repo_url: "https://github.com/example/portal.git", port: 8100, status: "running", last_deploy: "2026-11-11T09:00:00Z", deployments: [] },
+  { id: "docs", name: "Documentation", framework: "static", branch: "main", route: "/docs/", repo_url: "https://github.com/example/docs.git", port: 8101, status: "stopped", deployments: [] },
 ];
 
 async function loadUi(overrides = {}, configureWindow) {
@@ -358,239 +354,35 @@ async function loadUi(overrides = {}, configureWindow) {
   return { dom, window, document: window.document, calls };
 }
 
-async function loadDockerManager(overrides = {}) {
-  const dom = new JSDOM(dockerManagerHtml, {
-    runScripts: "outside-only",
-    url: "https://localhost/cockpit/docker-manager/index.html",
-  });
-  const { window } = dom;
-  const calls = [];
-  window.confirm = () => true;
-  window.TextEncoder = TextEncoder;
-  window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
-  window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event("close")); };
-  const defaults = {
-    list: { apps: [] }, overview: { total_apps: 0 }, deployments: { deployments: [] },
-    "docker-status": { installed: false, daemon_active: false, compose_available: false },
-    "env-save": { key_count: 1 },
-  };
-  window.cockpit = {
-    spawn(args) {
-      const [, command, ...values] = args;
-      const record = { command, values };
-      calls.push(record);
-      let stream;
-      const handler = overrides[command];
-      const promise = Promise.resolve().then(() => typeof handler === "function" ? handler(record) : handler || defaults[command] || {}).then((result) => {
-        const output = JSON.stringify({ ok: true, ...result });
-        if (stream) { stream(output); return ""; }
-        return output;
-      });
-      promise.stream = (callback) => { stream = callback; return promise; };
-      promise.input = (input) => { record.input = input; return promise; };
-      return promise;
-    },
-  };
-  window.eval(dockerManagerScript);
-  await settle(window);
-  return { dom, window, document: window.document, calls };
-}
-
-async function loadNginxManager(overrides = {}) {
-  const dom = new JSDOM(nginxManagerHtml, {
-    runScripts: "outside-only",
-    url: "https://localhost/cockpit/nginx-manager/index.html",
-  });
-  const { window } = dom;
-  const calls = [];
-  window.confirm = () => true;
-  window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
-  window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event("close")); };
-  const defaults = {
-    "nginx-overview": { nginx_version: "1.26.0", service_state: "active", sites: [], conflicts: [], warnings: [] },
-    "nginx-conflicts": { conflicts: [], warnings: [], can_enable: true },
-    "nginx-site-save": { message: "Website saved." },
-    "nginx-site-enable": { enabled: true },
-    "nginx-site-disable": { enabled: false },
-    "nginx-test": { passed: true, output: "syntax is ok" },
-    "nginx-service": { action: "reload", message: "Nginx reload completed successfully" },
-  };
-  window.cockpit = {
-    spawn(args) {
-      const [, command, ...values] = args;
-      const record = { command, values };
-      calls.push(record);
-      let stream;
-      const handler = overrides[command];
-      const promise = Promise.resolve()
-        .then(() => typeof handler === "function" ? handler(record) : handler || defaults[command] || {})
-        .then((result) => {
-          const output = JSON.stringify({ ok: true, ...result });
-          if (stream) { stream(output); return ""; }
-          return output;
-        });
-      promise.stream = (callback) => { stream = callback; return promise; };
-      return promise;
-    },
-  };
-  window.eval(nginxManagerScript);
-  await settle(window);
-  return { dom, window, document: window.document, calls };
-}
-
 async function settle(window) {
   for (let turn = 0; turn < 4; turn += 1) await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
-test("applications are the initial view and only active routes have public links", async () => {
+test("applications are the initial view and routing is configured separately", async () => {
   const ui = await loadUi();
   try {
     assert.equal(ui.document.querySelector('[data-tab="websites"]').getAttribute("aria-selected"), "true");
     assert.equal(ui.document.querySelectorAll(".am-app-card").length, 2);
-    assert.equal(ui.document.querySelectorAll('.am-app-route a[href="https://stuserver.online/portal/"]').length, 1);
-    assert.match(ui.document.querySelector("#appsTableContainer").textContent, /Deploy to activate/);
-    assert.equal(ui.document.querySelector('[data-action="start"][data-id="docs"]').disabled, true);
+    assert.equal(ui.document.querySelectorAll(".am-app-route a").length, 0);
+    assert.match(ui.document.querySelector("#appsTableContainer").textContent, /configure routing in Nginx Manager/i);
+    assert.equal(ui.document.querySelector('[data-action="start"][data-id="docs"]'), null);
   } finally { ui.dom.window.close(); }
 });
 
-test("App Manager excludes Docker apps and reserves Docker setup for its own plugin", async () => {
+test("App Manager includes Docker applications without a separate Docker Manager plugin", async () => {
   const ui = await loadUi();
   try {
-    assert.equal(ui.document.querySelector('#appFramework option[value="docker"]'), null);
-    assert.deepEqual(ui.calls.find((record) => record.command === "list").values, ["--exclude-framework", "docker"]);
-    assert.deepEqual(ui.calls.find((record) => record.command === "overview").values, ["--exclude-framework", "docker"]);
-    assert.deepEqual(ui.calls.find((record) => record.command === "deployments").values, ["--exclude-framework", "docker"]);
+    ui.document.querySelector("[data-open-add]").click();
+    assert.ok(ui.document.querySelector('#appFramework option[value="docker"]'));
+    assert.deepEqual(ui.calls.find((record) => record.command === "list").values, []);
+    assert.equal(fs.existsSync(path.join(root, "cockpit/docker-manager")), false);
+    assert.equal(fs.existsSync(path.join(root, "cockpit/nginx-manager")), false);
   } finally { ui.dom.window.close(); }
 });
 
-test("Docker Manager is a distinct, branded Cockpit plugin and manages the host Engine", async () => {
-  const manifest = JSON.parse(fs.readFileSync(path.join(root, "cockpit/docker-manager/manifest.json"), "utf8"));
-  assert.equal(manifest.name, "docker-manager");
-  assert.equal(manifest.menu["docker-manager"].label, "Docker Manager");
-  assert.equal(html.includes('data-tab="docker"'), false);
-  assert.match(dockerManagerHtml, /class="docker-mark"/);
-
-  const dockerStatus = {
-    installed: true, daemon_active: true, engine_version: "27.0.1",
-    compose_available: true, compose_version: "v2.29.0",
-  };
-  const ui = await loadDockerManager({ "docker-status": dockerStatus, "docker-install": { updated: true, ...dockerStatus } });
-  try {
-    assert.match(ui.document.querySelector("#engineDetails").textContent, /27\.0\.1/);
-    assert.match(ui.document.querySelector("#engineDetails").textContent, /v2\.29\.0/);
-    assert.deepEqual(ui.calls.find((record) => record.command === "list").values, ["--framework", "docker"]);
-    ui.document.querySelector("#installButton").click();
-    await settle(ui.window);
-    assert.equal(ui.calls.filter((record) => record.command === "docker-install").length, 1);
-    assert.match(ui.document.querySelector("#globalNotice").textContent, /installed and running/);
-  } finally { ui.dom.window.close(); }
-});
-
-test("Nginx Manager is an independent branded plugin with read-only host-site inventory", async () => {
-  const manifest = JSON.parse(fs.readFileSync(path.join(root, "cockpit/nginx-manager/manifest.json"), "utf8"));
-  assert.equal(manifest.name, "nginx-manager");
-  assert.equal(manifest.menu["nginx-manager"].label, "Nginx Manager");
-  assert.match(nginxManagerHtml, /class="nginx-mark"/);
-  const managed = {
-    site_id: "a".repeat(32), name: "managed.example.com", domains: ["managed.example.com"],
-    mode: "proxy", upstream_port: 3000, listen_port: 80, listen_ports: [80, 443],
-    tls: true, enabled: true, managed: true, editable: true, path: "/etc/nginx/conf.d/managed.conf",
-  };
-  const unmanaged = {
-    site_id: null, name: "stuserver.online", domains: ["stuserver.online"],
-    mode: "external", listen_port: 443, listen_ports: [443], tls: true,
-    enabled: true, managed: false, editable: false, path: "/etc/nginx/sites-enabled/default",
-  };
-  const ui = await loadNginxManager({
-    "nginx-overview": { nginx_version: "1.26.0", service_state: "active", sites: [managed, unmanaged], conflicts: [], warnings: [] },
-  });
-  try {
-    assert.equal(ui.document.querySelectorAll(".site-card").length, 2);
-    assert.match(ui.document.querySelector("#siteCountCaption").textContent, /1 managed here/);
-    assert.ok(ui.document.querySelector(`[data-action="edit"][data-id="${"a".repeat(32)}"]`));
-    assert.equal(ui.document.querySelectorAll(".site-card:nth-child(2) [data-action='edit']").length, 0);
-    assert.equal(ui.document.querySelectorAll(".site-card:nth-child(2) [data-action='enable']").length, 0);
-    assert.match(ui.document.querySelector("#serviceState").textContent, /running/i);
-  } finally { ui.dom.window.close(); }
-});
-
-test("Nginx Manager validates a new proxy website and saves only after conflict checks", async () => {
-  let savedSite = null;
-  const siteId = "b".repeat(32);
-  const ui = await loadNginxManager({
-    "nginx-overview": () => ({
-      nginx_version: "1.26.0", service_state: "active",
-      sites: savedSite ? [savedSite] : [], conflicts: [], warnings: [],
-    }),
-    "nginx-conflicts": (record) => {
-      const payload = JSON.parse(record.values[0]);
-      return { conflicts: [], can_enable: true, warnings: [], received: payload.domains };
-    },
-    "nginx-site-save": (record) => {
-      const payload = JSON.parse(record.values[0]);
-      savedSite = {
-        ...payload, site_id: siteId, name: payload.domains[0],
-        listen_ports: [payload.listen_port, ...(payload.tls ? [443] : [])],
-        managed: true, editable: true, path: `/etc/nginx/conf.d/${siteId}.conf`,
-      };
-      return { message: "Virtual host saved and enabled." };
-    },
-  });
-  try {
-    ui.document.querySelector('[data-action="create"]').click();
-    const form = ui.document.querySelector("#siteForm");
-    form.elements.domains.value = "shop.example.com, www.shop.example.com";
-    form.elements.mode.value = "proxy";
-    form.elements.mode.dispatchEvent(new ui.window.Event("change"));
-    form.elements.upstream_port.value = "3000";
-    form.elements.tls.checked = true;
-    form.elements.tls.dispatchEvent(new ui.window.Event("change"));
-    form.elements.certificate_file.value = "/etc/letsencrypt/live/shop/fullchain.pem";
-    form.elements.private_key_file.value = "/etc/letsencrypt/live/shop/privkey.pem";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-
-    const checked = ui.calls.find((record) => record.command === "nginx-conflicts");
-    const saved = ui.calls.find((record) => record.command === "nginx-site-save");
-    const payload = JSON.parse(saved.values[0]);
-    assert.deepEqual(JSON.parse(checked.values[0]).domains, ["shop.example.com", "www.shop.example.com"]);
-    assert.equal(payload.mode, "proxy");
-    assert.equal(payload.upstream_port, 3000);
-    assert.equal(payload.tls, true);
-    assert.equal(payload.certificate_file, "/etc/letsencrypt/live/shop/fullchain.pem");
-    assert.equal(ui.document.querySelector("#siteDialog").open, false);
-    assert.equal(ui.document.querySelectorAll(".site-card").length, 1);
-    assert.match(ui.document.querySelector("#globalNotice").textContent, /Reload Nginx/);
-  } finally { ui.dom.window.close(); }
-});
-
-test("Nginx Manager blocks conflicted enabled sites and gates reload behind confirmation", async () => {
-  const ui = await loadNginxManager({
-    "nginx-conflicts": {
-      conflicts: [{ type: "domain", domain: "taken.example.com", port: 80, blocking: true, message: "Domain is already configured." }],
-      can_enable: false,
-    },
-  });
-  try {
-    ui.document.querySelector('[data-action="create"]').click();
-    const form = ui.document.querySelector("#siteForm");
-    form.elements.domains.value = "taken.example.com";
-    form.elements.document_root.value = "/var/www/taken";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    assert.equal(ui.calls.some((record) => record.command === "nginx-site-save"), false);
-    assert.match(ui.document.querySelector("#formError").textContent, /already configured/);
-
-    ui.document.querySelector('[data-action="reload"]').click();
-    await settle(ui.window);
-    const service = ui.calls.find((record) => record.command === "nginx-service");
-    assert.deepEqual(service.values, ["reload"]);
-  } finally { ui.dom.window.close(); }
-});
-
-test("Docker Manager registers Dockerfile apps with the Docker backend", async () => {
+test("App Manager registers Dockerfile apps through the regular application flow", async () => {
   let savedApps = [];
-  const ui = await loadDockerManager({
+  const ui = await loadUi({
     list: () => ({ apps: savedApps }),
     add: (record) => {
       const payload = JSON.parse(record.values[0]);
@@ -599,50 +391,56 @@ test("Docker Manager registers Dockerfile apps with the Docker backend", async (
     },
   });
   try {
-    ui.document.querySelector("[data-open-create]").click();
-    const form = ui.document.querySelector("#dockerAppForm");
+    ui.document.querySelector("[data-open-add]").click();
+    const form = ui.document.querySelector(".am-dialog-form");
     form.elements.repo_url.value = "https://github.com/example/docker-shop.git";
     form.elements.name.value = "Docker Shop";
     form.elements.name.dispatchEvent(new ui.window.Event("input"));
+    ui.document.querySelector("#setupNext").click();
+    form.elements.framework.value = "docker";
+    form.elements.framework.dispatchEvent(new ui.window.Event("change"));
     form.elements.dockerfile.value = "deploy/Dockerfile";
     form.elements.container_port.value = "8081";
     form.elements.environment.value = 'DATABASE_URL="private-value"';
     form.elements.deploy_now.checked = false;
+    ui.document.querySelector("#setupNext").click();
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
     assert.equal(payload.framework, "docker");
-    assert.deepEqual(payload.build_config, {
-      docker_mode: "dockerfile", dockerfile: "deploy/Dockerfile", container_port: 8081,
-    });
+    assert.deepEqual(payload.build_config, { docker_mode: "dockerfile", dockerfile: "deploy/Dockerfile", container_port: 8081 });
     const environmentSave = ui.calls.find((record) => record.command === "env-save");
     assert.equal(environmentSave.input, 'DATABASE_URL="private-value"\n');
-    assert.equal(ui.document.querySelector("#appDialog").open, false);
+    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
   } finally { ui.dom.window.close(); }
 });
 
-test("Docker Manager configures Compose apps and lists its managed containers", async () => {
+test("App Manager accepts Docker Compose deployment settings", async () => {
   let savedApps = [];
-  const ui = await loadDockerManager({
+  const ui = await loadUi({
     list: () => ({ apps: savedApps }),
     add: (record) => {
       const payload = JSON.parse(record.values[0]);
-      savedApps = [{ ...payload, id: payload.slug, status: "running", port: 8100, hosting_active: true, active_route: payload.route, public_url: `https://stuserver.online${payload.route}`, deployments: [] }];
+      savedApps = [{ ...payload, id: payload.slug, status: "running", port: 8100, deployments: [] }];
       return { app: savedApps[0] };
     },
   });
   try {
-    ui.document.querySelector("[data-open-create]").click();
-    const form = ui.document.querySelector("#dockerAppForm");
+    ui.document.querySelector("[data-open-add]").click();
+    const form = ui.document.querySelector(".am-dialog-form");
     form.elements.repo_url.value = "https://github.com/example/compose-shop.git";
     form.elements.name.value = "Compose Shop";
     form.elements.name.dispatchEvent(new ui.window.Event("input"));
+    ui.document.querySelector("#setupNext").click();
+    form.elements.framework.value = "docker";
+    form.elements.framework.dispatchEvent(new ui.window.Event("change"));
     form.elements.docker_mode.value = "compose";
     form.elements.docker_mode.dispatchEvent(new ui.window.Event("change"));
     form.elements.compose_file.value = "deploy/compose.yaml";
     form.elements.compose_service.value = "frontend";
     form.elements.container_port.value = "8080";
     form.elements.deploy_now.checked = false;
+    ui.document.querySelector("#setupNext").click();
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
@@ -650,8 +448,9 @@ test("Docker Manager configures Compose apps and lists its managed containers", 
       docker_mode: "compose", compose_file: "deploy/compose.yaml",
       compose_service: "frontend", container_port: 8080,
     });
-    assert.equal(ui.document.querySelectorAll(".container-card").length, 1);
-    assert.match(ui.document.querySelector(".container-card").textContent, /127\.0\.0\.1:8100/);
+    assert.equal(payload.framework, "docker");
+    assert.equal(payload.build_config.compose_service, "frontend");
+    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
   } finally { ui.dom.window.close(); }
 });
 
@@ -688,17 +487,16 @@ test("application editing submits automatic deployment policy and numeric resour
   } finally { ui.dom.window.close(); }
 });
 
-test("health observations distinguish service readiness and public failures", async () => {
+test("health observations show local service readiness without public probes", async () => {
   const ui = await loadUi({ list: { apps: [{ ...fixtureApps[0], health: {
     checked_at: "2026-11-11T09:00:00Z", service_state: "active", local_healthy: true,
-    public_healthy: false, public_error: "Public DNS unavailable",
   }, auto_deploy: false }] } });
   try {
     const card = ui.document.querySelector(".am-app-card");
-    assert.match(card.textContent, /ReadinessHealthy/);
-    assert.match(card.textContent, /Public routeFailed/);
-    assert.match(card.textContent, /Auto-deployPaused/);
-    assert.ok(card.querySelector('[title="Public DNS unavailable"]'));
+    assert.equal(card.querySelector('[data-health="healthy"]')?.textContent, "Healthy");
+    assert.match(card.textContent, /Auto-deploy paused/);
+    assert.equal(card.textContent.includes("Public route"), false);
+    assert.equal(card.querySelector('[title="Public DNS unavailable"]'), null);
   } finally { ui.dom.window.close(); }
 });
 
@@ -715,20 +513,6 @@ test("successful service transitions override older health observations", async 
     assert.equal(ui.document.querySelectorAll(".am-app-card").length, 0);
   } finally { ui.dom.window.close(); }
 });
-test("forbidden public probes are blocked without marking a healthy runtime failed", async () => {
-  const ui = await loadUi({ list: { apps: [{ ...fixtureApps[0], health: {
-    checked_at: new Date().toISOString(), service_state: "active", local_healthy: true,
-    public_healthy: false, public_status: 403, public_error: "Cloudflare returned HTTP 403",
-  } }] } });
-  try {
-    const card = ui.document.querySelector(".am-app-card");
-    assert.equal(card.dataset.status, "running");
-    assert.match(card.textContent, /Blocked · 403/);
-    assert.match(card.textContent, /ReadinessHealthy/);
-    assert.equal(card.querySelector(".am-runtime-details").open, false);
-  } finally { ui.dom.window.close(); }
-});
-
 test("offline bundle renders every requested interface icon", async () => {
   const bundle = fs.readFileSync(path.join(root, "cockpit/icons.js"), "utf8");
   const ui = await loadUi({}, (window) => window.eval(bundle));
@@ -1169,13 +953,13 @@ test("application setup imports .env variants and text files into private enviro
   } finally { ui.dom.window.close(); }
 });
 
-test("attention includes public failures and matches the summary", async () => {
+test("attention includes local readiness failures and matches the summary", async () => {
   const cases = [
-    { health: { public_healthy: false } }, { health: { local_healthy: false } },
+    { health: { local_healthy: false } },
     { auto_deploy_state: { error: "Fetch failed" } },
     { deployments: [{ status: "deployed", cleanup_error: "Cleanup failed" }] },
     { pending_update: { commit: "new" }, deployed_commit: "old" },
-    { pending_update: { commit: "same" }, deployed_commit: "same" },
+    { status: "failed" },
   ];
   const ui = await loadUi({ list: { apps: cases.map((extra, index) => ({ ...fixtureApps[0], id: `app-${index}`, ...extra })) } });
   try {
@@ -1203,18 +987,18 @@ test("refresh preserves settings drafts and successful saves accept server value
   } finally { ui.dom.window.close(); }
 });
 
-test("manual health checks reload observations and report public failures", async () => {
+test("manual health checks reload local observations", async () => {
   let checked = false;
   const ui = await loadUi({
-    list: () => ({ apps: [{ ...fixtureApps[0], health: { public_healthy: checked ? false : null } }] }),
-    health: () => { checked = true; return { healthy: true, public_healthy: false, public_error: "DNS failed" }; },
+    list: () => ({ apps: [{ ...fixtureApps[0], health: { local_healthy: checked } }] }),
+    health: () => { checked = true; return { healthy: true, url: "http://127.0.0.1:8100/" }; },
   });
   try {
     ui.document.querySelector('[data-action="health"]').click();
     await settle(ui.window);
     assert.equal(ui.calls.filter((record) => record.command === "list").length, 2);
-    assert.match(ui.document.querySelector("#appManagerError").textContent, /public route failed: DNS failed/);
-    assert.match(ui.document.querySelector(".am-app-card").textContent, /Failed/);
+    assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Runtime health check passed/);
+    assert.match(ui.document.querySelector(".am-app-card").textContent, /Healthy/);
   } finally { ui.dom.window.close(); }
 });
 

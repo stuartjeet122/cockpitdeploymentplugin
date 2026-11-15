@@ -59,18 +59,7 @@ DEFAULT_REGISTRY_PATH = f"{DEFAULT_STATE_ROOT}/apps.json"
 DEFAULT_PRODUCTION_ROOT = "/opt/webapps"
 DEFAULT_SOURCE_ROOT = f"{DEFAULT_STATE_ROOT}/sources"
 DEFAULT_LOG_ROOT = "/var/log/cockpit-app-manager"
-DEFAULT_NGINX_SNIPPET_DIR = "/etc/nginx/snippets/cockpit-app-manager"
-DEFAULT_NGINX_CONFIG_ROOT = "/etc/nginx"
-NGINX_MANAGED_INCLUDE = f"include {DEFAULT_NGINX_SNIPPET_DIR}/*.conf;"
-NGINX_MANAGER_SITE_PREFIX = "cockpit-nginx-manager-"
-NGINX_MANAGER_MARKER = "# Managed by Cockpit Nginx Manager:"
-NGINX_MANAGER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-NGINX_MANAGER_DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$")
-NGINX_TLS_ALLOWED_ROOTS = ("/etc/letsencrypt", "/etc/ssl")
-NGINX_DOCUMENT_ROOTS = ("/var/www", "/srv/www", "/opt/webapps")
-DEFAULT_PUBLIC_ORIGIN = "https://stuserver.online"
 DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
-DEFAULT_OS_RELEASE_PATH = "/etc/os-release"
 PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
 PLUGIN_REPOSITORY_BRANCH = "main"
 PLUGIN_UPDATE_USER = "nobody"
@@ -121,7 +110,6 @@ def _default_config() -> Dict[str, Any]:
         "min_free_disk_mb": 512,
         "max_concurrent_builds": 1,
         "log_root": DEFAULT_LOG_ROOT,
-        "nginx_template": "/etc/cockpit/app-manager/templates/nginx.conf.tpl",
         "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl",
     }
 
@@ -406,6 +394,8 @@ def _validate_app_directory_setting(value: Any) -> None:
 def validate_app_route(value: Any, app_id: str) -> str:
     if value is None:
         value = f"/{app_id}/"
+    if value == "/":
+        return value
     if (
         not isinstance(value, str)
         or len(value) > 256
@@ -426,10 +416,6 @@ def validate_app_route(value: Any, app_id: str) -> str:
             "using lowercase letters, numbers, and hyphens"
         )
     return value.rstrip("/") + "/"
-
-
-def _public_url_for_route(route: str) -> str:
-    return f"{DEFAULT_PUBLIC_ORIGIN}{route}"
 
 
 def _validate_python_services(value: Any, framework: str, build: Dict[str, Any]) -> Dict[str, Any]:
@@ -1324,8 +1310,9 @@ def _routed_health_path(app: Dict[str, Any]) -> str:
     health = app.get("health_check_url") or "/"
     if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
         raise ValueError("Health-check URL must be a local path")
-    route = validate_app_route(app.get("active_route") or app.get("route"), app["id"])
-    if app.get("framework") == "nextjs" and (health == route.rstrip("/") or health.startswith(route)):
+    route = validate_app_route(app.get("route"), app["id"])
+    route_prefix = route.rstrip("/")
+    if route == "/" or app.get("framework") == "nextjs" and (health == route_prefix or health.startswith(route)):
         return health
     return route + health.lstrip("/")
 
@@ -1359,14 +1346,14 @@ def _static_content_root(app: Dict[str, Any], config: Dict[str, Any]) -> Path:
     return content_root
 
 
-def app_health_url(app: Dict[str, Any]) -> str:
+def app_health_url(app: Dict[str, Any]) -> Optional[str]:
     health = app.get("health_check_url") or "/"
     if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
         raise ValueError("Health-check URL must be a local path")
     if _is_static_app(app):
-        return DEFAULT_PUBLIC_ORIGIN + _routed_health_path(app)
+        return None
     if app.get("framework") == "nextjs":
-        health = _routed_health_path(dict(app, active_route=app.get("route")))
+        health = _routed_health_path(app)
     port = app.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
         raise ValueError("Application has an invalid port")
@@ -1376,12 +1363,11 @@ def app_health_url(app: Dict[str, Any]) -> str:
 def check_app_health(app: Dict[str, Any], timeout_seconds: int = 30) -> bool:
     if _is_static_app(app):
         index = _static_content_root(app, get_config()) / "index.html"
-        return bool(app.get("hosting_active") and app.get("status") == "running" and index.is_file())
-    request = urllib.request.Request(app_health_url(app), headers={
-        "Host": urllib.parse.urlsplit(DEFAULT_PUBLIC_ORIGIN).netloc,
-        "X-Forwarded-Proto": urllib.parse.urlsplit(DEFAULT_PUBLIC_ORIGIN).scheme,
-        "X-Forwarded-Prefix": (app.get("route") or "").rstrip("/"),
-    }, method="GET")
+        return index.is_file()
+    url = app_health_url(app)
+    if url is None:
+        return False
+    request = urllib.request.Request(url, method="GET")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LocalHealthRedirectHandler())
     try:
         with opener.open(request, timeout=max(1, min(int(timeout_seconds), 10))) as response:
@@ -1399,11 +1385,6 @@ class _LocalHealthRedirectHandler(urllib.request.HTTPRedirectHandler):
         if (target.scheme, target.netloc) != (original.scheme, original.netloc):
             return None
         return super().redirect_request(req, fp, code, msg, headers, new_url)
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, new_url):
-        return None
 
 
 def _wait_for_health(app: Dict[str, Any], timeout_seconds: int) -> bool:
@@ -1495,15 +1476,10 @@ def app_metadata(app: Dict[str, Any]) -> Dict[str, Any]:
     source = Path(app.get("source_path", ""))
     if source.is_dir():
         metadata["latest_commit"] = git_output(source, "rev-parse", "HEAD", username=app.get("service_user")) or metadata.get("latest_commit")
-    route = validate_app_route(app.get("route"), app["id"])
-    active_route = app.get("active_route")
-    if active_route is not None:
-        active_route = validate_app_route(active_route, app["id"])
-    hosting_active = bool(app.get("hosting_active", False) and active_route)
-    metadata["route"] = route
-    metadata["hosting_active"] = hosting_active
-    metadata["active_route"] = active_route
-    metadata["public_url"] = _public_url_for_route(active_route) if hosting_active else None
+    metadata["route"] = validate_app_route(app.get("route"), app["id"])
+    metadata.pop("active_route", None)
+    metadata.pop("hosting_active", None)
+    metadata.pop("public_url", None)
     return metadata
 
 
@@ -1833,7 +1809,6 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
     config = get_config()
     seen_ids: Set[str] = set()
     seen_ports: Set[int] = set()
-    seen_routes: Dict[str, str] = {}
     for app in registry["apps"]:
         if not isinstance(app, dict):
             raise ValueError("Each application registry entry must be an object")
@@ -1844,22 +1819,7 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         if app_id in seen_ids:
             raise ValueError(f"Duplicate application ID in registry: {app_id}")
         seen_ids.add(app_id)
-        route = validate_app_route(app.get("route"), app_id)
-        app["route"] = route
-        route_values = {route}
-        active_route = app.get("active_route")
-        if active_route is not None:
-            active_route = validate_app_route(active_route, app_id)
-            app["active_route"] = active_route
-            route_values.add(active_route)
-        app.setdefault("hosting_active", False)
-        if not isinstance(app["hosting_active"], bool):
-            raise ValueError(f"Application {app_id!r} has an invalid Nginx hosting status")
-        for route_value in route_values:
-            owner = seen_routes.get(route_value)
-            if owner is not None and owner != app_id:
-                raise ValueError(f"Duplicate application route in registry: {route_value}")
-            seen_routes[route_value] = app_id
+        app["route"] = validate_app_route(app.get("route"), app_id)
         validate_name(app.get("name"))
         if not validate_git_url(app.get("repo_url")):
             raise ValueError(f"Application {app_id!r} has an invalid Git URL")
@@ -1944,17 +1904,6 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
     with _registry_transaction() as registry:
         if any(app.get("id") == normalized["id"] for app in registry["apps"]):
             raise ValueError(f"Application {normalized['id']!r} is already registered")
-        for app in registry["apps"]:
-            existing_routes = {
-                validate_app_route(app.get("route"), app["id"]),
-                *(
-                    [validate_app_route(app["active_route"], app["id"])]
-                    if app.get("active_route") is not None
-                    else []
-                ),
-            }
-            if normalized["route"] in existing_routes:
-                raise ValueError(f"Route {normalized['route']} is already assigned to another application")
         port = normalized.get("port")
         if port is None:
             port = _select_port(registry, config)
@@ -1977,8 +1926,6 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
             "branch": normalized["branch"],
             "framework": normalized["framework"],
             "route": normalized["route"],
-            "active_route": None,
-            "hosting_active": False,
             "description": normalized.get("description", ""),
             "health_check_url": normalized["health_check_url"],
             "build_config": normalized["build_config"],
@@ -1991,7 +1938,6 @@ def add_app(payload: Dict[str, Any]) -> Dict[str, Any]:
             "deployment_mode": normalized["deployment_mode"],
             "python_services": normalized["python_services"],
             "port": port,
-            "public_url": None,
             "source_path": str(paths["source"]),
             "production_path": str(paths["production"]),
             "config_path": str(paths["config"]),
@@ -2412,26 +2358,13 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     with _app_lock(app_id):
         registry = get_registry()
         app = _find_app(registry, app_id)
-        current = {key: value for key, value in app.items() if key not in {"id", "slug", "status", "last_deploy", "latest_commit", "deployments", "created_at", "updated_at", "source_path", "production_path", "config_path", "log_path", "service_user", "public_url"}}
+        current = {key: value for key, value in app.items() if key not in {"id", "slug", "status", "last_deploy", "latest_commit", "deployments", "created_at", "updated_at", "source_path", "production_path", "config_path", "log_path", "service_user", "public_url", "active_route", "hosting_active"}}
         current["id"] = app_id
         current["slug"] = app_id
         candidate = {**current, **payload}
         normalized = validate_app_payload(candidate)
         if app.get("python_services") and not normalized["python_services"] and app.get("deployments"):
             raise ValueError("Cannot remove native Python policy from a deployed application; retain it to manage installed services safely")
-        for other in registry["apps"]:
-            if other.get("id") == app_id:
-                continue
-            other_routes = {
-                validate_app_route(other.get("route"), other["id"]),
-                *(
-                    [validate_app_route(other["active_route"], other["id"])]
-                    if other.get("active_route") is not None
-                    else []
-                ),
-            }
-            if normalized["route"] in other_routes:
-                raise ValueError(f"Route {normalized['route']} is already assigned to another application")
         port = normalized.get("port", app.get("port"))
         if port != app.get("port"):
             if any(other.get("id") != app_id and port in {other.get("port"), other.get("candidate_port")} for other in registry["apps"]):
@@ -2440,11 +2373,10 @@ def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError(f"Port {port} is already in use")
         with _registry_transaction() as registry2:
             app = _find_app(registry2, app_id)
-            for key in ("name", "repo_url", "branch", "framework", "route", "description", "health_check_url", "build_config", "resource_limits", "auto_deploy", "deployment_window", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode", "python_services", "port", "public_url"):
+            for key in ("name", "repo_url", "branch", "framework", "route", "description", "health_check_url", "build_config", "resource_limits", "auto_deploy", "deployment_window", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode", "python_services", "port"):
                 if key in normalized:
                     app[key] = normalized[key]
             app["slug"] = app_id
-            app["public_url"] = _public_url_for_route(app.get("active_route") or app["route"])
             app["updated_at"] = now_iso()
             return {"ok": True, "app": app}
 
@@ -2643,1275 +2575,13 @@ def _render_service(
     )
 
 
-def _render_nginx_config(
-    app_id: str,
-    port: int,
-    template_path: Optional[Path] = None,
-    framework: str = "nextjs",
-    config: Optional[Dict[str, Any]] = None,
-    route: Optional[str] = None,
-    static_root: Optional[str] = None,
-    python_services: Optional[Dict[str, Any]] = None,
-) -> str:
-    app_id = validate_app_id(app_id)
-    route = validate_app_route(route, app_id)
-    route_prefix = route.rstrip("/")
-    if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
-        raise ValueError("Nginx upstream port must be an available managed application port")
-    if framework not in FRAMEWORKS - {"auto"}:
-        raise ValueError("Nginx framework must be a detected, supported application framework")
-    if template_path is None:
-        config = config or get_config()
-        template_path = Path(config["nginx_template"])
-    try:
-        template = template_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(f"Could not read Nginx template {template_path}: {exc}") from exc
-    proxy_uri = "" if framework == "nextjs" else "/"
-    environment_guard = '    if ($uri ~* "(^|/)[.]env([./]|$)") { return 404; }\n'
-    if framework == "static":
-        config = config or get_config()
-        app_root = _app_paths(app_id, config)["current"] / "app" / _static_root_relative_path(static_root)
-        route_location = (
-            f"# Managed by Cockpit App Manager: {app_id}\n"
-            f"location ^~ {route} {{\n"
-            f"{environment_guard}"
-            f"    alias {_nginx_quote(str(app_root) + os.sep)};\n"
-            "    index index.html;\n"
-            f"    try_files $uri $uri/ {route}index.html;\n"
-            "}\n"
-        )
-    else:
-        proxy_redirect = (
-            "    proxy_redirect off;\n"
-            if framework == "nextjs"
-            else (
-                f"    proxy_redirect http://127.0.0.1:{port}/ {route};\n"
-                f"    proxy_redirect / {route};\n"
-                f"    proxy_cookie_path / {route};\n"
-            )
-        )
-        route_location = (
-            f"# Managed by Cockpit App Manager: {app_id}\n"
-            f"location ^~ {route} {{\n"
-            f"{environment_guard}"
-            f"    proxy_pass http://127.0.0.1:{port}{proxy_uri};\n"
-            + (f"    client_max_body_size {python_services['upload_limit_mb']}m;\n" + ("    deny all;\n" if python_services.get("access_control", "blocked") == "blocked" else "") if python_services else "")
-            +
-            "    proxy_http_version 1.1;\n"
-            "    proxy_set_header Host $host;\n"
-            "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-            "    proxy_set_header X-Forwarded-Proto $scheme;\n"
-            "    proxy_set_header X-Real-IP $remote_addr;\n"
-            f"    proxy_set_header X-Forwarded-Prefix {route_prefix};\n"
-            "    proxy_set_header Upgrade $http_upgrade;\n"
-            "    proxy_read_timeout 3600s;\n"
-            "    proxy_send_timeout 3600s;\n"
-            "    set $app_manager_connection_upgrade upgrade;\n"
-            "    if ($http_upgrade = \"\") {\n"
-            "        set $app_manager_connection_upgrade \"\";\n"
-            "    }\n"
-            "    proxy_set_header Connection $app_manager_connection_upgrade;\n"
-            + proxy_redirect
-            + "}\n"
-        )
-    rendered = (
-        template.replace("{{ app_slug }}", app_id)
-        .replace("{{ app_route }}", route_prefix)
-        .replace("{{ app_route_slash }}", route)
-        .replace("{{ app_port }}", str(port))
-        .replace("{{ app_proxy_uri }}", proxy_uri)
-        .replace("{{ app_route_location }}", route_location.rstrip())
-    )
-    if "{{" in rendered or "}}" in rendered:
-        raise ValueError("Nginx template contains an unresolved placeholder")
-    return rendered
-
-
-def _nginx_quote(path: str) -> str:
-    if any(char in path for char in ('"', "\r", "\n", ";", "{", "}")):
-        raise ValueError("Path cannot be safely represented in an Nginx configuration")
-    return '"' + path.replace("\\", "\\\\") + '"'
-
-
-def _nginx_snippet_path(app_id: str) -> Path:
-    return Path(DEFAULT_NGINX_SNIPPET_DIR) / f"{validate_app_id(app_id)}.conf"
-
-
 def _assert_no_symlink_components(path: Path) -> None:
     absolute = path.absolute()
     current = Path(absolute.anchor)
     for component in absolute.parts[1:]:
         current = current / component
         if current.is_symlink():
-            raise RuntimeError(f"Refusing to manage an Nginx path through a symlink: {current}")
-
-
-def _write_nginx_snippet(path: Path, content: str) -> Optional[bytes]:
-    _assert_no_symlink_components(path.parent)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    _assert_no_symlink_components(path.parent)
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise RuntimeError(f"Refusing to replace a non-regular Nginx snippet: {path}")
-    previous_content = path.read_bytes() if path.exists() else None
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary_path = Path(temporary_name)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o644)
-        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
-            os.fchown(descriptor, 0, 0)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary_path), str(path))
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            temporary_path.unlink()
-        raise
-    return previous_content
-
-
-def _restore_nginx_snippet(path: Path, previous_content: Optional[bytes]) -> None:
-    if previous_content is None:
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        return
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary_path = Path(temporary_name)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o644)
-        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
-            os.fchown(descriptor, 0, 0)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(previous_content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary_path), str(path))
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            temporary_path.unlink()
-        raise
-
-
-def _nginx_tokens(source: str) -> List[Tuple[str, int, int]]:
-    tokens: List[Tuple[str, int, int]] = []
-    index = 0
-    while index < len(source):
-        character = source[index]
-        if character.isspace():
-            index += 1
-            continue
-        if character == "#":
-            newline = source.find("\n", index)
-            index = len(source) if newline < 0 else newline + 1
-            continue
-        if character in "{};":
-            tokens.append((character, index, index + 1))
-            index += 1
-            continue
-        if character in {"'", '"'}:
-            quote = character
-            start = index
-            index += 1
-            value: List[str] = []
-            while index < len(source) and source[index] != quote:
-                if source[index] == "\\" and index + 1 < len(source):
-                    index += 1
-                value.append(source[index])
-                index += 1
-            if index >= len(source):
-                raise ValueError("Nginx configuration contains an unterminated quoted string")
-            index += 1
-            tokens.append(("".join(value), start, index))
-            continue
-        start = index
-        while index < len(source) and not source[index].isspace() and source[index] not in "{};#":
-            index += 1
-        tokens.append((source[start:index], start, index))
-    return tokens
-
-
-def _nginx_server_blocks(source: str) -> List[Dict[str, Any]]:
-    tokens = _nginx_tokens(source)
-    blocks: List[Dict[str, Any]] = []
-    for index, token in enumerate(tokens[:-1]):
-        if token[0] != "server" or tokens[index + 1][0] != "{":
-            continue
-        depth = 1
-        statement: List[str] = []
-        directives: List[Tuple[str, List[str]]] = []
-        cursor = index + 2
-        closing_index = None
-        while cursor < len(tokens):
-            value = tokens[cursor][0]
-            if value == "{":
-                depth += 1
-                statement.clear()
-            elif value == "}":
-                depth -= 1
-                if depth == 0:
-                    closing_index = cursor
-                    break
-                if depth == 1:
-                    statement.clear()
-            elif depth == 1 and value == ";":
-                if statement:
-                    directives.append((statement[0], statement[1:]))
-                statement = []
-            elif depth == 1:
-                statement.append(value)
-            cursor += 1
-        if closing_index is None:
-            raise ValueError("Nginx configuration contains an unterminated server block")
-        blocks.append({
-            "open_end": tokens[index + 1][2],
-            "close_start": tokens[closing_index][1],
-            "directives": directives,
-        })
-    return blocks
-
-
-def _nginx_config_sections(output: str) -> List[Tuple[Path, str]]:
-    sections: List[Tuple[Path, str]] = []
-    current_path: Optional[Path] = None
-    current_lines: List[str] = []
-    header = re.compile(r"^# configuration file (.+):\s*$")
-    for line in output.splitlines(keepends=True):
-        match = header.match(line.rstrip("\r\n"))
-        if match:
-            if current_path is not None:
-                sections.append((current_path, "".join(current_lines)))
-            current_path = Path(match.group(1))
-            current_lines = []
-        elif current_path is not None:
-            current_lines.append(line)
-    if current_path is not None:
-        sections.append((current_path, "".join(current_lines)))
-    return sections
-
-
-def _nginx_includes_path(output: str, path: Path) -> bool:
-    expected = path.resolve(strict=False)
-    return any(
-        listed_path.resolve(strict=False) == expected
-        for listed_path, _ in _nginx_config_sections(output)
-    )
-
-
-def _select_nginx_site_server(output: str, hostname: str) -> Tuple[Path, str, Dict[str, Any]]:
-    matches: List[Tuple[Path, str, Dict[str, Any], bool]] = []
-    config_root = Path(DEFAULT_NGINX_CONFIG_ROOT).resolve(strict=False)
-    for listed_path, source in _nginx_config_sections(output):
-        try:
-            resolved_path = listed_path.resolve(strict=True)
-            resolved_path.relative_to(config_root)
-        except (OSError, ValueError):
-            continue
-        if not resolved_path.is_file():
-            continue
-        for block in _nginx_server_blocks(source):
-            directives = block["directives"]
-            names = [
-                name
-                for directive, values in directives
-                if directive == "server_name"
-                for name in values
-            ]
-            if hostname not in names:
-                continue
-            listeners = [
-                values
-                for directive, values in directives
-                if directive == "listen"
-            ]
-            is_https = any(
-                "ssl" in values
-                or any(re.search(r":443$", value) or value == "443" for value in values)
-                for values in listeners
-            )
-            matches.append((resolved_path, source, block, is_https))
-    https_matches = [item for item in matches if item[3]]
-    candidates = https_matches or matches
-    unique = {(path, block["open_end"]): (path, source, block) for path, source, block, _ in candidates}
-    if len(unique) != 1:
-        if not unique:
-            raise RuntimeError(
-                f"Could not find an Nginx server block with the exact server_name {hostname!r}; "
-                "no site configuration was changed."
-            )
-        raise RuntimeError(
-            f"Found multiple Nginx server blocks for {hostname!r}; refusing to modify an ambiguous site configuration."
-        )
-    return next(iter(unique.values()))
-
-
-def _write_nginx_site_file(path: Path, source: str) -> None:
-    _assert_no_symlink_components(path.parent)
-    if path.is_symlink() or not path.is_file():
-        raise RuntimeError(f"Refusing to edit a non-regular Nginx site configuration: {path}")
-    metadata = path.stat()
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.app-manager.", dir=str(path.parent))
-    temporary_path = Path(temporary_name)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode))
-        if hasattr(os, "fchown") and os.name != "nt":
-            os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
-            handle.write(source)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary_path), str(path))
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            temporary_path.unlink()
-        raise
-
-
-def _backup_nginx_site_file(path: Path, contents: bytes) -> Path:
-    backup_root = Path(DEFAULT_STATE_ROOT) / "nginx-backups"
-    if backup_root.is_symlink():
-        raise RuntimeError("Nginx backup directory must not be a symlink")
-    backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(backup_root, 0o700)
-    digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
-    backup_path = backup_root / f"{path.name}.{digest}.before-app-manager"
-    if backup_path.exists() or backup_path.is_symlink():
-        if backup_path.is_symlink() or not backup_path.is_file():
-            raise RuntimeError("Existing Nginx site backup is not a regular file")
-        return backup_path
-    descriptor = os.open(
-        str(backup_path),
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(contents)
-        handle.flush()
-        os.fsync(handle.fileno())
-    return backup_path
-
-
-def _ensure_nginx_site_include(output: str) -> Tuple[Path, Optional[str]]:
-    hostname = urlsplit(DEFAULT_PUBLIC_ORIGIN).hostname
-    if not hostname:
-        raise RuntimeError("App Manager public origin does not contain a valid hostname")
-    site_path, source, block = _select_nginx_site_server(output, hostname)
-    wanted = NGINX_MANAGED_INCLUDE
-    if any(
-        directive == "include"
-        and len(values) == 1
-        and values[0] == f"{DEFAULT_NGINX_SNIPPET_DIR}/*.conf"
-        for directive, values in block["directives"]
-    ):
-        return site_path, None
-    original_bytes = site_path.read_bytes()
-    current_source = original_bytes.decode("utf-8")
-    _, _, current_block = _select_nginx_site_server(
-        f"# configuration file {site_path}:\n{current_source}",
-        hostname,
-    )
-    if any(
-        directive == "include"
-        and len(values) == 1
-        and values[0] == f"{DEFAULT_NGINX_SNIPPET_DIR}/*.conf"
-        for directive, values in current_block["directives"]
-    ):
-        return site_path, None
-    insert_at = current_block["open_end"]
-    newline = "\r\n" if "\r\n" in current_source else "\n"
-    addition = (
-        f"{newline}    # Managed by Cockpit App Manager{newline}"
-        f"    {wanted}{newline}"
-    )
-    updated_source = current_source[:insert_at] + addition + current_source[insert_at:]
-    _backup_nginx_site_file(site_path, original_bytes)
-    _write_nginx_site_file(site_path, updated_source)
-    return site_path, current_source
-
-
-def _activate_nginx_config(
-    app: Dict[str, Any],
-    framework: str,
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
-    with _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / "nginx.lock"):
-        return _activate_nginx_config_locked(app, framework, config)
-
-
-def _activate_nginx_config_locked(
-    app: Dict[str, Any],
-    framework: str,
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
-    app_id = validate_app_id(app["id"])
-    snippet_path = _nginx_snippet_path(app_id)
-    rendered = _render_nginx_config(
-        app_id,
-        app["port"],
-        framework=framework,
-        config=config,
-        route=app.get("route"),
-        static_root=app.get("static_root"),
-        python_services=app.get("python_services"),
-    )
-    previous_content = _write_nginx_snippet(snippet_path, rendered)
-    site_path: Optional[Path] = None
-    previous_site_source: Optional[str] = None
-    try:
-        config_listing = run_command(["nginx", "-T"], timeout=int(config["command_timeout_seconds"]))
-        _command_error(config_listing, "nginx -T")
-        site_path, previous_site_source = _ensure_nginx_site_include(
-            (config_listing.stdout or "") + "\n" + (config_listing.stderr or "")
-        )
-        test_result = run_command(["nginx", "-t"], timeout=int(config["command_timeout_seconds"]))
-        _command_error(test_result, "nginx -t")
-        verification = run_command(["nginx", "-T"], timeout=int(config["command_timeout_seconds"]))
-        _command_error(verification, "nginx -T after managed include")
-        if not _nginx_includes_path(
-            (verification.stdout or "") + "\n" + (verification.stderr or ""), snippet_path
-        ):
-            raise RuntimeError(
-                f"Nginx did not load the generated application snippet {snippet_path}"
-            )
-        _systemctl("reload", "nginx", timeout=int(config["command_timeout_seconds"]))
-    except Exception as exc:
-        rollback_errors: List[str] = []
-        if site_path is not None and previous_site_source is not None:
-            try:
-                _write_nginx_site_file(site_path, previous_site_source)
-            except Exception as rollback_exc:
-                rollback_errors.append(f"site configuration restore failed: {rollback_exc}")
-        try:
-            _restore_nginx_snippet(snippet_path, previous_content)
-        except Exception as rollback_exc:
-            rollback_errors.append(f"snippet restore failed: {rollback_exc}")
-        rollback_detail = f"; {'; '.join(rollback_errors)}" if rollback_errors else ""
-        raise RuntimeError(
-            f"Nginx route activation failed: {exc}{rollback_detail}"
-        ) from exc
-    return {
-        "active": True,
-        "route": app.get("route"),
-        "config_path": str(snippet_path),
-        "message": (
-            f"Nginx is serving {app.get('route')} from the managed application configuration. "
-            f"Added the managed include to {site_path}."
-            if previous_site_source is not None
-            else f"Nginx is serving {app.get('route')} from the managed application configuration."
-        ),
-    }
-
-
-def _remove_nginx_config(app_id: str, config: Dict[str, Any]) -> None:
-    with _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / "nginx.lock"):
-        _remove_nginx_config_locked(app_id, config)
-
-
-def _remove_nginx_config_locked(app_id: str, config: Dict[str, Any]) -> None:
-    snippet_path = _nginx_snippet_path(app_id)
-    if not snippet_path.exists() and not snippet_path.is_symlink():
-        return
-    _assert_no_symlink_components(snippet_path.parent)
-    if snippet_path.is_symlink() or not snippet_path.is_file():
-        raise RuntimeError(f"Refusing to remove a non-regular Nginx snippet: {snippet_path}")
-    previous_content = snippet_path.read_bytes()
-    if f"# Managed by Cockpit App Manager: {app_id}".encode("utf-8") not in previous_content:
-        raise RuntimeError(f"Refusing to remove an unverified Nginx snippet: {snippet_path}")
-    config_listing = run_command(["nginx", "-T"], timeout=int(config["command_timeout_seconds"]))
-    if config_listing.returncode != 0:
-        detail = (config_listing.stderr or config_listing.stdout or "").strip()[-2000:]
-        raise RuntimeError(f"Could not verify whether the Nginx snippet is active: {detail}")
-    snippet_is_active = _nginx_includes_path(
-        (config_listing.stdout or "") + "\n" + (config_listing.stderr or ""), snippet_path
-    )
-    snippet_path.unlink()
-    if not snippet_is_active:
-        return
-    try:
-        test_result = run_command(["nginx", "-t"], timeout=int(config["command_timeout_seconds"]))
-        _command_error(test_result, "nginx -t")
-        _systemctl("reload", "nginx", timeout=int(config["command_timeout_seconds"]))
-    except Exception as exc:
-        _restore_nginx_snippet(snippet_path, previous_content)
-        raise RuntimeError(f"Could not deactivate the App Manager Nginx route; the snippet was restored: {exc}") from exc
-
-
-def _nginx_manager_site_paths(site_id: str) -> Tuple[Path, Path]:
-    if not isinstance(site_id, str) or not NGINX_MANAGER_ID_RE.fullmatch(site_id):
-        raise ValueError("Nginx Manager site ID is invalid")
-    config_directory = Path(DEFAULT_NGINX_CONFIG_ROOT) / "conf.d"
-    return (
-        config_directory / f"{NGINX_MANAGER_SITE_PREFIX}{site_id}.conf",
-        Path(DEFAULT_STATE_ROOT) / "nginx-manager" / "sites" / f"{site_id}.json",
-    )
-
-
-def _nginx_manager_domain(value: Any) -> str:
-    if not isinstance(value, str) or not value or len(value) > 255 or any(ord(char) < 33 for char in value):
-        raise ValueError("Each domain must be a valid hostname")
-    wildcard = value.startswith("*.")
-    candidate = value[2:] if wildcard else value
-    if "*" in candidate or candidate.startswith(".") or candidate.endswith("."):
-        raise ValueError("Domains may only use a leading '*.' wildcard")
-    try:
-        hostname = candidate.encode("idna").decode("ascii").lower()
-    except UnicodeError as exc:
-        raise ValueError("Domain contains an invalid internationalized hostname") from exc
-    if len(hostname) > 253:
-        raise ValueError("Domain name is too long")
-    if hostname != "localhost" and "." not in hostname:
-        raise ValueError("Domain must contain a dot (or be localhost)")
-    if hostname != "localhost" and not NGINX_MANAGER_DOMAIN_RE.fullmatch(hostname):
-        try:
-            ipaddress.ip_address(hostname)
-        except ValueError as exc:
-            raise ValueError(f"Invalid domain name: {value}") from exc
-    return f"*.{hostname}" if wildcard else hostname
-
-
-def _nginx_manager_port(value: Any, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
-        raise ValueError(f"{label} must be an integer from 1 to 65535")
-    return value
-
-
-def _nginx_manager_file_path(value: Any, label: str, allowed_roots: Sequence[str]) -> str:
-    if (
-        not isinstance(value, str)
-        or not value.startswith("/")
-        or any(char in value for char in ('"', "$", ";", "{", "}", "\r", "\n", "\0"))
-        or any(ord(char) < 32 or ord(char) == 127 for char in value)
-    ):
-        raise ValueError(f"{label} must be an absolute path without Nginx syntax characters")
-    candidate = Path(os.path.normpath(value))
-    if not any(_path_is_within(candidate, Path(root)) for root in allowed_roots):
-        raise ValueError(f"{label} must resolve within an approved directory")
-    return str(candidate)
-
-
-def _normalize_nginx_manager_site(payload: Any) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise ValueError("Nginx site configuration must be a JSON object")
-    allowed_fields = {
-        "site_id", "domains", "mode", "listen_port", "tls", "certificate_file",
-        "private_key_file", "document_root", "upstream_port", "enabled",
-    }
-    if set(payload) - allowed_fields:
-        raise ValueError("Nginx site configuration contains unsupported fields")
-    site_id = payload.get("site_id")
-    if site_id is not None and (not isinstance(site_id, str) or not NGINX_MANAGER_ID_RE.fullmatch(site_id)):
-        raise ValueError("Nginx Manager site ID is invalid")
-    raw_domains = payload.get("domains")
-    if not isinstance(raw_domains, list) or not raw_domains or len(raw_domains) > 32:
-        raise ValueError("Enter between 1 and 32 domains")
-    domains = list(dict.fromkeys(_nginx_manager_domain(domain) for domain in raw_domains))
-    mode = payload.get("mode")
-    if not isinstance(mode, str) or mode not in {"static", "proxy"}:
-        raise ValueError("Site type must be static or reverse proxy")
-    listen_port = _nginx_manager_port(payload.get("listen_port"), "HTTP listen port")
-    if listen_port == 443:
-        raise ValueError("Port 443 is reserved for HTTPS; enable TLS instead")
-    if listen_port == 8080 or 8100 <= listen_port <= 8999:
-        raise ValueError("Ports 8080 and 8100–8999 are reserved for existing and managed applications")
-    tls = payload.get("tls", False)
-    if not isinstance(tls, bool):
-        raise ValueError("TLS must be enabled or disabled")
-    if "enabled" not in payload or not isinstance(payload["enabled"], bool):
-        raise ValueError("Site enabled state must be a boolean")
-    normalized: Dict[str, Any] = {
-        "site_id": site_id,
-        "domains": domains,
-        "mode": mode,
-        "listen_port": listen_port,
-        "tls": tls,
-        "enabled": payload["enabled"],
-    }
-    if mode == "static":
-        root = validate_allowed_path(
-            payload.get("document_root"),
-            NGINX_DOCUMENT_ROOTS,
-        )
-        if not root.is_dir():
-            raise ValueError("Document root must be an existing directory")
-        if (
-            any(char in str(root) for char in ('"', "$", ";", "{", "}"))
-            or any(ord(char) < 32 or ord(char) == 127 for char in str(root))
-        ):
-            raise ValueError("Document root cannot be represented safely in Nginx")
-        normalized["document_root"] = str(root)
-    else:
-        upstream_port = _nginx_manager_port(payload.get("upstream_port"), "Upstream port")
-        if upstream_port == listen_port or (tls and upstream_port == 443):
-            raise ValueError("Upstream port cannot match this site's Nginx listen port")
-        normalized["upstream_port"] = upstream_port
-    certificate = payload.get("certificate_file")
-    private_key = payload.get("private_key_file")
-    if tls:
-        normalized["certificate_file"] = _nginx_manager_file_path(
-            certificate, "TLS certificate", NGINX_TLS_ALLOWED_ROOTS
-        )
-        normalized["private_key_file"] = _nginx_manager_file_path(
-            private_key, "TLS private key", NGINX_TLS_ALLOWED_ROOTS
-        )
-        if not Path(normalized["certificate_file"]).is_file():
-            raise ValueError("TLS certificate file does not exist")
-        if not Path(normalized["private_key_file"]).is_file():
-            raise ValueError("TLS private key file does not exist")
-    elif certificate or private_key:
-        raise ValueError("Certificate paths are only valid when TLS is enabled")
-    return normalized
-
-
-def _nginx_manager_config(site: Dict[str, Any]) -> str:
-    site_id = site["site_id"]
-    domains = " ".join(site["domains"])
-
-    def server_block(port: int, tls: bool) -> str:
-        directives = [
-            "server {",
-            f"    listen {port}{' ssl' if tls else ''};",
-            f"    server_name {domains};",
-        ]
-        if tls:
-            directives.extend([
-                f"    ssl_certificate {_nginx_quote(site['certificate_file'])};",
-                f"    ssl_certificate_key {_nginx_quote(site['private_key_file'])};",
-                "    ssl_protocols TLSv1.2 TLSv1.3;",
-            ])
-        if site["mode"] == "static":
-            directives.extend([
-                f"    root {_nginx_quote(site['document_root'])};",
-                "    index index.html index.htm;",
-                "    location / {",
-                "        try_files $uri $uri/ =404;",
-                "    }",
-            ])
-        else:
-            directives.extend([
-                "    location / {",
-                f"        proxy_pass http://127.0.0.1:{site['upstream_port']};",
-                "        proxy_http_version 1.1;",
-                "        proxy_set_header Host $host;",
-                "        proxy_set_header X-Real-IP $remote_addr;",
-                "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-                "        proxy_set_header X-Forwarded-Proto $scheme;",
-                "    }",
-            ])
-        directives.append("}")
-        return "\n".join(directives)
-
-    blocks = [server_block(site["listen_port"], False)]
-    if site["tls"]:
-        blocks.append(server_block(443, True))
-    return f"{NGINX_MANAGER_MARKER} {site_id}\n" + "\n\n".join(blocks) + "\n"
-
-
-def _nginx_manager_load_site(site_id: str) -> Dict[str, Any]:
-    _, metadata_path = _nginx_manager_site_paths(site_id)
-    _assert_no_symlink_components(metadata_path.parent)
-    if metadata_path.is_symlink() or not metadata_path.is_file():
-        raise ValueError("Nginx site is not managed by Nginx Manager")
-    try:
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RuntimeError(f"Could not read Nginx Manager site metadata: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("site_id") != site_id:
-        raise RuntimeError("Nginx Manager site metadata is invalid")
-    normalized = _normalize_nginx_manager_site(payload)
-    if normalized["site_id"] != site_id:
-        raise RuntimeError("Nginx Manager site metadata does not match its file name")
-    return normalized
-
-
-def _nginx_manager_write_metadata(site: Dict[str, Any]) -> None:
-    _, metadata_path = _nginx_manager_site_paths(site["site_id"])
-    _assert_no_symlink_components(metadata_path.parent)
-    if metadata_path.is_symlink() or (metadata_path.exists() and not metadata_path.is_file()):
-        raise RuntimeError("Refusing to replace unsafe Nginx Manager metadata")
-    _atomic_json_write(metadata_path, site)
-
-
-def _nginx_manager_restore_metadata(site_id: str, previous: Optional[bytes]) -> None:
-    _, metadata_path = _nginx_manager_site_paths(site_id)
-    _assert_no_symlink_components(metadata_path.parent)
-    if previous is None:
-        if metadata_path.is_symlink():
-            raise RuntimeError("Refusing to remove symlinked Nginx Manager metadata")
-        with contextlib.suppress(FileNotFoundError):
-            metadata_path.unlink()
-        return
-    payload = json.loads(previous.decode("utf-8"))
-    _atomic_json_write(metadata_path, payload)
-
-
-def _nginx_manager_restore_config(path: Path, previous: Optional[bytes]) -> None:
-    _assert_no_symlink_components(path.parent)
-    if path.is_symlink():
-        raise RuntimeError(f"Refusing to restore a symlinked Nginx Manager configuration: {path}")
-    if previous is None:
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        return
-    _write_nginx_snippet(path, previous.decode("utf-8"))
-
-
-def _nginx_manager_read_configuration(timeout: int) -> str:
-    result = run_command(["nginx", "-T"], timeout=timeout)
-    _command_error(result, "nginx -T")
-    return (result.stdout or "") + "\n" + (result.stderr or "")
-
-
-def _nginx_manager_parse_listeners(directives: Sequence[Tuple[str, List[str]]]) -> List[Dict[str, Any]]:
-    listeners: List[Dict[str, Any]] = []
-    for directive, values in directives:
-        if directive != "listen":
-            continue
-        endpoint = values[0] if values else "80"
-        if endpoint.startswith("unix:"):
-            continue
-        address = "*"
-        port_text = endpoint
-        if endpoint.startswith("[") and "]:" in endpoint:
-            address, port_text = endpoint[1:].split("]:", 1)
-            address = f"[{address}]"
-        elif ":" in endpoint:
-            address, port_text = endpoint.rsplit(":", 1)
-            address = address or "*"
-        if not port_text.isdigit():
-            continue
-        listeners.append({
-            "address": address,
-            "port": int(port_text),
-            "default_server": "default_server" in values[1:],
-            "ssl": "ssl" in values[1:],
-        })
-    if not listeners:
-        listeners.append({"address": "*", "port": 80, "default_server": False, "ssl": False})
-    return listeners
-
-
-def _nginx_manager_sources(output: str) -> Dict[str, Tuple[Path, str, bool]]:
-    sources: Dict[str, Tuple[Path, str, bool]] = {}
-    for listed_path, content in _nginx_config_sections(output):
-        resolved = listed_path.resolve(strict=False)
-        sources[str(resolved)] = (resolved, content, True)
-
-    config_root = Path(DEFAULT_NGINX_CONFIG_ROOT)
-    available_directory = config_root / "sites-available"
-    if available_directory.is_symlink():
-        raise RuntimeError("Refusing to scan a symlinked Nginx sites-available directory")
-    if available_directory.is_dir():
-        for candidate in sorted(available_directory.iterdir()):
-            if candidate.is_symlink() or not candidate.is_file():
-                continue
-            resolved = candidate.resolve(strict=False)
-            sources.setdefault(str(resolved), (resolved, candidate.read_text(encoding="utf-8"), False))
-
-    manager_directory = config_root / "conf.d"
-    if manager_directory.is_symlink():
-        raise RuntimeError("Refusing to scan a symlinked Nginx conf.d directory")
-    if manager_directory.is_dir():
-        for candidate in sorted(manager_directory.glob(f"{NGINX_MANAGER_SITE_PREFIX}*.conf")):
-            if candidate.is_symlink() or not candidate.is_file():
-                continue
-            resolved = candidate.resolve(strict=False)
-            sources.setdefault(str(resolved), (resolved, candidate.read_text(encoding="utf-8"), False))
-    return sources
-
-
-def _nginx_manager_file_marker(content: str) -> Optional[str]:
-    match = re.search(
-        rf"^{re.escape(NGINX_MANAGER_MARKER)} ([0-9a-f]{{32}})$",
-        content,
-        re.MULTILINE,
-    )
-    return match.group(1) if match else None
-
-
-def _nginx_manager_inventory(output: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    sources = _nginx_manager_sources(output)
-    sites: List[Dict[str, Any]] = []
-    warnings: List[str] = []
-    metadata_directory = Path(DEFAULT_STATE_ROOT) / "nginx-manager" / "sites"
-    metadata: Dict[str, Dict[str, Any]] = {}
-    if metadata_directory.is_symlink():
-        raise RuntimeError("Nginx Manager metadata directory must not be a symlink")
-    if metadata_directory.is_dir():
-        for path in sorted(metadata_directory.glob("*.json")):
-            if path.is_symlink() or not path.is_file():
-                warnings.append(f"Ignored unsafe Nginx Manager metadata file: {path.name}")
-                continue
-            site_id = path.stem
-            if not NGINX_MANAGER_ID_RE.fullmatch(site_id):
-                warnings.append(f"Ignored invalid Nginx Manager site metadata: {path.name}")
-                continue
-            try:
-                metadata[site_id] = _nginx_manager_load_site(site_id)
-            except (RuntimeError, ValueError) as exc:
-                warnings.append(f"Could not load managed site {site_id}: {exc}")
-
-    for site_id, managed in metadata.items():
-        active_path, _ = _nginx_manager_site_paths(site_id)
-        if active_path.is_symlink():
-            warnings.append(f"Managed site {site_id} has an unsafe symlinked configuration")
-            continue
-        if active_path.exists() and not active_path.is_file():
-            warnings.append(f"Managed site {site_id} has a non-regular configuration")
-            continue
-        content = active_path.read_text(encoding="utf-8") if active_path.is_file() else ""
-        if content and _nginx_manager_file_marker(content) != site_id:
-            warnings.append(f"Managed site {site_id} configuration marker does not match")
-            continue
-        enabled = bool(content) and _nginx_includes_path(output, active_path)
-        listeners = [{"address": "*", "port": managed["listen_port"], "default_server": False, "ssl": False}]
-        if managed["tls"]:
-            listeners.append({"address": "*", "port": 443, "default_server": False, "ssl": True})
-        sites.append({
-            **managed,
-            "name": managed["domains"][0],
-            "path": str(active_path),
-            "enabled": enabled,
-            "managed": True,
-            "editable": True,
-            "listeners": listeners,
-            "listen_ports": sorted({item["port"] for item in listeners}),
-            "management_issue": (
-                "Configuration file is missing; this site is disabled."
-                if not content and active_path.exists() is False
-                else None
-            ),
-        })
-
-    for path, content, included in sources.values():
-        marker_id = _nginx_manager_file_marker(content)
-        if marker_id and marker_id in metadata:
-            active_path, _ = _nginx_manager_site_paths(marker_id)
-            if path == active_path.resolve(strict=False):
-                continue
-        blocks = _nginx_server_blocks(content)
-        for block_index, block in enumerate(blocks, start=1):
-            directives = block["directives"]
-            names = [
-                name
-                for directive, values in directives
-                if directive == "server_name"
-                for name in values
-            ]
-            listeners = _nginx_manager_parse_listeners(directives)
-            identifier = f"{path}#server-{block_index}"
-            site_id = marker_id if marker_id else None
-            sites.append({
-                "site_id": site_id,
-                "name": names[0] if names else path.name,
-                "domains": names,
-                "listen_ports": sorted({item["port"] for item in listeners}),
-                "mode": "external",
-                "listen_port": listeners[0]["port"] if listeners else 80,
-                "tls": any(item["ssl"] for item in listeners),
-                "enabled": included,
-                "managed": False,
-                "editable": False,
-                "path": str(path),
-                "listeners": listeners,
-                "management_issue": (
-                    "Manager marker found without valid manager metadata; this site is read-only."
-                    if marker_id else None
-                ),
-            })
-
-    sites.sort(key=lambda site: (not site["enabled"], site["name"].lower(), site["path"]))
-    return sites, warnings
-
-
-def _nginx_manager_socket_listeners(timeout: int) -> List[Dict[str, Any]]:
-    result = run_command(["ss", "-H", "-ltnp"], timeout=timeout)
-    _command_error(result, "ss -H -ltnp")
-    listeners: List[Dict[str, Any]] = []
-    for line in (result.stdout or "").splitlines():
-        columns = line.split()
-        if len(columns) < 4:
-            continue
-        endpoint = columns[3]
-        if endpoint.startswith("[") and "]:" in endpoint:
-            address, port_text = endpoint[1:].split("]:", 1)
-            address = f"[{address}]"
-        elif ":" in endpoint:
-            address, port_text = endpoint.rsplit(":", 1)
-        else:
-            continue
-        if not port_text.isdigit():
-            continue
-        owners = re.findall(r'\("([^"]+)"', " ".join(columns[4:]))
-        listeners.append({
-            "address": address or "*",
-            "port": int(port_text),
-            "owners": sorted(set(owners)) or ["unknown"],
-        })
-    return listeners
-
-
-def _nginx_addresses_overlap(left: str, right: str) -> bool:
-    wildcards = {"*", "0.0.0.0", "::", "[::]"}
-    return left == right or left in wildcards or right in wildcards
-
-
-def _nginx_names_overlap(left: str, right: str) -> bool:
-    left = left.lower()
-    right = right.lower()
-
-    def matches(pattern: str, hostname: str) -> bool:
-        if pattern == hostname:
-            return True
-        if pattern.startswith("*."):
-            suffix = pattern[1:]
-            return hostname.endswith(suffix) and hostname != suffix[1:]
-        if pattern.startswith("."):
-            suffix = pattern[1:]
-            return hostname == suffix or hostname.endswith(f".{suffix}")
-        return False
-
-    if left.startswith("*.") and right.startswith("*."):
-        left_suffix, right_suffix = left[1:], right[1:]
-        return left_suffix.endswith(right_suffix) or right_suffix.endswith(left_suffix)
-    return matches(left, right) or matches(right, left)
-
-
-def _nginx_manager_conflicts_for_site(
-    candidate: Dict[str, Any],
-    sites: Sequence[Dict[str, Any]],
-    socket_listeners: Sequence[Dict[str, Any]],
-    *,
-    include_disabled: bool = False,
-) -> List[Dict[str, Any]]:
-    candidate_id = candidate.get("site_id")
-    candidate_ports = {candidate["listen_port"]}
-    if candidate["tls"]:
-        candidate_ports.add(443)
-    conflicts: List[Dict[str, Any]] = []
-    for site in sites:
-        if (
-            (candidate_id is not None and site.get("site_id") == candidate_id)
-            or (not site["enabled"] and not include_disabled)
-        ):
-            continue
-        for hostname in candidate["domains"]:
-            matching_domain = next(
-                (name for name in site["domains"] if _nginx_names_overlap(hostname, name)),
-                None,
-            )
-            shared_ports = candidate_ports.intersection(site["listen_ports"])
-            if matching_domain and shared_ports:
-                for port in sorted(shared_ports):
-                    conflicts.append({
-                        "type": "domain",
-                        "domain": hostname,
-                        "port": port,
-                        "site": site["name"],
-                        "enabled": site["enabled"],
-                        "blocking": bool(site["enabled"]),
-                        "message": (
-                            f"{hostname} is already configured on port {port} by {site['name']}"
-                            if site["enabled"]
-                            else f"{hostname} is also configured by a disabled site on port {port}"
-                        ),
-                    })
-    for listener in socket_listeners:
-        if listener["port"] not in candidate_ports:
-            continue
-        non_nginx_owners = [owner for owner in listener["owners"] if owner != "nginx"]
-        if non_nginx_owners:
-            conflicts.append({
-                "type": "port",
-                "port": listener["port"],
-                "owner": ", ".join(non_nginx_owners),
-                "blocking": True,
-                "message": (
-                    f"Port {listener['port']} is already listening on {listener['address']} "
-                    f"({', '.join(non_nginx_owners)})"
-                ),
-            })
-    return conflicts
-
-
-def _nginx_manager_find_conflicts(
-    sites: Sequence[Dict[str, Any]],
-    socket_listeners: Sequence[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    conflicts: List[Dict[str, Any]] = []
-    active_sites = [site for site in sites if site["enabled"]]
-    for index, first in enumerate(active_sites):
-        for second in active_sites[index + 1:]:
-            for first_listener in first["listeners"]:
-                for second_listener in second["listeners"]:
-                    if first_listener["port"] != second_listener["port"]:
-                        continue
-                    if not _nginx_addresses_overlap(first_listener["address"], second_listener["address"]):
-                        continue
-                    if first_listener["default_server"] and second_listener["default_server"]:
-                        conflicts.append({
-                            "type": "port",
-                            "port": first_listener["port"],
-                            "sites": [first["name"], second["name"]],
-                            "blocking": True,
-                            "message": (
-                                f"Multiple default virtual hosts are configured on port "
-                                f"{first_listener['port']}"
-                            ),
-                        })
-                    for first_name in first["domains"]:
-                        matching = next(
-                            (name for name in second["domains"] if _nginx_names_overlap(first_name, name)),
-                            None,
-                        )
-                        if matching:
-                            conflicts.append({
-                                "type": "domain",
-                                "domain": first_name,
-                                "port": first_listener["port"],
-                                "sites": [first["name"], second["name"]],
-                                "blocking": True,
-                                "message": (
-                                    f"{first_name} is configured by both {first['name']} and {second['name']} "
-                                    f"on port {first_listener['port']}"
-                                ),
-                            })
-    for site in active_sites:
-        for server_listener in site["listeners"]:
-            for socket_listener in socket_listeners:
-                if (
-                    server_listener["port"] == socket_listener["port"]
-                    and _nginx_addresses_overlap(server_listener["address"], socket_listener["address"])
-                ):
-                    owners = [owner for owner in socket_listener["owners"] if owner != "nginx"]
-                    if owners:
-                        conflicts.append({
-                            "type": "port",
-                            "port": server_listener["port"],
-                            "sites": [site["name"]],
-                            "owner": ", ".join(owners),
-                            "blocking": True,
-                            "message": (
-                                f"{site['name']} uses port {server_listener['port']}, also held by "
-                                f"{', '.join(owners)}"
-                            ),
-                        })
-    unique: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-    for conflict in conflicts:
-        key = (
-            conflict["type"], conflict.get("domain"), conflict.get("port"),
-            tuple(conflict.get("sites", [])), conflict.get("owner"),
-        )
-        unique[key] = conflict
-    return list(unique.values())
-
-
-def _nginx_manager_overview_data(
-    config: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str], str, List[Dict[str, Any]]]:
-    output = _nginx_manager_read_configuration(int(config["command_timeout_seconds"]))
-    sites, warnings = _nginx_manager_inventory(output)
-    sockets = _nginx_manager_socket_listeners(int(config["command_timeout_seconds"]))
-    conflicts = _nginx_manager_find_conflicts(sites, sockets)
-    return sites, conflicts, warnings, output, sockets
-
-
-def nginx_manager_overview() -> Dict[str, Any]:
-    _require_root()
-    config = get_config()
-    sites, conflicts, warnings, _, _ = _nginx_manager_overview_data(config)
-    status_result = run_command(["systemctl", "is-active", "nginx"], timeout=int(config["command_timeout_seconds"]))
-    if status_result.returncode not in {0, 3, 4}:
-        _command_error(status_result, "systemctl is-active nginx")
-    version_result = run_command(["nginx", "-v"], timeout=int(config["command_timeout_seconds"]))
-    _command_error(version_result, "nginx -v")
-    version_output = (version_result.stdout or "") + (version_result.stderr or "")
-    version_match = re.search(r"nginx/([^\s]+)", version_output)
-    return {
-        "ok": True,
-        "nginx_version": version_match.group(1) if version_match else "unknown",
-        "service_state": (status_result.stdout or "").strip() or "unknown",
-        "sites": sites,
-        "conflicts": conflicts,
-        "warnings": warnings,
-    }
-
-
-def nginx_manager_conflicts(payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_root()
-    candidate = _normalize_nginx_manager_site(payload)
-    config = get_config()
-    sites, _, warnings, _, sockets = _nginx_manager_overview_data(config)
-    conflicts = _nginx_manager_conflicts_for_site(candidate, sites, sockets, include_disabled=True)
-    return {
-        "ok": True,
-        "conflicts": conflicts,
-        "warnings": warnings,
-        "can_enable": not any(item["blocking"] for item in conflicts),
-    }
-
-
-def _nginx_manager_test_config(config: Dict[str, Any]) -> str:
-    result = run_command(["nginx", "-t"], timeout=int(config["command_timeout_seconds"]))
-    _command_error(result, "nginx -t")
-    return "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
-
-
-def _nginx_manager_verify_loaded(path: Path, config: Dict[str, Any], expected: bool) -> None:
-    output = _nginx_manager_read_configuration(int(config["command_timeout_seconds"]))
-    loaded = _nginx_includes_path(output, path)
-    if loaded != expected:
-        expectation = "loaded" if expected else "disabled"
-        raise RuntimeError(f"Nginx did not confirm the managed site is {expectation}: {path}")
-
-
-def _nginx_manager_rollback_site(
-    site_id: str,
-    active_path: Path,
-    previous_config: Optional[bytes],
-    previous_metadata: Optional[bytes],
-) -> List[str]:
-    errors: List[str] = []
-    try:
-        _nginx_manager_restore_config(active_path, previous_config)
-    except Exception as exc:
-        errors.append(f"configuration restore failed: {exc}")
-    try:
-        _nginx_manager_restore_metadata(site_id, previous_metadata)
-    except Exception as exc:
-        errors.append(f"metadata restore failed: {exc}")
-    return errors
-
-
-def nginx_manager_save_site(payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_root()
-    normalized = _normalize_nginx_manager_site(payload)
-    is_edit = normalized["site_id"] is not None
-    config = get_config()
-    with _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / "nginx-manager.lock"):
-        site_id = normalized["site_id"] or uuid.uuid4().hex
-        normalized["site_id"] = site_id
-        active_path, metadata_path = _nginx_manager_site_paths(site_id)
-        _assert_no_symlink_components(active_path.parent)
-        if not active_path.parent.is_dir():
-            raise RuntimeError(f"Nginx configuration directory does not exist: {active_path.parent}")
-        if active_path.is_symlink() or (active_path.exists() and not active_path.is_file()):
-            raise RuntimeError("Refusing to replace an unsafe Nginx Manager site configuration")
-        if metadata_path.is_symlink() or (metadata_path.exists() and not metadata_path.is_file()):
-            raise RuntimeError("Refusing to replace unsafe Nginx Manager site metadata")
-        previous_config = active_path.read_bytes() if active_path.exists() else None
-        previous_metadata = metadata_path.read_bytes() if metadata_path.exists() else None
-        if not is_edit and (previous_config is not None or previous_metadata is not None):
-            raise RuntimeError("Generated Nginx Manager site ID already exists; retry the operation")
-        if previous_config is not None and _nginx_manager_file_marker(previous_config.decode("utf-8")) != site_id:
-            raise RuntimeError("Refusing to edit a configuration not created by Nginx Manager")
-        if is_edit and previous_metadata is None:
-            raise ValueError("Nginx site is not managed by Nginx Manager")
-        conflict_result = nginx_manager_conflicts(normalized)
-        blocking = [item for item in conflict_result["conflicts"] if item["blocking"]]
-        if normalized["enabled"] and blocking:
-            raise ValueError(blocking[0]["message"])
-        try:
-            _write_nginx_snippet(active_path, _nginx_manager_config(normalized))
-            _nginx_manager_test_config(config)
-            if normalized["enabled"]:
-                _nginx_manager_verify_loaded(active_path, config, True)
-            else:
-                active_path.unlink()
-                _nginx_manager_test_config(config)
-                _nginx_manager_verify_loaded(active_path, config, False)
-            _nginx_manager_write_metadata(normalized)
-        except Exception as exc:
-            rollback_errors = _nginx_manager_rollback_site(
-                site_id, active_path, previous_config, previous_metadata
-            )
-            detail = f"; {'; '.join(rollback_errors)}" if rollback_errors else ""
-            raise RuntimeError(f"Could not save Nginx site: {exc}{detail}") from exc
-    return {
-        "ok": True,
-        "site": {**normalized, "name": normalized["domains"][0], "managed": True, "editable": True},
-        "conflicts": conflict_result["conflicts"],
-        "message": (
-            "Virtual host saved and enabled. Reload Nginx to apply the configuration."
-            if normalized["enabled"]
-            else "Virtual host saved disabled. Enable it and reload Nginx when it is ready."
-        ),
-    }
-
-
-def nginx_manager_set_enabled(site_id: str, enabled: bool) -> Dict[str, Any]:
-    _require_root()
-    if not isinstance(enabled, bool):
-        raise ValueError("Enabled state must be a boolean")
-    config = get_config()
-    with _file_lock(Path(DEFAULT_STATE_ROOT) / "locks" / "nginx-manager.lock"):
-        site = _nginx_manager_load_site(site_id)
-        active_path, metadata_path = _nginx_manager_site_paths(site_id)
-        _assert_no_symlink_components(active_path.parent)
-        if active_path.is_symlink() or (active_path.exists() and not active_path.is_file()):
-            raise RuntimeError("Refusing to manage an unsafe Nginx site configuration")
-        is_present = active_path.is_file()
-        if is_present == enabled:
-            return {"ok": True, "site_id": site_id, "enabled": enabled, "message": "Site state is unchanged"}
-        previous_config = active_path.read_bytes() if is_present else None
-        previous_metadata = metadata_path.read_bytes()
-        if is_present and _nginx_manager_file_marker(previous_config.decode("utf-8")) != site_id:
-            raise RuntimeError("Refusing to manage a configuration not created by Nginx Manager")
-        if enabled:
-            conflict_result = nginx_manager_conflicts(dict(site, enabled=True))
-            blocking = [item for item in conflict_result["conflicts"] if item["blocking"]]
-            if blocking:
-                raise ValueError(blocking[0]["message"])
-        try:
-            if enabled:
-                _write_nginx_snippet(active_path, _nginx_manager_config(site))
-                _nginx_manager_test_config(config)
-                _nginx_manager_verify_loaded(active_path, config, True)
-            else:
-                active_path.unlink()
-                _nginx_manager_test_config(config)
-                _nginx_manager_verify_loaded(active_path, config, False)
-            site["enabled"] = enabled
-            _nginx_manager_write_metadata(site)
-        except Exception as exc:
-            rollback_errors = _nginx_manager_rollback_site(
-                site_id, active_path, previous_config, previous_metadata
-            )
-            detail = f"; {'; '.join(rollback_errors)}" if rollback_errors else ""
-            raise RuntimeError(f"Could not {'enable' if enabled else 'disable'} Nginx site: {exc}{detail}") from exc
-    return {
-        "ok": True,
-        "site_id": site_id,
-        "enabled": enabled,
-        "message": (
-            "Site enabled. Reload Nginx to apply the configuration."
-            if enabled else "Site disabled. Reload Nginx to apply the configuration."
-        ),
-    }
-
-
-def nginx_manager_test() -> Dict[str, Any]:
-    _require_root()
-    output = _nginx_manager_test_config(get_config())
-    return {"ok": True, "passed": True, "output": output or "Nginx configuration test passed"}
-
-
-def nginx_manager_service_action(action_name: str) -> Dict[str, Any]:
-    _require_root()
-    if action_name not in {"reload", "restart"}:
-        raise ValueError("Nginx action must be reload or restart")
-    config = get_config()
-    output = _nginx_manager_test_config(config)
-    _systemctl(action_name, "nginx", timeout=int(config["command_timeout_seconds"]))
-    return {
-        "ok": True,
-        "action": action_name,
-        "output": output or "Nginx configuration test passed",
-        "message": f"Nginx {action_name} completed successfully",
-    }
+            raise RuntimeError(f"Refusing to manage a path through a symlink: {current}")
 
 
 def _write_service(
@@ -4564,7 +3234,7 @@ def deployment_start_app(app_id: str, approved_commit: Optional[str] = None) -> 
             "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
             "--property=CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_KILL",
             "--property=UMask=0027",
-            f"--property=ReadWritePaths={DEFAULT_STATE_ROOT} {DEFAULT_PRODUCTION_ROOT} {DEFAULT_LOG_ROOT} /etc/systemd/system /etc/nginx /var/log/nginx",
+            f"--property=ReadWritePaths={DEFAULT_STATE_ROOT} {DEFAULT_PRODUCTION_ROOT} {DEFAULT_LOG_ROOT} /etc/systemd/system",
             "--property=StandardOutput=null",
             "--property=StandardError=journal",
             "--",
@@ -4720,7 +3390,7 @@ def _build_slot(cancel_file: Path, on_wait: Optional[Callable[[], None]] = None)
         time.sleep(0.1)
 
 
-def docker_status() -> Dict[str, Any]:
+def _docker_engine_status() -> Dict[str, Any]:
     docker = shutil.which("docker")
     if not docker:
         return {
@@ -4744,32 +3414,6 @@ def docker_status() -> Dict[str, Any]:
     }
 
 
-def install_or_update_docker() -> Dict[str, Any]:
-    _require_root()
-    os_release = Path(DEFAULT_OS_RELEASE_PATH)
-    if not os_release.is_file():
-        raise RuntimeError("Cannot identify the host operating system; Docker installation requires Ubuntu")
-    release = {}
-    for line in os_release.read_text(encoding="utf-8").splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            release[key] = value.strip().strip('"')
-    if release.get("ID") != "ubuntu":
-        raise RuntimeError(f"Docker installation requires Ubuntu; found {release.get('ID', 'unknown')}")
-    environment = {"DEBIAN_FRONTEND": "noninteractive"}
-    for command, description in (
-        (["apt-get", "update"], "Refreshing Ubuntu package metadata"),
-        (["apt-get", "install", "--yes", "docker.io", "docker-compose-v2"], "Installing or updating Docker Engine and Compose"),
-        (["systemctl", "enable", "--now", "docker.service"], "Enabling and starting Docker Engine"),
-    ):
-        result = run_command(command, timeout=1800, env=environment)
-        _command_error(result, description)
-    status = docker_status()
-    if not status["installed"] or not status["daemon_active"] or not status["compose_available"]:
-        raise RuntimeError("Docker packages were installed, but the Engine daemon or Compose plugin is not ready")
-    return {"ok": True, "updated": True, **status}
-
-
 def _host_preflight(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     checks = []
     environment = _environment_values_app(app["id"])
@@ -4784,7 +3428,7 @@ def _host_preflight(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, An
         checks.append({"name": key, "passed": free >= config.get("min_free_disk_mb", 512) * 1024 * 1024,
                        "message": f"{free // (1024 * 1024)} MiB free; minimum {config.get('min_free_disk_mb', 512)} MiB"})
     if app.get("framework") == "docker":
-        docker = docker_status()
+        docker = _docker_engine_status()
         passed = docker["installed"] and docker["daemon_active"] and bool(docker["engine_version"])
         checks.append({
             "name": "Docker Engine and Compose",
@@ -4989,7 +3633,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
         previous_app = dict(app_snapshot)
         previous_unit_path = _service_path(previous_app)
         old_service_retired = True
-        route_activated = False
         native = bool(app_snapshot.get("python_services"))
         worker_path = _service_path(_worker_app(app_snapshot))
         previous_worker_content = None
@@ -5226,16 +3869,11 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             _raise_if_deployment_cancelled(cancel_file)
             if staged:
                 _atomic_symlink(release_dir, paths["current"])
-            _append_deployment_log(deployment_log, "Generating and activating the application Nginx route")
             with _registry_transaction() as registry:
                 _raise_if_deployment_cancelled(cancel_file)
                 latest = _find_app(registry, app_id)["deployments"][0]
                 latest["abortable"] = False
-            hosting_result = _activate_nginx_config(app_snapshot, hosting_framework, config)
-            route_activated = True
-            record["hosting"] = hosting_result
             record["abortable"] = False
-            _append_deployment_log(deployment_log, hosting_result["message"])
             _append_deployment_log(deployment_log, "Deployment completed successfully")
             record.update({"build_status": "success", "status": "deployed"})
             with _registry_transaction() as registry:
@@ -5249,14 +3887,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 else:
                     app.pop("static_root", None)
                 app["status"] = "running"
-                app["hosting_active"] = (
-                    True if hosting_result["active"] else bool(app_snapshot.get("hosting_active", False))
-                )
-                if hosting_result["active"]:
-                    app["active_route"] = app_snapshot["route"]
-                app["public_url"] = _public_url_for_route(
-                    app.get("active_route") or app["route"]
-                )
                 app["last_deploy"] = record["date"]
                 app["deployed_commit"] = commit or None
                 if build_result.get("image"):
@@ -5275,7 +3905,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 app["health"] = {
                     "checked_at": now_iso(), "service_state": "active" if runtime_required else "not-required",
                     "service_error": None, "local_healthy": True, "local_error": None,
-                    "public_healthy": None, "public_error": "Public reachability has not been checked",
                 }
                 app["latest_commit"] = commit or app.get("latest_commit")
                 stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
@@ -5305,14 +3934,8 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                             raise RuntimeError("Previous API did not recover its health check; worker remains stopped")
                     if previous_worker_content is not None and previous_worker_active:
                         _start_worker(previous_app)
-                    if route_activated:
-                        _activate_nginx_config(previous_app, previous_app["framework"], config)
                     native_recovered = True
                 elif staged:
-                    if route_activated:
-                        previous_route_app = dict(previous_app, route=previous_app.get("active_route") or previous_app["route"])
-                        previous_framework = "static" if _is_static_app(previous_app) else previous_app["framework"]
-                        _activate_nginx_config(previous_route_app, previous_framework, config)
                     if unit_written and service_path is not None:
                         _systemctl("disable", "--now", service_path.name)
                         _restore_service_file(service_path, None)
@@ -5329,7 +3952,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                     if previous_service_content is not None and service_path is not None:
                         if app_snapshot.get("status") == "running":
                             _systemctl("restart", service_path.name)
-                            previous_app = dict(app_snapshot, route=app_snapshot.get("active_route") or app_snapshot["route"])
                             if not _wait_for_health(previous_app, int(config["health_timeout_seconds"])):
                                 raise RuntimeError("The previous release did not recover its health check")
                         else:
@@ -5433,7 +4055,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             "app": app_metadata(app),
             "build": build_result,
             "deployment": record,
-            "hosting": hosting_result,
         }
 
 
@@ -5536,34 +4157,18 @@ def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any
 
 def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
     _require_root()
-    config = get_config()
     with _app_lock(app_id):
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
             app_snapshot = dict(app)
         if _is_static_app(app_snapshot):
-            route = app_snapshot.get("active_route") or app_snapshot["route"]
-            if action_name == "stop":
-                _remove_nginx_config(app_id, config)
-            else:
-                index = _static_content_root(app_snapshot, config) / "index.html"
-                if not index.is_file():
-                    raise RuntimeError("Static application has no deployed index.html; deploy it first")
-                _activate_nginx_config(dict(app_snapshot, route=route), "static", config)
-            status = "stopped" if action_name == "stop" else "running"
-            with _registry_transaction() as registry:
-                app = _find_app(registry, app_id)
-                app["status"] = status
-                app["hosting_active"] = status == "running"
-                app["active_route"] = route
-                app["updated_at"] = now_iso()
-                app.pop("health", None)
-            return {"ok": True, "app_id": app_id, "status": status}
+            raise RuntimeError("Static applications have no runtime service; manage their Nginx routing separately")
+        config = get_config()
         service_path = _service_path(app_snapshot)
         if not service_path.exists():
             raise RuntimeError(f"Application service {service_path.name} is not installed; deploy it first")
         native = bool(app_snapshot.get("python_services"))
-        active_app = dict(app_snapshot, route=app_snapshot.get("active_route") or app_snapshot["route"])
+        active_app = app_snapshot
         try:
             if native:
                 _verified_service_bytes(app_snapshot, service_path)
@@ -5807,7 +4412,6 @@ def metrics_app(app_id: str) -> Dict[str, Any]:
 
 def health_check_app(app_id: str) -> Dict[str, Any]:
     app = _find_app(get_registry(), app_id)
-    app = dict(app, route=app.get("active_route") or app["route"])
     url = app_health_url(app)
     static = _is_static_app(app)
     service_state = "not-required" if static else "unknown"
@@ -5819,45 +4423,8 @@ def health_check_app(app_id: str) -> Dict[str, Any]:
         except (OSError, RuntimeError) as exc:
             service_error = str(exc)
     healthy = check_app_health(app, 3)
-    public_healthy = None
-    public_status = None
-    public_error = "Route is not active" if not app.get("hosting_active") else None
-    if app.get("hosting_active"):
-        public_url = DEFAULT_PUBLIC_ORIGIN + _routed_health_path(app)
-        try:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LocalHealthRedirectHandler())
-            request = urllib.request.Request(
-                public_url,
-                headers={
-                    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-                    "User-Agent": "Cockpit-App-Manager/1.0",
-                },
-                method="GET",
-            )
-            with opener.open(request, timeout=3) as response:
-                public_status = response.status
-                public_healthy = 200 <= response.status < 300
-                if not public_healthy:
-                    public_error = f"Public route returned HTTP {response.status}"
-        except urllib.error.HTTPError as exc:
-            public_healthy = False
-            public_status = exc.code
-            public_error = f"Public route returned HTTP {exc.code} {exc.reason}"
-            if exc.code == 403:
-                edge = exc.headers and (exc.headers.get("cf-mitigated") or exc.headers.get("Server", "").lower() == "cloudflare")
-                public_error += (
-                    "; Cloudflare edge protection may be blocking the probe. Check the matching WAF/Access rule; "
-                    "do not disable protection globally. Use a health-check path accessible without authentication or an edge-security challenge"
-                    if edge else
-                    "; inspect Nginx error logs and application access rules. Static index.html and its parent directories "
-                    "must be readable/traversable by Nginx. Use a health-check path accessible without authentication or an edge-security challenge"
-                )
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            public_healthy = False
-            public_error = str(exc)
     health = {"checked_at": now_iso(), "service_state": service_state, "service_error": service_error,
-              "local_healthy": healthy, "local_error": None if healthy else "Local readiness check failed",
-              "public_healthy": public_healthy, "public_status": public_status, "public_error": public_error}
+              "local_healthy": healthy, "local_error": None if healthy else "Local readiness check failed"}
     with _registry_transaction() as registry:
         stored = _find_app(registry, app_id)
         if stored.get("status") == app.get("status") and stored.get("updated_at") == app.get("updated_at"):
@@ -5874,7 +4441,6 @@ def remove_app(app_id: str) -> Dict[str, Any]:
             raise RuntimeError("Cannot remove an application while a deployment is in progress")
         config = get_config()
         paths, private_gid = _validate_app_removal_paths(app, config)
-        _remove_nginx_config(app_id, config)
         _retire_legacy_root_service(app)
         if app.get("python_services"):
             _stop_native_runtime(app)
@@ -5908,18 +4474,6 @@ def remove_app(app_id: str) -> Dict[str, Any]:
         return {"ok": True, "removed": app_id, "data_retained": False}
 
 
-def open_app(app_id: str) -> Dict[str, Any]:
-    app = _find_app(get_registry(), app_id)
-    route = app.get("active_route")
-    if not app.get("hosting_active") or not route:
-        raise RuntimeError(
-            "Application route is not active in Nginx. Add the App Manager snippets include "
-            "inside the intended site's server block, run nginx -t and reload Nginx, then deploy again."
-        )
-    route = validate_app_route(route, app_id)
-    return {"ok": True, "app_id": app_id, "url": _public_url_for_route(route)}
-
-
 def action(app_id: str, action_name: str) -> Dict[str, Any]:
     operations = {
         "deploy": lambda: deploy_app(app_id),
@@ -5929,7 +4483,6 @@ def action(app_id: str, action_name: str) -> Dict[str, Any]:
         "restart": lambda: restart_app(app_id),
         "logs": lambda: logs_app(app_id),
         "remove": lambda: remove_app(app_id),
-        "open": lambda: open_app(app_id),
         "health": lambda: health_check_app(app_id),
         "health-check": lambda: health_check_app(app_id),
         "rollback": lambda: rollback_app(app_id),
@@ -5964,19 +4517,6 @@ def _build_parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("--framework", choices=sorted(FRAMEWORKS))
         command.add_argument("--exclude-framework", choices=sorted(FRAMEWORKS))
-    commands.add_parser("docker-status")
-    commands.add_parser("docker-install")
-    commands.add_parser("nginx-overview")
-    commands.add_parser("nginx-test")
-    nginx_save = commands.add_parser("nginx-site-save")
-    nginx_save.add_argument("payload")
-    nginx_conflicts = commands.add_parser("nginx-conflicts")
-    nginx_conflicts.add_argument("payload")
-    for name in ("nginx-site-enable", "nginx-site-disable"):
-        command = commands.add_parser(name)
-        command.add_argument("site_id")
-    nginx_service = commands.add_parser("nginx-service")
-    nginx_service.add_argument("action", choices=("reload", "restart"))
     commands.add_parser("plugin-update-check")
     commands.add_parser("plugin-update")
     deployment_logs = commands.add_parser("deployment-logs")
@@ -5998,7 +4538,7 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy = commands.add_parser("deploy")
     deploy.add_argument("app_id")
     deploy.add_argument("--deployment-id")
-    for name in ("pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "open", "preflight", "prerequisites", "worker-status", "worker-restart", "worker-logs", "metrics", "review-update"):
+    for name in ("pull", "start", "stop", "restart", "remove", "health", "health-check", "check-health", "preflight", "prerequisites", "worker-status", "worker-restart", "worker-logs", "metrics", "review-update"):
         command = commands.add_parser(name)
         command.add_argument("app_id")
     logs = commands.add_parser("logs")
@@ -6021,24 +4561,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
-    if args.command == "docker-status":
-        return docker_status()
-    if args.command == "docker-install":
-        return install_or_update_docker()
-    if args.command == "nginx-overview":
-        return nginx_manager_overview()
-    if args.command == "nginx-test":
-        return nginx_manager_test()
-    if args.command == "nginx-conflicts":
-        return nginx_manager_conflicts(parse_payload(args.payload))
-    if args.command == "nginx-site-save":
-        return nginx_manager_save_site(parse_payload(args.payload))
-    if args.command == "nginx-site-enable":
-        return nginx_manager_set_enabled(args.site_id, True)
-    if args.command == "nginx-site-disable":
-        return nginx_manager_set_enabled(args.site_id, False)
-    if args.command == "nginx-service":
-        return nginx_manager_service_action(args.action)
     if args.command == "list":
         return list_apps(args.framework, args.exclude_framework)
     if args.command == "overview":
@@ -6081,8 +4603,6 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         return rollback_app(args.app_id, args.release_id)
     if args.command in {"health", "health-check", "check-health"}:
         return health_check_app(args.app_id)
-    if args.command == "open":
-        return open_app(args.app_id)
     if args.command == "preflight":
         return preflight_app(args.app_id)
     if args.command == "prerequisites":

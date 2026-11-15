@@ -45,7 +45,7 @@
         <div class="am-welcome-copy">
           <p class="am-welcome-kicker"><span aria-hidden="true"></span> Cockpit application platform</p>
           <h2 id="amWelcomeTitle">Build, ship,<br class="am-welcome-break"> <span>and run.</span></h2>
-          <p>Deploy releases, check runtime health, and manage every hosted route from one workspace.</p>
+          <p>Deploy releases, check runtime health, and prepare applications for routing in Cockpit.</p>
         </div>
         <div class="am-welcome-visual" aria-hidden="true">
           <div class="am-welcome-orbit"></div>
@@ -146,7 +146,7 @@
         </div>
       </section>
       <section data-setup-step="1" aria-labelledby="setupRuntimeTitle" hidden>
-        <h3 id="setupRuntimeTitle" class="am-setup-title">Runtime and public route</h3>
+        <h3 id="setupRuntimeTitle" class="am-setup-title">Runtime and application path</h3>
         <div class="am-form-grid">
           <div>
             <label for="appSlug">Application ID</label>
@@ -161,12 +161,13 @@
               <option value="node">Node.js</option>
               <option value="python">Python</option>
               <option value="static">Static HTML</option>
+              <option value="docker">Docker</option>
             </select>
           </div>
           <div class="am-form-grid__wide">
-            <label for="appRoute">Hosted route</label>
-            <input id="appRoute" required name="route" autocomplete="off" spellcheck="false" placeholder="/customer-portal/" maxlength="256" pattern="/([a-z0-9]([a-z0-9\-]{0,62}[a-z0-9])?/)+" />
-            <output id="setupUrlPreview" class="am-url-preview" for="appRoute"></output>
+            <label for="appRoute">Application path prefix</label>
+            <input id="appRoute" required name="route" autocomplete="off" spellcheck="false" placeholder="/customer-portal/ or /" maxlength="256" pattern="/|/([a-z0-9]([a-z0-9\-]{0,62}[a-z0-9])?/)+" />
+            <small class="am-field-hint">This path configures the app's base path only. Set up domains and reverse-proxy routing separately in Cockpit's Nginx Manager.</small>
           </div>
           <div>
             <label for="appHealthCheck">Health-check path</label>
@@ -183,6 +184,23 @@
             <div class="am-form-grid__wide"><label for="appDirectory">Project directory <span class="am-optional">Optional</span></label><input id="appDirectory" name="app_directory" placeholder="apps/web" autocomplete="off" /></div>
             <div class="am-form-grid__wide"><label for="appGoPackage">Go main package <span class="am-optional">Optional</span></label><input id="appGoPackage" name="go_package" placeholder="./cmd/server" autocomplete="off" pattern="\.(?:/[A-Za-z0-9_\-][A-Za-z0-9_.\-]*)*" /></div>
             <div class="am-form-grid__wide"><label for="appStartCommand">Start command <span class="am-optional">JSON argument array</span></label><textarea id="appStartCommand" name="start_command" rows="2" spellcheck="false" placeholder='["node", "dist/server.js"]'></textarea></div>
+            <div id="dockerSetupFields" class="am-form-grid__wide" hidden>
+              <label for="dockerMode">Docker deployment type</label>
+              <select id="dockerMode" name="docker_mode" disabled>
+                <option value="dockerfile">Dockerfile</option>
+                <option value="compose">Docker Compose</option>
+              </select>
+              <label for="dockerfilePath">Dockerfile path</label>
+              <input id="dockerfilePath" name="dockerfile" value="Dockerfile" autocomplete="off" disabled>
+              <div id="composeSetupFields" class="am-form-grid__wide" hidden>
+                <label for="composeFile">Compose file</label>
+                <input id="composeFile" name="compose_file" value="compose.yaml" autocomplete="off" disabled>
+                <label for="composeService">Web service name</label>
+                <input id="composeService" name="compose_service" autocomplete="off" disabled>
+              </div>
+              <label for="containerPort">Container port</label>
+              <input id="containerPort" name="container_port" type="number" min="1" max="65535" value="3000" disabled>
+            </div>
           </div>
         </details>
         <section class="am-setup-environment" aria-labelledby="setupEnvironmentTitle">

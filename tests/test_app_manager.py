@@ -78,46 +78,6 @@ class AppManagerTests(unittest.TestCase):
                     (repo / filename).write_text(contents, encoding="utf-8")
                 self.assertEqual(detect_framework(repo), expected)
 
-    def test_docker_status_and_apt_install_flow(self):
-        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with patch.object(manager.shutil, "which", return_value="/usr/bin/docker"), patch.object(
-            manager, "run_command", side_effect=[
-                subprocess.CompletedProcess([], 0, stdout="Docker version 27.0\n", stderr=""),
-                subprocess.CompletedProcess([], 0, stdout="27.0.1\n", stderr=""),
-                subprocess.CompletedProcess([], 0, stdout="v2.29.0\n", stderr=""),
-                subprocess.CompletedProcess([], 0, stdout="active\n", stderr=""),
-            ],
-        ):
-            status = manager.docker_status()
-        self.assertTrue(status["installed"])
-        self.assertTrue(status["daemon_active"])
-        self.assertTrue(status["compose_available"])
-        self.assertEqual(status["engine_version"], "27.0.1")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            os_release = Path(temporary) / "os-release"
-            os_release.write_text('ID="ubuntu"\n', encoding="utf-8")
-            commands = [
-                ["apt-get", "update"],
-                ["apt-get", "install", "--yes", "docker.io", "docker-compose-v2"],
-                ["systemctl", "enable", "--now", "docker.service"],
-                ["/usr/bin/docker", "--version"],
-                ["/usr/bin/docker", "version", "--format", "{{.Server.Version}}"],
-                ["/usr/bin/docker", "compose", "version", "--short"],
-                ["systemctl", "show", "docker.service", "--property=ActiveState", "--value"],
-            ]
-            outputs = [success, success, success, success,
-                       subprocess.CompletedProcess([], 0, stdout="27.0.1\n", stderr=""),
-                       subprocess.CompletedProcess([], 0, stdout="v2.29.0\n", stderr=""),
-                       subprocess.CompletedProcess([], 0, stdout="active\n", stderr="")]
-            with patch.object(manager, "DEFAULT_OS_RELEASE_PATH", str(os_release)), patch.object(
-                manager, "_require_root"
-            ), patch.object(manager.shutil, "which", return_value="/usr/bin/docker"), patch.object(
-                manager, "run_command", side_effect=outputs
-            ) as run:
-                installed = manager.install_or_update_docker()
-            self.assertTrue(installed["updated"])
-            self.assertEqual([call.args[0] for call in run.call_args_list], commands)
 
     def python_payload(self, **overrides):
         payload = self.add_payload("Drums", framework="python", health_check_url="/api/health",
@@ -162,14 +122,6 @@ class AppManagerTests(unittest.TestCase):
         self.assertNotIn("worker-stdout.log", web)
         self.assertEqual(manager._service_path(manager._worker_app(app)).name, "cockpit-app-drums@worker.service")
 
-    def test_python_upload_and_access_rules_only_affect_the_app_location(self):
-        settings = manager.validate_app_payload(self.python_payload())["python_services"]
-        template = Path(__file__).resolve().parents[1] / "templates" / "nginx.conf.tpl"
-        rendered = manager._render_nginx_config("drums", 8123, template_path=template, framework="python", python_services=settings)
-        self.assertIn("client_max_body_size 101m;", rendered)
-        self.assertIn("deny all;", rendered)
-        self.assertIn("location ^~ /drums/", rendered)
-        self.assertNotIn("client_max_body_size", manager._render_nginx_config("other", 8124, template_path=template, framework="python"))
 
     def test_worker_handover_refuses_a_live_or_unknown_cgroup(self):
         app = {"id": "drums"}
@@ -378,7 +330,6 @@ class AppManagerTests(unittest.TestCase):
                         "_wait_for_health": Mock(side_effect=[False, True] if failure == "api" else [True, True, True]),
                         "_startup_failure": Mock(return_value="api unhealthy"), "_assert_loopback_binding": Mock(),
                         "_atomic_symlink": Mock(side_effect=lambda *args: events.append(("symlink",))),
-                        "_activate_nginx_config": Mock(return_value={"active": True, "message": "active"}),
                         "_prune_releases": Mock(),
                     }
                     for name, replacement in mocks.items():
@@ -566,70 +517,17 @@ class AppManagerTests(unittest.TestCase):
         result = self.add_app("Fixed Port", slug="fixed-port", port=8123)
         self.assertEqual(result["app"]["port"], 8123)
 
-    def test_application_route_is_validated_normalized_and_unique(self):
-        created = self.add_app("Public Site", route="/public-site")
-        self.assertEqual(created["app"]["route"], "/public-site/")
-        self.assertIsNone(created["app"]["public_url"])
 
-        with self.assertRaisesRegex(ValueError, "already assigned"):
-            self.add_app("Other Site", slug="other-site", route="/public-site/")
-
-        for route in (
-            "/",
-            "public-site/",
-            "//public-site/",
-            "/Upper/",
-            "/query/?x=1",
-            "/../outside/",
-            "/ends-with-./",
-        ):
-            with self.subTest(route=route), self.assertRaisesRegex(ValueError, "Route must be"):
-                manager.validate_app_payload(self.add_payload("Bad Route", route=route))
-        self.assertEqual(
-            manager.validate_app_payload(
-            self.add_payload("Nested Route", route="/apps/customer-portal")
-            )["route"],
-            "/apps/customer-portal/",
-        )
-
-    def test_edit_application_changes_route_without_changing_active_route(self):
+    def test_edit_application_changes_application_path_prefix(self):
         created = self.add_app("Route App", route="/old-route")["app"]
-        with manager._registry_transaction() as registry:
-            app = manager._find_app(registry, created["id"])
-            app["active_route"] = "/old-route/"
-            app["hosting_active"] = True
-
         updated = manager.edit_app(created["id"], {"route": "/new-route"})
         self.assertEqual(updated["app"]["route"], "/new-route/")
-        self.assertEqual(updated["app"]["active_route"], "/old-route/")
         metadata = manager.list_apps()["apps"][0]
-        self.assertEqual(metadata["public_url"], f"{manager.DEFAULT_PUBLIC_ORIGIN}/old-route/")
+        self.assertNotIn("active_route", metadata)
+        self.assertNotIn("hosting_active", metadata)
+        self.assertNotIn("public_url", metadata)
 
-    def test_public_url_is_withheld_until_the_route_is_active(self):
-        created = self.add_app("Pending Site", route="/pending-site")["app"]
-        metadata = manager.app_metadata(created)
-        self.assertFalse(metadata["hosting_active"])
-        self.assertIsNone(metadata["public_url"])
 
-        with manager._registry_transaction() as registry:
-            app = manager._find_app(registry, created["id"])
-            app["active_route"] = "/pending-site/"
-            app["hosting_active"] = True
-        active = manager.app_metadata(manager.get_registry()["apps"][0])
-        self.assertTrue(active["hosting_active"])
-        self.assertEqual(active["public_url"], f"{manager.DEFAULT_PUBLIC_ORIGIN}/pending-site/")
-
-    def test_open_app_refuses_to_return_a_url_for_an_inactive_nginx_route(self):
-        app = self.add_app("Pending Site", route="/pending-site")["app"]
-        with self.assertRaisesRegex(RuntimeError, "route is not active in Nginx"):
-            manager.open_app(app["id"])
-
-        with manager._registry_transaction() as registry:
-            stored = manager._find_app(registry, app["id"])
-            stored["active_route"] = stored["route"]
-            stored["hosting_active"] = True
-        result = manager.open_app(app["id"])
-        self.assertEqual(result["url"], f"{manager.DEFAULT_PUBLIC_ORIGIN}/pending-site/")
 
     def test_build_config_rejects_unsafe_go_package(self):
         for package in ("", "../outside", "./cmd/../server", "/absolute", "example.com/remote", "./...", ["./cmd/server"]):
@@ -895,16 +793,8 @@ class AppManagerTests(unittest.TestCase):
 
     def test_missing_application_is_reported(self):
         with self.assertRaisesRegex(ValueError, "not found"):
-            manager.open_app("missing")
+            manager.health_check_app("missing")
 
-    def test_frontend_action_convention_supports_open(self):
-        app = self.add_app()["app"]
-        with manager._registry_transaction() as registry:
-            stored = manager._find_app(registry, app["id"])
-            stored["active_route"] = stored["route"]
-            stored["hosting_active"] = True
-        result = manager.action("example-site", "open")
-        self.assertEqual(result["url"], "https://stuserver.online/example-site/")
 
     def test_cli_errors_go_to_stderr_and_stdout_remains_json(self):
         stdout = io.StringIO()
@@ -1402,8 +1292,8 @@ class AppManagerTests(unittest.TestCase):
             argument for argument in command if argument.startswith("--property=ReadWritePaths=")
         )
         self.assertIn(manager.DEFAULT_STATE_ROOT, read_write_paths)
-        self.assertIn("/etc/nginx", read_write_paths)
-        self.assertIn("/var/log/nginx", read_write_paths)
+        self.assertNotIn("/etc/nginx", read_write_paths)
+        self.assertNotIn("/var/log/nginx", read_write_paths)
         ensure_user.assert_called_once_with(app["id"])
         self.assertFalse(any("/etc/passwd" in argument for argument in command))
         self.assertEqual(command[-4:], ["deploy", app["id"], "--deployment-id", result["deployment_id"]])
@@ -1769,77 +1659,9 @@ class AppManagerTests(unittest.TestCase):
             self.assertEqual(manager.auto_deploy_apps()["results"][0]["status"], "retry-backoff")
         self.assertIn("offline", manager.get_registry()["apps"][0]["auto_deploy_state"]["error"])
 
-    def test_health_reports_service_local_and_public_independently(self):
-        app = self.add_app(framework="node")["app"]
-        with manager._registry_transaction() as registry:
-            stored = manager._find_app(registry, app["id"])
-            stored.update(hosting_active=True, active_route=stored["route"])
-        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
-            manager, "check_app_health", return_value=True
-        ), patch.object(manager.urllib.request, "build_opener") as opener:
-            opener.return_value.open.side_effect = urllib.error.URLError("public DNS unavailable")
-            result = manager.health_check_app(app["id"])
-        request = opener.return_value.open.call_args.args[0]
-        self.assertEqual(result["service_state"], "active")
-        self.assertTrue(result["local_healthy"])
-        self.assertFalse(result["public_healthy"])
-        self.assertIn("DNS", result["public_error"])
-        self.assertEqual(request.get_header("User-agent"), "Cockpit-App-Manager/1.0")
-        self.assertEqual(manager.get_registry()["apps"][0]["health"]["checked_at"], result["checked_at"])
 
-    def test_public_health_explains_forbidden_health_paths(self):
-        app = self.add_app(framework="node")["app"]
-        with manager._registry_transaction() as registry:
-            stored = manager._find_app(registry, app["id"])
-            stored.update(hosting_active=True, active_route=stored["route"])
-        forbidden = urllib.error.HTTPError(
-            manager.DEFAULT_PUBLIC_ORIGIN + app["route"], 403, "Forbidden", {}, None
-        )
-        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
-            manager, "check_app_health", return_value=True
-        ), patch.object(manager.urllib.request, "build_opener") as opener:
-            opener.return_value.open.side_effect = forbidden
-            report = manager.health_check_app(app["id"])
-        self.assertFalse(report["public_healthy"])
-        self.assertEqual(report["public_status"], 403)
-        self.assertIn("HTTP 403 Forbidden", report["public_error"])
-        self.assertIn("Nginx error logs", report["public_error"])
-        self.assertIn("health-check path", report["public_error"])
 
-    def test_public_health_identifies_a_cloudflare_forbidden_probe(self):
-        app = self.add_app(framework="go")["app"]
-        with manager._registry_transaction() as registry:
-            stored = manager._find_app(registry, app["id"])
-            stored.update(hosting_active=True, active_route=stored["route"])
-        forbidden = urllib.error.HTTPError(
-            manager.DEFAULT_PUBLIC_ORIGIN + app["route"], 403, "Forbidden", {"Server": "cloudflare"}, None
-        )
-        with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
-            manager, "check_app_health", return_value=True
-        ), patch.object(manager.urllib.request, "build_opener") as opener:
-            opener.return_value.open.side_effect = forbidden
-            report = manager.health_check_app(app["id"])
-        self.assertTrue(report["local_healthy"])
-        self.assertEqual(report["service_state"], "active")
-        self.assertEqual(report["public_status"], 403)
-        self.assertIn("Cloudflare edge protection", report["public_error"])
 
-    def test_nextjs_public_health_preserves_an_existing_route_prefix(self):
-        app = self.add_app(framework="nextjs")["app"]
-        route = app["route"]
-        for health in ("/health", route + "health", route.rstrip("/"), "/"):
-            with self.subTest(health=health):
-                with manager._registry_transaction() as registry:
-                    stored = manager._find_app(registry, app["id"])
-                    stored.update(hosting_active=True, active_route=route, health_check_url=health)
-                with patch.object(manager, "_systemctl", return_value=subprocess.CompletedProcess([], 0, "active\n", "")), patch.object(
-                    manager, "check_app_health", return_value=True
-                ), patch.object(manager.urllib.request, "build_opener") as opener:
-                    opener.return_value.open.return_value.__enter__.return_value.status = 200
-                    report = manager.health_check_app(app["id"])
-                local_path = report["url"].split(":" + str(app["port"]), 1)[1]
-                self.assertEqual(opener.return_value.open.call_args.args[0].full_url, manager.DEFAULT_PUBLIC_ORIGIN + local_path)
-                self.assertNotIn(route.rstrip("/") + route, local_path)
 
     def test_health_started_before_stop_cannot_restore_an_active_observation(self):
         app = self.add_app(framework="node")["app"]
@@ -2179,66 +2001,6 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(stored["deployments"][-1]["status"], "failed")
         self.assertIn("remote unavailable", stored["deployments"][-1]["error"])
 
-    def test_deployment_uses_custom_route_and_activates_nginx_after_health_check(self):
-        app = self.add_app("Custom Route", route="/custom-route")["app"]
-        config = manager.get_config()
-        paths = manager._app_paths(app["id"], config)
-        paths["releases"].mkdir(parents=True)
-        unit_path = Path(self.temp_dir.name) / "cockpit-app-custom-route.service"
-        activation = {
-            "active": True,
-            "route": "/custom-route/",
-            "config_path": "/etc/nginx/snippets/cockpit-app-manager/custom-route.conf",
-            "message": "Nginx is serving /custom-route/ from the managed application configuration.",
-        }
-
-        class Adapter:
-            def build(self, app_record, source_path, release_dir, **kwargs):
-                kwargs["runner"](["true"], source_path, 1)
-                self.route = app_record["route"]
-                return {"start_command": ["/bin/true"], "working_directory": None}
-
-        adapter = Adapter()
-
-        def prepare_release(release_dir, username):
-            release_dir.mkdir()
-
-        with patch.object(manager, "_require_root"), patch.object(
-            manager, "ensure_app_user", return_value=app["service_user"]
-        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
-            manager, "clone_or_update_repo", return_value={"status": "updated"}
-        ), patch.object(manager, "git_output", return_value="a" * 40), patch.object(
-            manager, "_prepare_release_directory", side_effect=prepare_release
-        ), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
-            manager, "_environment_values_app", return_value={}
-        ), patch.object(manager, "_service_path", return_value=unit_path), patch.object(
-            manager, "_write_service"
-        ), patch.object(manager, "_seal_release"), patch.object(
-            manager, "_systemctl"
-        ), patch.object(manager, "_retire_legacy_root_service"), patch.object(
-            manager, "_atomic_symlink"
-        ), patch.object(manager, "_wait_for_health", return_value=True), patch.object(
-            manager, "_assert_loopback_binding"
-        ) as binding, patch.object(
-            manager, "_activate_nginx_config", return_value=activation
-        ) as activate, patch.object(
-            manager, "_run_as_user", return_value=subprocess.CompletedProcess(
-                args=["true"], returncode=0, stdout="", stderr=""
-            )
-        ) as run_as_user, patch.object(manager, "get_adapter", return_value=adapter), patch.object(
-            manager, "_deployment_preflight", return_value={"passed": True}
-        ):
-            result = manager.deploy_app(app["id"])
-
-        self.assertEqual(adapter.route, "/custom-route/")
-        binding.assert_called_once()
-        self.assertEqual(run_as_user.call_args.kwargs["environment"]["APP_BASE_PATH"], "/custom-route")
-        activate.assert_called_once()
-        self.assertEqual(activate.call_args.args[0]["route"], "/custom-route/")
-        self.assertTrue(result["hosting"]["active"])
-        stored = manager.get_registry()["apps"][0]
-        self.assertEqual(stored["active_route"], "/custom-route/")
-        self.assertTrue(stored["hosting_active"])
 
     def test_failed_nextjs_deployment_retains_preflight_and_npm_diagnostics(self):
         app = self.add_app("Next Site", framework="nextjs")["app"]
@@ -2404,52 +2166,12 @@ class AppManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not listening"):
                 manager._assert_loopback_binding(app, 10)
 
-    def test_static_deployment_uses_nginx_without_creating_a_runtime_service(self):
-        app = self.add_app("Static deployment")["app"]
-        paths = manager._app_paths(app["id"], manager.get_config())
-        paths["source"].mkdir(parents=True)
-        paths["releases"].mkdir(parents=True)
-        (paths["source"] / "index.html").write_text("<h1>Ready</h1>", encoding="utf-8")
-        activation = {"active": True, "route": app["route"], "message": "Static route active"}
-        with patch.object(manager, "_require_root"), patch.object(
-            manager, "ensure_app_user", return_value=app["service_user"]
-        ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
-            manager, "clone_or_update_repo"
-        ), patch.object(manager, "git_output", return_value="a" * 40), patch.object(
-            manager, "_prepare_release_directory", side_effect=lambda path, user: path.mkdir()
-        ), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
-            manager, "_service_path", return_value=Path(self.temp_dir.name) / "static.service"
-        ), patch.object(manager, "_environment_values_app", return_value={}), patch.object(
-            manager, "_seal_release"
-        ), patch.object(manager, "_write_service") as write_service, patch.object(
-            manager, "_retire_legacy_root_service"
-        ), patch.object(manager, "_atomic_symlink"), patch.object(
-            manager, "_systemctl"
-        ) as systemctl, patch.object(manager, "_wait_for_health") as runtime_health, patch.object(
-            manager, "_activate_nginx_config", return_value=activation
-        ), patch.object(manager, "_prune_releases"), patch("backend.adapters._prepare_build_copy_permissions"):
-            result = manager.deploy_app(app["id"])
-        write_service.assert_not_called()
-        systemctl.assert_not_called()
-        runtime_health.assert_not_called()
-        self.assertTrue(result["app"]["hosting_active"])
-        self.assertEqual(result["app"]["public_url"], manager.DEFAULT_PUBLIC_ORIGIN + app["route"])
-        self.assertFalse(paths["source"].exists())
-        self.assertTrue((Path(result["deployment"]["release"]) / "app" / "index.html").is_file())
-        logs = manager.deployment_logs_app(app["id"])["logs"]
-        self.assertIn(f"branch={app['branch']}", logs)
-        self.assertIn(f"route={app['route']}", logs)
-        self.assertIn("configured_framework=static", logs)
-        self.assertIn(f"deployment_id={result['deployment']['id']}", logs)
-        self.assertIn("Source revision: " + "a" * 40, logs)
 
     def test_nextjs_export_deploys_as_static_without_changing_framework_detection(self):
         app = self.add_app("Next export", framework="nextjs")["app"]
         paths = manager._app_paths(app["id"], manager.get_config())
         paths["source"].mkdir(parents=True)
         paths["releases"].mkdir(parents=True)
-        activation = {"active": True, "route": app["route"], "message": "Static route active"}
-
         def build_export(app_snapshot, source, release, *args, **kwargs):
             output = release / "app" / "apps" / "web" / "out"
             output.mkdir(parents=True)
@@ -2475,8 +2197,8 @@ class AppManagerTests(unittest.TestCase):
         ) as write_service, patch.object(manager, "_retire_legacy_root_service"), patch.object(
             manager, "_atomic_symlink"
         ), patch.object(manager, "_systemctl") as systemctl, patch.object(
-            manager, "_activate_nginx_config", return_value=activation
-        ) as activate_nginx, patch.object(manager, "_prune_releases"), patch(
+            manager, "_prune_releases"
+        ), patch(
             "backend.adapters._prepare_build_copy_permissions"
         ):
             result = manager.deploy_app(app["id"])
@@ -2485,7 +2207,6 @@ class AppManagerTests(unittest.TestCase):
         systemctl.assert_not_called()
         seal_release.assert_called_once()
         self.assertTrue(seal_release.call_args.kwargs["public"])
-        self.assertEqual(activate_nginx.call_args.args[1], "static")
         self.assertEqual(result["app"]["framework"], "nextjs")
         self.assertTrue(result["app"]["static_export"])
         self.assertEqual(result["app"]["static_root"], "apps/web/out")
@@ -2537,7 +2258,6 @@ class AppManagerTests(unittest.TestCase):
                         "_write_service": Mock(side_effect=write_service), "_systemctl": Mock(side_effect=systemctl),
                         "_wait_for_health": Mock(side_effect=health), "_assert_loopback_binding": Mock(),
                         "_atomic_symlink": Mock(side_effect=lambda *args: events.append("symlink")),
-                        "_activate_nginx_config": Mock(side_effect=lambda *args: events.append("nginx") or {"active": True, "message": "active"}),
                         "_prune_releases": Mock(), "_socket_port_available": Mock(return_value=True),
                         "get_listening_ports": Mock(return_value=set()),
                     }
@@ -2546,7 +2266,7 @@ class AppManagerTests(unittest.TestCase):
                     if health_passes:
                         manager.deploy_app(app["id"])
                         self.assertLess(events.index("health"), events.index("symlink"))
-                        self.assertLess(events.index("nginx"), events.index(("disable", "--now", primary.name)))
+                        self.assertLess(events.index("symlink"), events.index(("disable", "--now", primary.name)))
                         stored = manager._find_app(manager.get_registry(), app["id"])
                         self.assertEqual(stored["service_slot"], "secondary")
                         self.assertEqual(stored["deployed_commit"], "b" * 40)
@@ -2554,7 +2274,6 @@ class AppManagerTests(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(RuntimeError, "health check"):
                             manager.deploy_app(app["id"])
-                        self.assertNotIn("nginx", events)
                         self.assertNotIn(("restart", primary.name), events)
                         self.assertNotIn(("disable", "--now", primary.name), events)
                         self.assertTrue(primary.exists())
@@ -2610,8 +2329,6 @@ class AppManagerTests(unittest.TestCase):
         with patch.object(manager, "_validate_app_account_for_removal", return_value=1234), patch.object(
             manager, "_remove_app_account"
         ) as remove_account, patch.object(
-            manager, "_remove_nginx_config"
-        ) as remove_nginx, patch.object(
             manager, "_retire_legacy_root_service"
         ), patch.object(
             manager, "_service_path", side_effect=lambda record: units[record.get("service_slot", "primary")]
@@ -2621,7 +2338,6 @@ class AppManagerTests(unittest.TestCase):
             result = manager.remove_app(app["id"])
 
         self.assertEqual(result, {"ok": True, "removed": app["id"], "data_retained": False})
-        remove_nginx.assert_called_once_with(app["id"], config)
         remove_account.assert_called_once()
         self.assertEqual(remove_account.call_args.args[0]["id"], app["id"])
         self.assertEqual(remove_account.call_args.args[1], 1234)
@@ -2635,22 +2351,17 @@ class AppManagerTests(unittest.TestCase):
 
     def test_remove_app_refuses_paths_or_accounts_before_modifying_resources(self):
         app = self.add_app()["app"]
-        with patch.object(manager, "_assert_no_symlink_components", side_effect=RuntimeError("symlink")), patch.object(
-            manager, "_remove_nginx_config"
-        ) as remove_nginx:
+        with patch.object(manager, "_assert_no_symlink_components", side_effect=RuntimeError("symlink")):
             with self.assertRaisesRegex(RuntimeError, "symlink"):
                 manager.remove_app(app["id"])
-        remove_nginx.assert_not_called()
         self.assertEqual(len(manager.get_registry()["apps"]), 1)
 
     def test_remove_app_refuses_active_deployment(self):
         app = self.add_app()["app"]
         with manager._registry_transaction() as registry:
             manager._find_app(registry, app["id"])["deployments"] = [{"status": "deploying"}]
-        with patch.object(manager, "_remove_nginx_config") as remove_nginx:
-            with self.assertRaisesRegex(RuntimeError, "deployment is in progress"):
-                manager.remove_app(app["id"])
-        remove_nginx.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "deployment is in progress"):
+            manager.remove_app(app["id"])
         self.assertEqual(len(manager.get_registry()["apps"]), 1)
 
     def test_application_account_removal_requires_its_private_group(self):
@@ -2706,7 +2417,7 @@ class AppManagerTests(unittest.TestCase):
                 stored = manager._find_app(manager.get_registry(), app["id"])
                 self.assertEqual(stored["status"], "running" if healthy and isolated else "failed")
 
-    def test_failed_static_conversion_restores_and_reenables_the_previous_runtime(self):
+    def test_static_conversion_disables_the_previous_runtime_without_nginx_activation(self):
         app = self.add_app("Converted static")["app"]
         paths = manager._app_paths(app["id"], manager.get_config())
         paths["source"].mkdir(parents=True)
@@ -2732,35 +2443,31 @@ class AppManagerTests(unittest.TestCase):
             manager, "_atomic_symlink"
         ), patch.object(manager, "_restore_service_file") as restore, patch.object(
             manager, "_systemctl"
-        ) as systemctl, patch.object(manager, "_wait_for_health", return_value=True), patch.object(
-            manager, "_activate_nginx_config", side_effect=RuntimeError("Nginx refused activation")
-        ), patch("backend.adapters._prepare_build_copy_permissions"):
-            with self.assertRaisesRegex(RuntimeError, "Nginx refused activation"):
-                manager.deploy_app(app["id"])
-        self.assertEqual([item.args for item in restore.call_args_list], [
-            (service_path, None), (service_path, previous_service.encode("utf-8")),
-        ])
+        ) as systemctl, patch(
+            "backend.adapters._prepare_build_copy_permissions"
+        ):
+            result = manager.deploy_app(app["id"])
+        self.assertEqual(result["app"]["framework"], "static")
+        self.assertFalse(result["app"]["static_export"])
+        self.assertEqual(restore.call_args_list[0].args, (service_path, None))
         actions = [item.args for item in systemctl.call_args_list]
         self.assertIn(("disable", "--now", service_path.name), actions)
-        self.assertIn(("enable", service_path.name), actions)
-        self.assertIn(("restart", service_path.name), actions)
         stored = manager._find_app(manager.get_registry(), app["id"])
         self.assertEqual(stored["status"], "running")
-        self.assertEqual(stored["deployments"][0]["status"], "failed")
-        self.assertNotIn("rollback_error", stored["deployments"][0])
+        self.assertEqual(stored["deployments"][0]["status"], "deployed")
 
-    def test_static_health_checks_the_active_release_without_a_runtime(self):
+    def test_static_health_checks_the_release_without_a_runtime(self):
         app = self.add_app()["app"]
         index = manager._app_paths(app["id"], manager.get_config())["current"] / "app" / "index.html"
         index.parent.mkdir(parents=True)
         index.write_text("<h1>Live</h1>", encoding="utf-8")
-        app.update(status="running", hosting_active=True, active_route=app["route"])
+        app.update(status="running")
         with patch.object(manager.urllib.request, "build_opener") as opener:
             self.assertTrue(manager.check_app_health(app))
             opener.assert_not_called()
-        self.assertEqual(manager.app_health_url(app), manager.DEFAULT_PUBLIC_ORIGIN + app["route"])
+        self.assertIsNone(manager.app_health_url(app))
         app["status"] = "stopped"
-        self.assertFalse(manager.check_app_health(app))
+        self.assertTrue(manager.check_app_health(app))
 
     def test_nextjs_health_path_matches_the_public_base_path(self):
         app = {"id": "demo", "framework": "nextjs", "port": 8123, "route": "/apps/demo/"}
@@ -2774,23 +2481,6 @@ class AppManagerTests(unittest.TestCase):
                     "http://127.0.0.1:8123" + expected,
                 )
 
-    def test_static_start_and_stop_manage_only_the_application_route(self):
-        app = self.add_app()["app"]
-        index = manager._app_paths(app["id"], manager.get_config())["current"] / "app" / "index.html"
-        index.parent.mkdir(parents=True)
-        index.write_text("<h1>Live</h1>", encoding="utf-8")
-        with patch.object(manager, "_require_root"), patch.object(
-            manager, "_activate_nginx_config", return_value={"active": True}
-        ) as activate, patch.object(manager, "_remove_nginx_config") as remove, patch.object(
-            manager, "_systemctl"
-        ) as systemctl:
-            self.assertEqual(manager.start_app(app["id"])["status"], "running")
-            self.assertTrue(manager.get_registry()["apps"][0]["hosting_active"])
-            self.assertEqual(manager.stop_app(app["id"])["status"], "stopped")
-            self.assertFalse(manager.get_registry()["apps"][0]["hosting_active"])
-        activate.assert_called_once()
-        remove.assert_called_once()
-        systemctl.assert_not_called()
 
     def test_logs_returns_recent_app_specific_output(self):
         app = self.add_app()["app"]
@@ -4197,29 +3887,12 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             'install -o root -g root -m 0644 "$APP_DIR/cockpit/index.html" "$PLUGIN_DEST/index.html"',
             installer,
         )
-        nginx_plugin = cockpit_dir / "nginx-manager"
-        nginx_manifest = json.loads((nginx_plugin / "manifest.json").read_text(encoding="utf-8"))
-        nginx_html = (nginx_plugin / "index.html").read_text(encoding="utf-8")
-        nginx_frontend = (nginx_plugin / "nginx-manager.js").read_text(encoding="utf-8")
-        self.assertEqual(nginx_manifest["name"], "nginx-manager")
-        self.assertEqual(nginx_manifest["menu"]["nginx-manager"]["label"], "Nginx Manager")
-        self.assertEqual(nginx_manifest["menu"]["nginx-manager"]["order"], 62)
-        self.assertIn('class="nginx-mark"', nginx_html)
-        self.assertIn('aria-label="Create new website"', nginx_html)
-        self.assertIn('<script src="nginx-manager.js" defer></script>', nginx_html)
-        self.assertIn('const BACKEND = "/usr/libexec/cockpit/app-manager/app-manager";', nginx_frontend)
-        self.assertIn('superuser: "require"', nginx_frontend)
-        for command in (
-            '"nginx-overview"', '"nginx-conflicts"', '"nginx-site-save"',
-            'callBackend(`nginx-site-${action}`', '"nginx-test"', '"nginx-service"',
-        ):
-            self.assertIn(command, nginx_frontend)
-        for asset in ("index.html", "manifest.json", "nginx-manager.css", "nginx-manager.js"):
-            self.assertTrue((nginx_plugin / asset).is_file())
-        self.assertIn(
-            'install -o root -g root -m 0644 "$APP_DIR/cockpit/nginx-manager/nginx-manager.js" "$NGINX_MANAGER_PLUGIN_DEST/nginx-manager.js"',
-            installer,
-        )
+        self.assertFalse((cockpit_dir / "nginx-manager").exists())
+        self.assertFalse((cockpit_dir / "docker-manager").exists())
+        self.assertNotIn("NGINX_MANAGER_PLUGIN_DEST", installer)
+        self.assertNotIn("DOCKER_MANAGER_PLUGIN_DEST", installer)
+        self.assertNotIn("nginx-site-save", installer)
+        self.assertNotIn("docker-install", installer)
         self.assertIn(
             'install -o root -g root -m 0644 "$APP_DIR/cockpit/app-manager.css" "$PLUGIN_DEST/app-manager.css"',
             installer,
@@ -4270,7 +3943,6 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('PLUGIN_UPDATE_USER = "nobody"', backend)
         self.assertIn('["runuser", "--user", PLUGIN_UPDATE_USER, "--", *env_args]', backend)
         self.assertIn('["bash", str(installer)]', backend)
-        self.assertIn('target="_blank" rel="noopener noreferrer"', frontend)
         self.assertIn('Another operation is still in progress.', frontend)
         self.assertIn('updateConnection("error", "Could not load data")', frontend)
         self.assertIn('id="addAppFormTemplate"', html)
@@ -4403,7 +4075,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotIn('"', directive)
         self.assertIn("state 100%%", directive)
 
-    def test_auto_deploy_service_can_write_nginx_log_directory(self):
+    def test_auto_deploy_service_cannot_write_nginx_configuration_or_logs(self):
         template = (Path(__file__).resolve().parent.parent / "templates" / "auto-deploy.service").read_text(
             encoding="utf-8"
         )
@@ -4411,8 +4083,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             line for line in template.splitlines() if line.startswith("ReadWritePaths=")
         )
         self.assertIn("/var/lib/cockpit/app-manager", read_write_paths)
-        self.assertIn("/etc/nginx", read_write_paths)
-        self.assertIn("/var/log/nginx", read_write_paths)
+        self.assertNotIn("/etc/nginx", read_write_paths)
+        self.assertNotIn("/var/log/nginx", read_write_paths)
         self.assertIn("PrivateUsers=false", template)
 
     def test_auto_deploy_service_retains_uid_switching_with_seccomp(self):
@@ -4622,415 +4294,16 @@ class InfrastructureConfigurationTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
 
-    def test_nginx_prefix_generation_is_framework_aware_and_handles_websockets(self):
-        template = Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
-        app_id = "website1"
-        nextjs = manager._render_nginx_config(app_id, 8123, template, "nextjs")
-        request_paths = (
-            "/website1/",
-            "/website1/about",
-            "/website1/api/items?page=1",
-            "/website1/_next/static/chunks/app.js",
-            "/website1/socket.io/?EIO=4&transport=websocket",
-        )
-        self.assertIn("return 308 /website1/$is_args$args;", nextjs)
-        self.assertIn("location ^~ /website1/ {", nextjs)
-        environment_guard = '    if ($uri ~* "(^|/)[.]env([./]|$)") { return 404; }'
-        self.assertIn("location ^~ /website1/ {\n" + environment_guard, nextjs)
-        next_proxy_pass = next(line for line in nextjs.splitlines() if "proxy_pass " in line)
-        self.assertTrue(next_proxy_pass.endswith("8123;"))
-        self.assertIn("proxy_http_version 1.1;", nextjs)
-        self.assertIn("proxy_read_timeout 3600s;", nextjs)
-        self.assertIn("proxy_send_timeout 3600s;", nextjs)
-        self.assertIn("proxy_set_header Host $host;", nextjs)
-        self.assertIn("proxy_pass http://127.0.0.1:8123;", nextjs)
-        self.assertNotIn("proxy_pass http://127.0.0.1:8123/;", nextjs)
-        self.assertIn("proxy_set_header Upgrade $http_upgrade;", nextjs)
-        self.assertIn("proxy_set_header Connection $app_manager_connection_upgrade;", nextjs)
-        self.assertIn("set $app_manager_connection_upgrade upgrade;", nextjs)
-        self.assertIn('if ($http_upgrade = "") {', nextjs)
-        self.assertIn('set $app_manager_connection_upgrade "";', nextjs)
-        self.assertNotIn("$http_connection", nextjs)
-        self.assertIn("proxy_set_header X-Forwarded-Prefix /website1;", nextjs)
-        next_proxy_uri = next_proxy_pass.split("8123", 1)[1].rstrip(";")
-        for request_path in request_paths:
-            upstream_path = (
-                request_path
-                if not next_proxy_uri
-                else next_proxy_uri + request_path[len("/website1/"):]
-            )
-            self.assertEqual(request_path, upstream_path)
-
-        for framework in ("go", "node", "python", "docker"):
-            stripped_prefix = manager._render_nginx_config(app_id, 8123, template, framework)
-            self.assertIn("location ^~ /website1/ {\n" + environment_guard, stripped_prefix)
-            proxy_pass = next(line for line in stripped_prefix.splitlines() if "proxy_pass " in line)
-            proxy_uri = proxy_pass.split("8123", 1)[1].rstrip(";")
-            self.assertIn("proxy_pass http://127.0.0.1:8123/;", stripped_prefix)
-            self.assertIn("proxy_set_header X-Forwarded-Prefix /website1;", stripped_prefix)
-            self.assertIn("proxy_redirect / /website1/;", stripped_prefix)
-            self.assertIn("proxy_redirect http://127.0.0.1:8123/ /website1/;", stripped_prefix)
-            self.assertIn("proxy_cookie_path / /website1/;", stripped_prefix)
-            self.assertIn("proxy_set_header Connection $app_manager_connection_upgrade;", stripped_prefix)
-            self.assertNotIn("$http_connection", stripped_prefix)
-            for request_path, expected_upstream_path in (
-                ("/website1/", "/"),
-                ("/website1/about", "/about"),
-                ("/website1/api/items?page=1", "/api/items?page=1"),
-                ("/website1/_next/static/chunks/app.js", "/_next/static/chunks/app.js"),
-            ):
-                self.assertEqual(
-                    proxy_uri + request_path[len("/website1/"):],
-                    expected_upstream_path,
-                )
-
-        config = manager._default_config()
-        config["production_root"] = "/opt/webapps"
-        static = manager._render_nginx_config(app_id, 8123, template, "static", config=config)
-        self.assertIn("location ^~ /website1/ {\n" + environment_guard, static)
-        static_root = manager._app_paths(app_id, config)["current"] / "app"
-        self.assertIn(f"alias {manager._nginx_quote(str(static_root) + os.sep)};", static)
-        self.assertIn("try_files $uri $uri/ /website1/index.html;", static)
-        for request_path, expected_file in (
-            ("/website1/", static_root / "index.html"),
-            ("/website1/about", static_root / "index.html"),
-            ("/website1/css/site.css", static_root / "css" / "site.css"),
-            ("/website1/js/app.js", static_root / "js" / "app.js"),
-            ("/website1/images/logo.png", static_root / "images" / "logo.png"),
-        ):
-            request_relative_path = request_path[len("/website1/"):]
-            mapped_file = (
-                static_root / "index.html"
-                if request_relative_path in ("", "about")
-                else static_root / request_relative_path
-            )
-            self.assertEqual(expected_file, mapped_file)
-        self.assertNotIn("proxy_pass", static)
-        self.assertNotIn("rewrite ", static)
-        exported = manager._render_nginx_config(
-            app_id, 8123, template, "static", config=config, static_root="apps/web/out"
-        )
-        exported_root = static_root / "apps" / "web" / "out"
-        self.assertIn(f"alias {manager._nginx_quote(str(exported_root) + os.sep)};", exported)
-        with self.assertRaises(ValueError):
-            manager._render_nginx_config(
-                app_id, 8123, template, "static", config=config, static_root="../outside"
-            )
-        self.assertNotIn("proxy_pass http://127.0.0.1:8123/;", nextjs)
-        with self.assertRaises(ValueError):
-            manager._render_nginx_config("../outside", 8123, template, "nextjs")
-        with self.assertRaises(ValueError):
-            manager._render_nginx_config("demo", 8080, template, "nextjs")
-
-    def test_nginx_config_uses_custom_application_route(self):
-        template = Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
-        config = manager._render_nginx_config(
-            "website1",
-            8123,
-            template,
-            "node",
-            route="/customer-portal/",
-        )
-        self.assertIn("location = /customer-portal {", config)
-        self.assertIn("return 308 /customer-portal/$is_args$args;", config)
-        self.assertIn("location ^~ /customer-portal/ {", config)
-        self.assertIn("proxy_set_header X-Forwarded-Prefix /customer-portal;", config)
-        self.assertIn("proxy_redirect / /customer-portal/;", config)
-        self.assertNotIn("/website1/", config)
-
-    def test_nginx_deploy_adds_managed_include_to_matching_https_server(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            snippet_root = root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
-            config = manager._default_config()
-            config["nginx_template"] = (
-                Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
-            )
-            config_root, site_path, listing = self._nginx_site_fixture(
-                root,
-                "server {\n    listen 443 ssl;\n    server_name stuserver.online;\n    location / { proxy_pass http://127.0.0.1:8080; }\n}\n",
-            )
-            app = {"id": "demo", "port": 8123, "route": "/customer-portal/"}
-            valid = subprocess.CompletedProcess(args=["nginx", "-t"], returncode=0, stdout="", stderr="")
-
-            def run(args, **kwargs):
-                if args == ["nginx", "-T"]:
-                    site_contents = site_path.read_text(encoding="utf-8")
-                    output = f"# configuration file {site_path}:\n{site_contents}"
-                    snippet = snippet_root / "demo.conf"
-                    if "include /etc/nginx/snippets/cockpit-app-manager/*.conf;" in site_contents:
-                        output += f"\n# configuration file {snippet}:\n{snippet.read_text(encoding='utf-8')}"
-                    return subprocess.CompletedProcess(args=args, returncode=0, stdout=output, stderr="")
-                return valid
-
-            with patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)), patch.object(
-                manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)
-            ), patch.object(manager, "run_command", side_effect=run) as run_command, patch.object(
-                manager, "DEFAULT_STATE_ROOT", str(root / "state")
-            ), patch.object(manager, "_systemctl") as systemctl:
-                activation = manager._activate_nginx_config(app, "node", config)
-
-            snippet = snippet_root / "demo.conf"
-            self.assertTrue(snippet.is_file())
-            self.assertIn("location ^~ /customer-portal/ {", snippet.read_text(encoding="utf-8"))
-            site_contents = site_path.read_text(encoding="utf-8")
-            self.assertIn("server_name stuserver.online;", site_contents)
-            self.assertIn("location / { proxy_pass http://127.0.0.1:8080; }", site_contents)
-            self.assertIn("include /etc/nginx/snippets/cockpit-app-manager/*.conf;", site_contents)
-            self.assertTrue(activation["active"])
-            self.assertIn("Added the managed include", activation["message"])
-            self.assertEqual([call.args[0] for call in run_command.call_args_list], [
-                ["nginx", "-T"], ["nginx", "-t"], ["nginx", "-T"],
-            ])
-            systemctl.assert_called_once_with(
-                "reload",
-                "nginx",
-                timeout=config["command_timeout_seconds"],
-            )
-            backup = next((root / "state" / "nginx-backups").glob("*.before-app-manager"))
-            self.assertIn("server_name stuserver.online;", backup.read_text(encoding="utf-8"))
-
-    def test_nginx_site_include_targets_https_server_not_http_redirect(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config_root, site_path, listing = self._nginx_site_fixture(
-                root,
-                "server {\n    listen 80;\n    server_name stuserver.online;\n    return 301 https://$host$request_uri;\n}\n"
-                "server {\n    listen 443 ssl;\n    server_name stuserver.online;\n    location / { proxy_pass http://127.0.0.1:8080; }\n}\n",
-            )
-            with patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)), patch.object(
-                manager, "DEFAULT_NGINX_SNIPPET_DIR", str(config_root / "snippets" / "cockpit-app-manager")
-            ), patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")):
-                updated_path, old_source = manager._ensure_nginx_site_include(listing)
-
-            self.assertEqual(updated_path, site_path.resolve())
-            self.assertIsNotNone(old_source)
-            contents = site_path.read_text(encoding="utf-8")
-            http_block, https_block = contents.split("server {", 2)[1:]
-            self.assertNotIn(manager.NGINX_MANAGED_INCLUDE, http_block.split("}", 1)[0])
-            self.assertIn(manager.NGINX_MANAGED_INCLUDE, https_block.split("}", 1)[0])
-
-    def test_nginx_site_include_refuses_ambiguous_matching_https_servers(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config_root, site_path, _ = self._nginx_site_fixture(
-                root,
-                "server { listen 443 ssl; server_name stuserver.online; }\n"
-                "server { listen 443 ssl; server_name stuserver.online; }\n",
-            )
-            listing = f"# configuration file {site_path}:\n{site_path.read_text(encoding='utf-8')}"
-            with patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)):
-                with self.assertRaisesRegex(RuntimeError, "multiple Nginx server blocks"):
-                    manager._ensure_nginx_site_include(listing)
-            self.assertNotIn(manager.NGINX_MANAGED_INCLUDE, site_path.read_text(encoding="utf-8"))
-
-    def test_nginx_snippet_activation_tests_and_reloads_only_managed_config(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            snippet_root = root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
-            snippet_path = snippet_root / "demo.conf"
-            config = manager._default_config()
-            config["nginx_template"] = (
-                Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
-            )
-            config_root, site_path, listing = self._nginx_site_fixture(
-                root,
-                "server {\n    listen 443 ssl;\n    server_name stuserver.online;\n}\n",
-            )
-            app = {"id": "demo", "port": 8123, "route": "/customer-portal/"}
-
-            def run(args, **kwargs):
-                if args == ["nginx", "-T"]:
-                    site_contents = site_path.read_text(encoding="utf-8")
-                    output = f"# configuration file {site_path}:\n{site_contents}"
-                    if "include /etc/nginx/snippets/cockpit-app-manager/*.conf;" in site_contents:
-                        output += f"\n# configuration file {snippet_path}:\n{snippet_path.read_text(encoding='utf-8')}"
-                    return subprocess.CompletedProcess(args=args, returncode=0, stdout=output, stderr="")
-                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-
-            with patch.object(manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)), patch.object(
-                manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)
-            ), patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")), patch.object(
-                manager, "run_command", side_effect=run
-            ) as run, patch.object(manager, "_systemctl") as systemctl:
-                activation = manager._activate_nginx_config(app, "node", config)
-
-            self.assertTrue(activation["active"])
-            self.assertEqual([call.args[0] for call in run.call_args_list], [
-                ["nginx", "-T"], ["nginx", "-t"], ["nginx", "-T"],
-            ])
-            systemctl.assert_called_once_with(
-                "reload",
-                "nginx",
-                timeout=config["command_timeout_seconds"],
-            )
-
-    def test_nginx_syntax_failure_restores_previous_app_snippet(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            snippet_root = root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
-            snippet_root.mkdir(parents=True)
-            snippet_path = snippet_root / "demo.conf"
-            previous = b"# Managed by Cockpit App Manager: demo\nlocation /old/ {}\n"
-            snippet_path.write_bytes(previous)
-            config = manager._default_config()
-            config["nginx_template"] = (
-                Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
-            )
-            config_root, site_path, listing = self._nginx_site_fixture(
-                root,
-                "server {\n    listen 443 ssl;\n    server_name stuserver.online;\n}\n",
-            )
-            previous_site = site_path.read_bytes()
-            app = {"id": "demo", "port": 8123, "route": "/new/"}
-            invalid = subprocess.CompletedProcess(
-                args=["nginx", "-t"],
-                returncode=1,
-                stdout="",
-                stderr="invalid location",
-            )
-            def run(args, **kwargs):
-                if args == ["nginx", "-T"]:
-                    return subprocess.CompletedProcess(
-                        args=args,
-                        returncode=0,
-                        stdout=f"# configuration file {site_path}:\n{site_path.read_text(encoding='utf-8')}",
-                        stderr="",
-                    )
-                return invalid
-
-            with patch.object(manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)), patch.object(
-                manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)
-            ), patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")), patch.object(
-                manager, "run_command", side_effect=run
-            ), patch.object(manager, "_systemctl") as systemctl:
-                with self.assertRaisesRegex(RuntimeError, "invalid location"):
-                    manager._activate_nginx_config(app, "node", config)
-
-            self.assertEqual(snippet_path.read_bytes(), previous)
-            self.assertEqual(site_path.read_bytes(), previous_site)
-            systemctl.assert_not_called()
-
-    def test_nginx_reload_failure_restores_managed_include_and_snippet(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            snippet_root = root / "etc" / "nginx" / "snippets" / "cockpit-app-manager"
-            config_root, site_path, _ = self._nginx_site_fixture(
-                root,
-                "server { listen 443 ssl; server_name stuserver.online; }\n",
-            )
-            previous_site = site_path.read_bytes()
-            snippet_path = snippet_root / "demo.conf"
-            previous_snippet = b"# Managed by Cockpit App Manager: demo\nlocation /old/ {}\n"
-            snippet_root.mkdir(parents=True)
-            snippet_path.write_bytes(previous_snippet)
-            config = manager._default_config()
-            config["nginx_template"] = (
-                Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
-            )
-
-            def run(args, **kwargs):
-                if args == ["nginx", "-T"]:
-                    site_contents = site_path.read_text(encoding="utf-8")
-                    output = f"# configuration file {site_path}:\n{site_contents}"
-                    if manager.NGINX_MANAGED_INCLUDE in site_contents:
-                        output += f"\n# configuration file {snippet_path}:\n{snippet_path.read_text(encoding='utf-8')}"
-                    return subprocess.CompletedProcess(args=args, returncode=0, stdout=output, stderr="")
-                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-
-            with patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(config_root)), patch.object(
-                manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)
-            ), patch.object(manager, "DEFAULT_STATE_ROOT", str(root / "state")), patch.object(
-                manager, "run_command", side_effect=run
-            ), patch.object(manager, "_systemctl", side_effect=RuntimeError("reload failed")):
-                with self.assertRaisesRegex(RuntimeError, "reload failed"):
-                    manager._activate_nginx_config(
-                        {"id": "demo", "port": 8123, "route": "/demo/"}, "node", config
-                    )
-
-            self.assertEqual(site_path.read_bytes(), previous_site)
-            self.assertEqual(snippet_path.read_bytes(), previous_snippet)
-
-    def test_removing_app_deactivates_only_its_active_nginx_snippet(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            snippet_root = Path(tmp) / "nginx" / "snippets" / "cockpit-app-manager"
-            snippet_root.mkdir(parents=True)
-            snippet_path = snippet_root / "demo.conf"
-            snippet_path.write_text(
-                "# Managed by Cockpit App Manager: demo\nlocation /demo/ {}\n",
-                encoding="utf-8",
-            )
-            config = manager._default_config()
-            listing = subprocess.CompletedProcess(
-                args=["nginx", "-T"],
-                returncode=0,
-                stdout=f"# configuration file {snippet_path.resolve(strict=False)}:\n",
-                stderr="",
-            )
-            valid = subprocess.CompletedProcess(args=["nginx", "-t"], returncode=0, stdout="", stderr="")
-            with patch.object(manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)), patch.object(
-                manager, "run_command", side_effect=[listing, valid]
-            ), patch.object(manager, "_systemctl") as systemctl:
-                manager._remove_nginx_config("demo", config)
-
-            self.assertFalse(snippet_path.exists())
-            systemctl.assert_called_once_with(
-                "reload",
-                "nginx",
-                timeout=config["command_timeout_seconds"],
-            )
-
-    def test_removing_unverified_nginx_snippet_fails_without_deleting_it(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            snippet_root = Path(tmp) / "nginx" / "snippets" / "cockpit-app-manager"
-            snippet_root.mkdir(parents=True)
-            snippet_path = snippet_root / "demo.conf"
-            original = "location /unrelated/ {}\n"
-            snippet_path.write_text(original, encoding="utf-8")
-            with patch.object(manager, "DEFAULT_NGINX_SNIPPET_DIR", str(snippet_root)):
-                with self.assertRaisesRegex(RuntimeError, "unverified Nginx snippet"):
-                    manager._remove_nginx_config("demo", manager._default_config())
-            self.assertEqual(snippet_path.read_text(encoding="utf-8"), original)
-
-    def test_generated_nginx_config_passes_nginx_parser_when_available(self):
-        nginx = shutil.which("nginx")
-        if nginx is None:
-            self.skipTest("nginx is not installed in this development environment")
-        template = Path(__file__).resolve().parent.parent / "templates" / "nginx.conf.tpl"
-        snippet = manager._render_nginx_config("website1", 8123, template, "nextjs")
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "nginx.conf"
-            config.write_text(
-                "pid " + str(Path(tmp) / "nginx.pid") + ";\n"
-                "error_log stderr;\n"
-                "events { worker_connections 16; }\n"
-                "http { access_log off; server { listen 127.0.0.1:8080;\n"
-                + snippet
-                + "\n} }\n",
-                encoding="utf-8",
-            )
-            result = subprocess.run(
-                [nginx, "-t", "-c", str(config)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, msg=result.stderr)
 
     def test_installer_uses_exact_file_ownership_and_checks_host_and_installed_imports(self):
         project = Path(__file__).resolve().parent.parent
         installer = (project / "scripts" / "install.sh").read_text(encoding="utf-8")
         uninstaller = (project / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
         cockpit_page = (project / "cockpit" / "index.html").read_text(encoding="utf-8")
-        docker_frontend = (project / "cockpit" / "docker-manager" / "docker-manager.js").read_text(encoding="utf-8")
         self.assertNotRegex(installer, r"\bchown\s+-R\b")
         self.assertNotIn('chown root:root "$BACKEND_DEST"', installer)
         self.assertNotIn('chown root:root "$PRODUCTION_ROOT"', installer)
         self.assertIn('BACKEND_DEST="${APP_MANAGER_BACKEND_DEST:-/usr/libexec/cockpit/app-manager}"', installer)
-        self.assertIn('DOCKER_MANAGER_PLUGIN_DEST="${DOCKER_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/docker-manager}"', installer)
-        self.assertIn('NGINX_MANAGER_PLUGIN_DEST="${NGINX_MANAGER_PLUGIN_DEST:-/usr/share/cockpit/nginx-manager}"', installer)
-        self.assertIn('install -o root -g root -m 0644 "$APP_DIR/cockpit/docker-manager/manifest.json" "$DOCKER_MANAGER_PLUGIN_DEST/manifest.json"', installer)
-        self.assertIn('install -o root -g root -m 0644 "$APP_DIR/cockpit/nginx-manager/manifest.json" "$NGINX_MANAGER_PLUGIN_DEST/manifest.json"', installer)
         self.assertIn('remove_owned_file "${DOCKER_MANAGER_PLUGIN_DEST}/manifest.json" \'"name": "docker-manager"\'', uninstaller)
         self.assertIn('remove_owned_file "${NGINX_MANAGER_PLUGIN_DEST}/manifest.json" \'"name": "nginx-manager"\'', uninstaller)
         self.assertIn('remove_owned_file "${NGINX_MANAGER_PLUGIN_DEST}/nginx-manager.js" "// Nginx Manager Cockpit UI loaded"', uninstaller)
@@ -5062,7 +4335,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('if [[ "$BACKEND_DEST" == "/usr/libexec/cockpit" ]]', uninstaller)
         self.assertIn("dpkg --compare-versions", installer)
         self.assertIn("Python 3.9 or newer is required", installer)
-        for required in ("systemd-run", "ss", "nginx", "git", "runuser", "setpriv"):
+        for required in ("systemd-run", "ss", "git", "runuser", "setpriv"):
             self.assertRegex(installer, rf"for required_command in [^;\n]*\b{required}\b[^;\n]*; do")
         self.assertIn('cockpit-app-manager-auto-deploy.timer', installer)
         self.assertIn("systemctl enable --now cockpit-app-manager-auto-deploy.timer", installer)
@@ -5075,7 +4348,6 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertIn('"$STATE_ROOT/plugin-version.json"', installer)
         frontend = (project / "cockpit" / "app-manager.js").read_text(encoding="utf-8")
         self.assertIn('superuser: "require"', frontend)
-        self.assertIn('superuser: "require"', docker_frontend)
         self.assertIn('config.command_timeout_seconds ?? 30', frontend)
 
     def test_shared_cache_service_uses_private_systemd_storage_and_read_only_registry_rules(self):
@@ -5131,9 +4403,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertTrue((cockpit_dir / "icons.js").is_file())
         self.assertTrue((cockpit_dir / "app-manager.js").is_file())
         frontend = (cockpit_dir / "app-manager.js").read_text(encoding="utf-8")
-        self.assertIn("Deploy to activate", frontend)
-        self.assertIn("const routeIsActive = Boolean(app.hosting_active && app.active_route);", frontend)
-        self.assertIn("safeUrl && routeIsActive", frontend)
+        self.assertIn("Application path prefix", frontend)
+        self.assertIn("configure routing in Nginx Manager", frontend)
         self.assertIn("function renderAppList()", frontend)
         self.assertIn('data-action="deployment-log"', frontend)
         self.assertNotIn("process.close()", frontend)
@@ -5159,149 +4430,6 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         )
 
 
-class NginxManagerTests(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        self.root = Path(self.temp_dir.name)
-        self.nginx_root = self.root / "etc" / "nginx"
-        self.conf_directory = self.nginx_root / "conf.d"
-        self.conf_directory.mkdir(parents=True)
-        self.www_root = self.root / "www"
-        self.www_root.mkdir()
-        self.socket_output = ""
-        self.commands = []
-        self.fail_nginx_test = False
-        self.config = manager._default_config()
-        self.config["command_timeout_seconds"] = 5
-
-        patches = (
-            patch.object(manager, "DEFAULT_STATE_ROOT", str(self.root / "state")),
-            patch.object(manager, "DEFAULT_NGINX_CONFIG_ROOT", str(self.nginx_root)),
-            patch.object(manager, "NGINX_DOCUMENT_ROOTS", (str(self.root),)),
-            patch.object(manager, "get_config", return_value=self.config),
-            patch.object(manager, "_require_root"),
-            patch.object(manager, "run_command", side_effect=self._run_command),
-        )
-        for active_patch in patches:
-            active_patch.start()
-            self.addCleanup(active_patch.stop)
-
-    def _run_command(self, command, **kwargs):
-        self.commands.append(list(command))
-        if command[:2] == ["nginx", "-T"]:
-            sections = []
-            if self.conf_directory.is_dir():
-                for path in sorted(self.conf_directory.glob("*.conf")):
-                    sections.append(f"# configuration file {path}:\n{path.read_text(encoding='utf-8')}\n")
-            return subprocess.CompletedProcess(command, 0, "".join(sections), "")
-        if command[:2] == ["nginx", "-t"]:
-            if self.fail_nginx_test:
-                return subprocess.CompletedProcess(command, 1, "", "configuration test failed")
-            return subprocess.CompletedProcess(command, 0, "syntax is ok", "test is successful")
-        if command[:2] == ["nginx", "-v"]:
-            return subprocess.CompletedProcess(command, 0, "", "nginx version: nginx/1.26.0")
-        if command[:3] == ["ss", "-H", "-ltnp"]:
-            return subprocess.CompletedProcess(command, 0, self.socket_output, "")
-        if command[:3] == ["systemctl", "is-active", "nginx"]:
-            return subprocess.CompletedProcess(command, 0, "active\n", "")
-        if command[:2] == ["systemctl", "reload"] or command[:2] == ["systemctl", "restart"]:
-            return subprocess.CompletedProcess(command, 0, "", "")
-        raise AssertionError(f"Unexpected command: {command}")
-
-    def _payload(self, domain="app.example.com", **overrides):
-        payload = {
-            "site_id": None,
-            "domains": [domain],
-            "mode": "static",
-            "listen_port": 80,
-            "tls": False,
-            "document_root": str(self.www_root),
-            "enabled": True,
-        }
-        payload.update(overrides)
-        return payload
-
-    def test_create_enable_disable_and_inventory_managed_sites(self):
-        saved = manager.nginx_manager_save_site(self._payload(enabled=False))
-        site_id = saved["site"]["site_id"]
-        active_path, metadata_path = manager._nginx_manager_site_paths(site_id)
-        self.assertFalse(active_path.exists())
-        self.assertTrue(metadata_path.is_file())
-
-        manager.nginx_manager_set_enabled(site_id, True)
-        self.assertTrue(active_path.is_file())
-        overview = manager.nginx_manager_overview()
-        site = next(site for site in overview["sites"] if site["site_id"] == site_id)
-        self.assertTrue(site["enabled"])
-        self.assertEqual(site["listen_ports"], [80])
-
-        manager.nginx_manager_set_enabled(site_id, False)
-        overview = manager.nginx_manager_overview()
-        site = next(site for site in overview["sites"] if site["site_id"] == site_id)
-        self.assertFalse(site["enabled"])
-        self.assertEqual(site["listen_ports"], [80])
-
-    def test_conflicts_detect_exact_and_wildcard_domains_and_disabled_sites(self):
-        existing = self.conf_directory / "existing.conf"
-        existing.write_text(
-            "server { listen 80; server_name SHOP.example.com; }\n",
-            encoding="utf-8",
-        )
-
-        exact = manager.nginx_manager_conflicts(self._payload(domain="shop.example.com"))
-        self.assertTrue(any(item["type"] == "domain" and item["blocking"] for item in exact["conflicts"]), exact)
-
-        wildcard = manager.nginx_manager_conflicts(self._payload(domain="*.example.com"))
-        self.assertTrue(any(item["type"] == "domain" and item["blocking"] for item in wildcard["conflicts"]))
-
-        unrelated = manager.nginx_manager_conflicts(self._payload(domain="other.test"))
-        self.assertFalse(any(item["type"] == "domain" for item in unrelated["conflicts"]))
-
-        manager.nginx_manager_save_site(self._payload(domain="disabled.example.com", enabled=False))
-        disabled = manager.nginx_manager_conflicts(self._payload(domain="disabled.example.com"))
-        disabled_conflict = next(item for item in disabled["conflicts"] if item["type"] == "domain")
-        self.assertFalse(disabled_conflict["blocking"])
-
-    def test_conflicts_report_ports_held_by_other_processes(self):
-        self.socket_output = (
-            'LISTEN 0 128 0.0.0.0:80 0.0.0.0:* users:(("apache2",pid=123,fd=4))\n'
-        )
-        result = manager.nginx_manager_conflicts(self._payload())
-        self.assertTrue(any(item["type"] == "port" and "apache2" in item["message"] for item in result["conflicts"]))
-
-    def test_edit_test_failure_restores_existing_managed_configuration_and_metadata(self):
-        saved = manager.nginx_manager_save_site(self._payload())
-        site_id = saved["site"]["site_id"]
-        active_path, metadata_path = manager._nginx_manager_site_paths(site_id)
-        original_config = active_path.read_bytes()
-        original_metadata = metadata_path.read_bytes()
-        self.fail_nginx_test = True
-
-        with self.assertRaisesRegex(RuntimeError, "Could not save Nginx site"):
-            manager.nginx_manager_save_site(
-                self._payload(domain="updated.example.com", site_id=site_id)
-            )
-
-        self.assertEqual(active_path.read_bytes(), original_config)
-        self.assertEqual(metadata_path.read_bytes(), original_metadata)
-
-    def test_service_action_tests_configuration_before_reload(self):
-        result = manager.nginx_manager_service_action("reload")
-        self.assertEqual(result["action"], "reload")
-        self.assertEqual(self.commands[-2:], [["nginx", "-t"], ["systemctl", "reload", "nginx"]])
-
-    def test_validation_rejects_reserved_ports_and_invalid_domains(self):
-        with self.assertRaisesRegex(ValueError, "reserved"):
-            manager._normalize_nginx_manager_site(self._payload(listen_port=8080))
-        with self.assertRaisesRegex(ValueError, "Site type"):
-            manager._normalize_nginx_manager_site(self._payload(mode=[]))
-        with self.assertRaisesRegex(ValueError, "valid hostname|Invalid domain"):
-            manager._normalize_nginx_manager_site(self._payload(domain="bad;domain.example"))
-        with self.assertRaisesRegex(ValueError, "allowed directories"):
-            manager._normalize_nginx_manager_site(
-                self._payload(document_root=str(self.root.parent / "outside"))
-            )
 
 
 @unittest.skipIf(os.name == "nt", "Uninstall integration tests require POSIX Bash and file permissions")

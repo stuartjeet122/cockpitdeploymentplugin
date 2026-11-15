@@ -187,15 +187,6 @@
     `;
   }
 
-  function getSafePublicUrl(value) {
-    try {
-      const url = new URL(value);
-      return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
-    } catch (_error) {
-      return null;
-    }
-  }
-
   function renderApps(data) {
     state.apps = data.apps || [];
     renderAppList();
@@ -209,7 +200,7 @@
 
   function needsAttention(app) {
     return observedStatus(app) === "failed" || app.deployments?.at(-1)?.status === "failed"
-      || app.health?.local_healthy === false || app.health?.public_healthy === false
+      || app.health?.local_healthy === false
       || Boolean(app.auto_deploy_state?.error || app.deployments?.at(-1)?.cleanup_error
         || app.pending_update?.commit && app.pending_update.commit !== app.deployed_commit);
   }
@@ -245,20 +236,14 @@
     }
 
     const cards = filtered.map((app) => {
-      const safeUrl = getSafePublicUrl(app.public_url);
-      const routeIsActive = Boolean(app.hosting_active && app.active_route);
       const deploying = app.status === "deploying";
+      const staticApp = app.framework === "static" && !app.build_config?.start_command;
       const unavailable = deploying ? " disabled data-unavailable" : "";
       const runtimeUnavailable = deploying || !app.last_deploy ? " disabled data-unavailable" : "";
       const appId = escapeHtml(app.id);
-      const serviceControl = observedStatus(app) === "running"
+      const serviceControl = staticApp ? "" : observedStatus(app) === "running"
         ? `<button type="button" data-action="stop" data-id="${appId}"${runtimeUnavailable}>${icon("pause")} Stop application</button>`
         : `<button type="button" data-action="start" data-id="${appId}"${runtimeUnavailable}>${icon("play")} Start application</button>`;
-      const routeStatus = routeIsActive && app.active_route === app.route
-        ? "Active"
-        : routeIsActive
-          ? "Route change pending"
-          : "Deploy to activate";
       const appInitial = String(app.name || "A").trim().charAt(0).toUpperCase() || "A";
       const deployControl = app.status === "deploying"
         ? `<button type="button" class="am-button am-button--primary" data-action="deployment-log" data-id="${appId}">${icon("loader-circle")} View deployment</button>`
@@ -276,16 +261,14 @@
             </div>
             ${renderStatus(observedStatus(app))}
           </header>
-          <div class="am-app-route">${icon("globe")}${safeUrl && routeIsActive
-            ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(app.active_route)}${icon("external-link")}</a>`
-            : `<code>${escapeHtml(app.route)}</code>`}<span class="am-route-state" data-active="${routeIsActive}">${escapeHtml(routeStatus)}</span></div>
+          <div class="am-app-route">${icon("globe")}<code>${escapeHtml(app.route)}</code><span class="am-route-state">Application path prefix · configure routing in Nginx Manager</span></div>
           <p class="am-repository" title="${escapeHtml(app.repo_url)}">${icon("git-branch")}<span>${escapeHtml(app.repo_url)}</span></p>
           <dl class="am-app-meta">
             <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
-            <div><dt>${app.framework === "static" && !app.build_config?.start_command ? "Hosting" : "Runtime"}</dt><dd>${app.framework === "static" && !app.build_config?.start_command ? "Nginx" : `127.0.0.1:${escapeHtml(app.port)}`}</dd></div>
+            <div><dt>${app.framework === "static" && !app.build_config?.start_command ? "Content" : "Runtime"}</dt><dd>${app.framework === "static" && !app.build_config?.start_command ? "Static files" : `127.0.0.1:${escapeHtml(app.port)}`}</dd></div>
             <div class="am-meta-wide"><dt>Last deployed</dt><dd>${escapeHtml(formatDate(app.last_deploy))}${app.deployed_commit ? ` <code>${escapeHtml(app.deployed_commit.slice(0, 7))}</code>` : ""}</dd></div>
             <div><dt>Readiness</dt><dd data-health="${app.health ? (app.health.local_healthy ? "healthy" : "failed") : "unknown"}" title="${escapeHtml(app.health?.local_error || "")}">${app.health ? (app.health.local_healthy ? "Healthy" : "Failed") : "Not checked"}</dd></div>
-            <div><dt>Public route</dt><dd data-health="${app.health?.public_healthy == null ? "unknown" : app.health.public_healthy ? "healthy" : "failed"}" title="${escapeHtml(app.health?.public_error || "")}">${app.health?.public_healthy == null ? "Not checked" : app.health.public_healthy ? "Reachable" : app.health.public_status === 403 ? "Blocked · 403" : "Failed"}</dd></div>
+            <div><dt>Container port</dt><dd>${app.framework === "docker" ? escapeHtml(app.build_config?.container_port || "Configured in deployment") : "—"}</dd></div>
           </dl>
           <details class="am-runtime-details">
             <summary>${icon("activity")} Runtime details ${app.auto_deploy === false ? '<span class="am-runtime-policy">Auto-deploy paused</span>' : ""}${icon("plus")}</summary>
@@ -302,7 +285,7 @@
             </dl>
           </details>
           ${app.deployment_mode === "approval" && app.pending_update && app.pending_update.commit !== app.deployed_commit ? `<p class="am-route-state">Awaiting approval: <code>${escapeHtml(app.pending_update.commit.slice(0, 7))}</code></p>` : ""}
-          ${app.health && (app.health.local_healthy === false || app.health.public_healthy === false || app.health.service_error) ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${escapeHtml(app.health.local_error || app.health.public_error || app.health.service_error)}</span></p>` : ""}
+          ${app.health && (app.health.local_healthy === false || app.health.service_error) ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${escapeHtml(app.health.local_error || app.health.service_error)}</span></p>` : ""}
           ${app.auto_deploy_state?.error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Automatic deployment: ${escapeHtml(app.auto_deploy_state.error)}</span></p>` : ""}
           ${app.deployments?.[0]?.cleanup_error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Deployment is live; cleanup needs attention: ${escapeHtml(app.deployments[0].cleanup_error)}</span></p>` : ""}
           ${lastFailure ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${app.status === "running" ? "Latest deployment failed. Previous release is still live." : "Latest deployment failed."} <button type="button" data-action="deployment-log" data-id="${appId}">View log</button></span></p>` : ""}
@@ -314,7 +297,7 @@
             <details class="am-app-menu"><summary class="am-button am-icon-button" title="More actions" aria-label="More actions for ${escapeHtml(app.name)}">${icon("ellipsis")}</summary>
               <div class="am-menu-panel">
                 ${serviceControl}
-                <button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>
+                ${staticApp ? "" : `<button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>`}
                 <button type="button" data-action="health" data-id="${appId}"${runtimeUnavailable}>${icon("activity")} Check health</button>
                 <button type="button" data-action="preflight" data-id="${appId}"${unavailable}>${icon("search")} Run preflight</button>
                 ${app.python_services?.worker ? `<button type="button" data-action="worker-status" data-id="${appId}">${icon("activity")} Worker status</button>
@@ -434,9 +417,9 @@
   async function refreshData() {
     try {
       const [overview, apps, deployments, settings] = await Promise.all([
-        callBackend("overview", ["--exclude-framework", "docker"]),
-        callBackend("list", ["--exclude-framework", "docker"]),
-        callBackend("deployments", ["--exclude-framework", "docker"]),
+        callBackend("overview"),
+        callBackend("list"),
+        callBackend("deployments"),
         callBackend("settings"),
       ]);
       renderApps(apps);
@@ -531,10 +514,21 @@
     let deployAfterSetup = true;
     const collect = (form) => {
       const values = Object.fromEntries(new FormData(form).entries());
-      const { app_directory, go_package, start_command, environment, deploy_now, ...payload } = values;
+      const { app_directory, go_package, start_command, docker_mode, dockerfile, compose_file, compose_service, container_port, environment, deploy_now, ...payload } = values;
       payload.build_config = {};
       if (app_directory.trim()) payload.build_config.app_directory = app_directory.trim();
       if (go_package.trim()) payload.build_config.go_package = go_package.trim();
+      if (payload.framework === "docker") {
+        payload.build_config.docker_mode = docker_mode;
+        if (docker_mode === "compose") {
+          payload.build_config.compose_file = compose_file.trim();
+          payload.build_config.compose_service = compose_service.trim();
+          payload.build_config.container_port = Number(container_port);
+        } else {
+          payload.build_config.dockerfile = dockerfile.trim();
+          payload.build_config.container_port = Number(container_port);
+        }
+      }
       if (start_command.trim()) {
         let command;
         try { command = JSON.parse(start_command); } catch (_error) { throw new Error('Start command must be a JSON array, such as ["node", "server.js"].'); }
@@ -587,8 +581,27 @@
     const nameInput = form.elements.namedItem("name");
     const slugInput = form.elements.namedItem("slug");
     const routeInput = form.elements.namedItem("route");
+    const frameworkInput = form.elements.namedItem("framework");
+    const dockerModeInput = form.elements.namedItem("docker_mode");
+    const dockerSetupFields = byId("dockerSetupFields");
+    const dockerfileInput = form.elements.namedItem("dockerfile");
+    const composeFields = byId("composeSetupFields");
+    const composeFileInput = form.elements.namedItem("compose_file");
+    const composeServiceInput = form.elements.namedItem("compose_service");
+    const containerPortInput = form.elements.namedItem("container_port");
     form.elements.namedItem("branch").value = state.settings.default_branch || "main";
-    const updatePreview = () => { byId("setupUrlPreview").textContent = `https://stuserver.online${routeInput.value || "/"}`; };
+    const updateDockerFields = () => {
+      const isDocker = frameworkInput.value === "docker";
+      const isCompose = isDocker && dockerModeInput.value === "compose";
+      dockerSetupFields.hidden = !isDocker;
+      dockerModeInput.disabled = !isDocker;
+      dockerfileInput.disabled = !isDocker || isCompose;
+      composeFields.hidden = !isCompose;
+      composeFileInput.disabled = !isCompose;
+      composeServiceInput.disabled = !isCompose;
+      composeServiceInput.required = isCompose;
+      containerPortInput.disabled = !isDocker;
+    };
     const showStep = () => {
       form.querySelectorAll("[data-setup-step]").forEach((section) => { section.hidden = Number(section.dataset.setupStep) !== step; });
       form.querySelectorAll("[data-setup-marker]").forEach((marker) => {
@@ -614,10 +627,9 @@
         if (step === 1) {
           const setup = collect(form);
           if (state.apps.some((app) => app.id !== created?.id && app.id === setup.payload.slug)) throw new Error("That application ID is already registered.");
-          if (state.apps.some((app) => app.id !== created?.id && [app.route, app.active_route].includes(setup.payload.route))) throw new Error("That hosted route is already assigned.");
           const review = [
             ["Application", setup.payload.name], ["Repository", setup.payload.repo_url], ["Branch", setup.payload.branch],
-            ["Framework", frameworkName(setup.payload.framework)], ["Public URL", `https://stuserver.online${setup.payload.route}`],
+            ["Framework", frameworkName(setup.payload.framework)], ["Application path", setup.payload.route],
             ["Environment", setup.environmentRows.length ? setup.environmentRows.map((row) => row.key).join(", ") : "No variables"],
           ];
           byId("setupReview").innerHTML = review.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
@@ -637,48 +649,41 @@
       if (slugInput.dataset.autogenerated === "true") {
         slugInput.value = suggestSlug(nameInput.value);
       }
-      if (routeInput.dataset.autogenerated === "true") {
-        routeInput.value = `/${slugInput.value}/`;
-      }
-      updatePreview();
+      if (routeInput.dataset.autogenerated === "true") routeInput.value = `/${slugInput.value}/`;
     });
     slugInput.addEventListener("input", () => {
       slugInput.dataset.autogenerated = "false";
-      if (routeInput.dataset.autogenerated === "true") {
-        routeInput.value = `/${slugInput.value}/`;
-      }
-      updatePreview();
+      if (routeInput.dataset.autogenerated === "true") routeInput.value = `/${slugInput.value}/`;
     });
-    routeInput.addEventListener("input", () => {
-      routeInput.dataset.autogenerated = "false";
-      updatePreview();
-    });
+    routeInput.addEventListener("input", () => { routeInput.dataset.autogenerated = "false"; });
+    frameworkInput.addEventListener("change", updateDockerFields);
+    dockerModeInput.addEventListener("change", updateDockerFields);
     form.elements.namedItem("repo_url").addEventListener("change", (event) => {
       if (!nameInput.value) {
         nameInput.value = event.target.value.split(/[/:]/).pop().replace(/\.git$/, "").replace(/[-_]/g, " ");
         nameInput.dispatchEvent(new Event("input"));
       }
     });
-    updatePreview();
+    updateDockerFields();
     renderIcons();
   }
 
   function editApplication(app) {
-    const frameworks = ["auto", "nextjs", "go", "node", "python", "static"];
+    const frameworks = ["auto", "nextjs", "go", "node", "python", "static", "docker"];
     const options = frameworks.map((framework) => `
-      <option value="${framework}"${app.framework === framework ? " selected" : ""}>${framework === "auto" ? "Auto detect" : escapeHtml(framework)}</option>
+      <option value="${framework}"${app.framework === framework ? " selected" : ""}>${frameworkName(framework)}</option>
     `).join("");
     const body = `
       <div class="am-form-grid">
         <label>Name<input name="name" value="${escapeHtml(app.name)}" required></label>
         <label>Git repository URL<input name="repo_url" value="${escapeHtml(app.repo_url)}" required></label>
         <label>Branch<input name="branch" value="${escapeHtml(app.branch)}" required></label>
-        <label>Hosted route<input name="route" value="${escapeHtml(app.route || `/${app.id}/`)}" required autocomplete="off"></label>
+        <label>Application path prefix<input name="route" value="${escapeHtml(app.route || `/${app.id}/`)}" required autocomplete="off"></label>
         <label>Description<textarea name="description" rows="3">${escapeHtml(app.description || "")}</textarea></label>
         <label>Deployment policy<select name="deployment_mode"><option value="automatic"${app.deployment_mode !== "approval" ? " selected" : ""}>Automatic</option><option value="approval"${app.deployment_mode === "approval" ? " selected" : ""}>Approval required</option></select></label>
         <label class="am-checkbox"><input type="checkbox" name="auto_deploy"${app.auto_deploy !== false ? " checked" : ""}> Automatic deployment</label>
       </div>
-      <small class="am-field-hint">A route change is applied by the next deployment. Next.js projects must build with the same basePath (APP_BASE_PATH is supplied during build).</small>
+      <small class="am-field-hint">App Manager only configures the application path. Configure domains and routing in Cockpit's Nginx Manager; Next.js receives APP_BASE_PATH during build.</small>
       <details class="am-advanced"><summary>Build and runtime</summary><div class="am-form-grid">
         <label>Framework<select name="framework">${options}</select></label>
         <label>Port<input type="number" name="port" min="8100" max="8999" value="${escapeHtml(app.port)}" required></label>
@@ -697,8 +702,8 @@
         ${Object.entries({ memory_mb: ["Worker memory (MiB)", 1024], cpu_percent: ["Worker CPU (%)", 100], tasks_max: ["Worker process limit", 256] }).map(([key, [label, fallback]]) => `<label>${label}<input type="number" name="worker_${key}" min="1" max="${key === "memory_mb" ? 1048576 : 10000}" value="${escapeHtml(app.python_services?.worker?.resource_limits?.[key] ?? fallback)}"></label>`).join("")}
         <label>Model artifact paths (relative to shared/models)<textarea name="model_files" rows="3">${escapeHtml((app.python_services?.model_files || []).join("\n"))}</textarea></label>
         <label>Upload body limit (MiB)<input name="upload_limit_mb" type="number" min="1" max="1024" value="${escapeHtml(app.python_services?.upload_limit_mb ?? 101)}"></label>
-        <label>Route access<select name="native_access"><option value="blocked"${app.python_services?.access_control !== "external-auth" ? " selected" : ""}>Blocked at Nginx</option><option value="external-auth"${app.python_services?.access_control === "external-auth" ? " selected" : ""}>Administrator-confirmed upstream authentication</option></select></label>
       </div></details>
+      <small class="am-field-hint">Configure any external authentication or access restrictions in Cockpit's Nginx Manager.</small>
       <details class="am-advanced"><summary>Deployment schedule (UTC)</summary><div class="am-form-grid">
         <label>Window start<input type="time" name="window_start" value="${escapeHtml(app.deployment_window?.start || "")}"></label>
         <label>Window end<input type="time" name="window_end" value="${escapeHtml(app.deployment_window?.end || "")}"></label>
@@ -722,14 +727,14 @@
         payload.python_services = {
           redis: form.elements.native_redis.checked, drum_prerequisites: form.elements.native_drum.checked,
           model_files: payload.model_files.split(/[\s,]+/).filter(Boolean),
-          upload_limit_mb: Number(payload.upload_limit_mb), access_control: payload.native_access,
+          upload_limit_mb: Number(payload.upload_limit_mb),
+          access_control: app.python_services?.access_control || "blocked",
           ...(command.length ? { worker: { command, stop_timeout_seconds: Number(payload.worker_timeout), resource_limits: {
             memory_mb: Number(payload.worker_memory_mb), cpu_percent: Number(payload.worker_cpu_percent), tasks_max: Number(payload.worker_tasks_max),
           } } } : {}),
         };
-        if (payload.native_access === "external-auth" && !window.confirm("Confirm authentication/access control protects this entire application prefix and every route to the origin. CORS is not authentication.")) return false;
       }
-      for (const key of ["native_python", "native_redis", "native_drum", "native_access", "worker_command", "worker_timeout", "worker_memory_mb", "worker_cpu_percent", "worker_tasks_max", "model_files", "upload_limit_mb"]) delete payload[key];
+      for (const key of ["native_python", "native_redis", "native_drum", "worker_command", "worker_timeout", "worker_memory_mb", "worker_cpu_percent", "worker_tasks_max", "model_files", "upload_limit_mb"]) delete payload[key];
       payload.auto_deploy = form.elements.auto_deploy.checked;
       if (Boolean(payload.window_start) !== Boolean(payload.window_end)) throw new Error("Set both UTC deployment window times or leave both empty.");
       payload.deployment_window = payload.window_start ? { start: payload.window_start, end: payload.window_end } : {};
@@ -1071,14 +1076,14 @@
   function openDeploymentLogDialog(appId) {
     const app = state.apps.find((item) => item.id === appId);
     const branch = app?.branch || "Unavailable";
-    const route = app?.active_route || app?.route || `/${appId}/`;
+    const route = app?.route || `/${appId}/`;
     openDialog(
       app?.name || appId,
       `<section class="am-deployment-summary" aria-label="Deployment details">
          <p id="deploymentLiveStatus" class="am-deployment-status" data-status="running" role="status" aria-live="polite">Starting deployment…</p>
          <dl class="am-deployment-facts">
            <div><dt>Branch</dt><dd>${icon("git-branch")}<span>${escapeHtml(branch)}</span></dd></div>
-           <div><dt>Route</dt><dd><span>${escapeHtml(route)}</span></dd></div>
+           <div><dt>Application path</dt><dd><span>${escapeHtml(route)}</span></dd></div>
            <div><dt>Source revision</dt><dd><code id="deploymentLogRevision">Pending</code></dd></div>
            <div class="am-deployment-facts__id"><dt>Deployment ID</dt><dd><code id="deploymentLogId">Starting</code></dd></div>
          </dl>
@@ -1337,7 +1342,6 @@
         const result = await callBackend("health", [appId]);
         await refreshData();
         if (!result.healthy) throw new Error(`Health check failed (${result.url}).`);
-        if (result.public_healthy === false) throw new Error(`Local readiness passed, but the public route failed: ${result.public_error || result.public_url || "unavailable"}.`);
         showNotice(app.framework === "static" && !app.build_config?.start_command
           ? "Static release is available."
           : `Runtime health check passed (${result.url}).`);
