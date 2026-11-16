@@ -752,6 +752,8 @@
     state.settings = config;
     const forms = Array.from(document.querySelectorAll("#settingsForm, #integrationSettingsForm"));
     if (forms.some((form) => Array.from(form.elements).some((input) => input.name && input.value !== input.defaultValue))) return;
+    const serviceAddress = (value = "") => value.startsWith(`${window.location.origin}/`)
+      ? value.slice(window.location.origin.length) : value;
     byId("settingsPanel").innerHTML = `
       <section class="am-surface am-settings">
         <div class="am-surface-heading">
@@ -790,14 +792,15 @@
         <div class="am-surface-heading">
           <div>
             <h3>Infrastructure APIs</h3>
-            <p>Save service URLs here. API keys and passwords are requested only when you connect and are kept in memory for this Cockpit page.</p>
+            <p>Using the same address as Cockpit? Enter only each service's route. API keys and passwords are requested when you connect and are kept in memory for this Cockpit page.</p>
           </div>
         </div>
         <form id="integrationSettingsForm" class="am-settings-form">
           <div class="am-form-grid">
-            <label for="settingPortainerUrl">Portainer URL<input id="settingPortainerUrl" name="portainer_url" type="url" inputmode="url" placeholder="https://portainer.example:9443" value="${escapeHtml(config.integrations?.portainer_url || "")}"></label>
-            <label for="settingNpmUrl">Nginx Proxy Manager URL<input id="settingNpmUrl" name="npm_url" type="url" inputmode="url" placeholder="http://127.0.0.1:81" value="${escapeHtml(config.integrations?.npm_url || "")}"></label>
+            <label for="settingPortainerUrl">Portainer route or full URL<input id="settingPortainerUrl" name="portainer_url" type="text" inputmode="url" placeholder="/portainer/" aria-describedby="integrationAddressHint" value="${escapeHtml(serviceAddress(config.integrations?.portainer_url))}"></label>
+            <label for="settingNpmUrl">Nginx Proxy Manager route or full URL<input id="settingNpmUrl" name="npm_url" type="text" inputmode="url" placeholder="/nginx/" aria-describedby="integrationAddressHint" value="${escapeHtml(serviceAddress(config.integrations?.npm_url))}"></label>
           </div>
+          <p id="integrationAddressHint" class="am-field-hint">Routes starting with / use <strong>${escapeHtml(window.location.origin)}</strong>, including its port. Enter your actual service routes, not /api; API paths are added automatically. A full HTTP(S) URL also works. Leave blank to disconnect a service.</p>
           <p class="am-field-hint">Use the address reachable from this Ubuntu host. HTTPS certificates are verified and redirects are not followed. HTTP does not encrypt credentials; use it only on a trusted local network.</p>
           <div class="am-form-actions"><button type="submit" class="am-button am-button--primary">Save API URLs</button></div>
         </form>
@@ -821,6 +824,11 @@
       const form = event.currentTarget;
       const integrations = Object.fromEntries(new FormData(form).entries());
       void runOperation(async () => {
+        for (const key of Object.keys(integrations)) {
+          const value = integrations[key].trim();
+          integrations[key] = value.startsWith("/") && !value.startsWith("//")
+            ? `${window.location.origin}${value}` : value;
+        }
         const previous = state.settings.integrations || {};
         const result = await callBackend("settings", [JSON.stringify({ integrations })]);
         state.settings = result.config || state.settings;

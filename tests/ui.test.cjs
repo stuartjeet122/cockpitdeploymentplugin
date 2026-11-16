@@ -316,8 +316,8 @@ const fixtureApps = [
   { id: "docs", name: "Documentation", framework: "static", branch: "main", route: "/docs/", repo_url: "https://github.com/example/docs.git", port: 8101, status: "stopped", deployments: [] },
 ];
 
-async function loadUi(overrides = {}, configureWindow) {
-  const dom = new JSDOM(html, { runScripts: "outside-only", url: "https://localhost/cockpit/app-manager/index.html" });
+async function loadUi(overrides = {}, configureWindow, url = "https://localhost/cockpit/app-manager/index.html") {
+  const dom = new JSDOM(html, { runScripts: "outside-only", url });
   const { window } = dom;
   const calls = [];
   window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
@@ -392,6 +392,43 @@ test("Infrastructure API URLs are saved separately from authentication secrets",
     ui.document.querySelector('[data-tab="infrastructure"]').click();
     assert.match(ui.document.querySelector("#integrationPanel").textContent, /Portainer/);
     assert.match(ui.document.querySelector("#integrationPanel").textContent, /Nginx Proxy Manager/);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Infrastructure routes reuse Cockpit's origin and preserve full URLs and empty settings", async () => {
+  let integrations = {
+    portainer_url: "https://server.example:9090/portainer",
+    npm_url: "https://server.example:9090/nginx",
+  };
+  const ui = await loadUi({
+    settings: (record) => {
+      if (record.values.length) integrations = JSON.parse(record.values[0]).integrations;
+      return { config: { integrations } };
+    },
+  }, undefined, "https://server.example:9090/cockpit/@host/app-manager/index.html");
+  try {
+    ui.document.querySelector('[data-tab="settings"]').click();
+    let form = ui.document.querySelector("#integrationSettingsForm");
+    assert.equal(form.elements.portainer_url.value, "/portainer");
+    assert.equal(form.elements.npm_url.value, "/nginx");
+    assert.match(ui.document.querySelector("#integrationAddressHint").textContent, /https:\/\/server.example:9090/);
+    form.elements.portainer_url.value = " /services/containers/ ";
+    form.elements.npm_url.value = "/services/proxy/";
+    assert.equal(form.checkValidity(), true);
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.deepEqual(integrations, {
+      portainer_url: "https://server.example:9090/services/containers/",
+      npm_url: "https://server.example:9090/services/proxy/",
+    });
+    form = ui.document.querySelector("#integrationSettingsForm");
+    assert.equal(form.elements.portainer_url.value, "/services/containers/");
+    assert.equal(form.elements.npm_url.value, "/services/proxy/");
+    form.elements.portainer_url.value = "";
+    form.elements.npm_url.value = "http://127.0.0.1:81";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.deepEqual(integrations, { portainer_url: "", npm_url: "http://127.0.0.1:81" });
   } finally { ui.dom.window.close(); }
 });
 
