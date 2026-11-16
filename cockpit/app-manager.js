@@ -379,6 +379,11 @@
     ],
   };
 
+  const integrationReadTitles = {
+    inspect: "Resource details", logs: "Container logs", stats: "Container stats",
+    changes: "Container filesystem changes", history: "Image history", file: "Stack Compose file",
+  };
+
   function integrationCall(provider, action, resource, extra = {}) {
     const connection = state.integration[provider];
     const payload = { provider, action, resource, ...extra };
@@ -451,6 +456,36 @@
     </details>`;
   }
 
+  function renderPortainerCreator(resource) {
+    if (!["containers", "images", "volumes", "networks"].includes(resource)) return "";
+    const pulling = resource === "images";
+    const title = pulling ? "Pull image" : `Create ${resource.slice(0, -1)}`;
+    const image = pulling || resource === "containers" ? `
+      <label>Image reference<input name="image" required maxlength="256" placeholder="nginx:alpine" autocomplete="off"></label>` : "";
+    const name = pulling ? "" : `
+      <label>Name<input name="name" required maxlength="63" pattern="[A-Za-z0-9][A-Za-z0-9_.\\-]{0,62}" autocomplete="off"></label>`;
+    const containerFields = resource === "containers" ? `
+      <label>Host loopback port (optional)<input name="host_port" type="number" min="8100" max="8999" step="1" placeholder="8100"></label>
+      <label>Container TCP port (required when publishing)<input name="container_port" type="number" min="1" max="65535" step="1" placeholder="80"></label>
+      <label>Restart policy<select name="restart_policy"><option value="no">Do not restart automatically</option><option value="unless-stopped">Unless stopped</option><option value="always">Always</option><option value="on-failure">On failure</option></select></label>` : "";
+    const internal = resource === "networks" ? `
+      <label class="am-checkbox"><input type="checkbox" name="internal"><span>Internal network (no external connectivity)</span></label>` : "";
+    const hint = ({
+      containers: "Use a trusted image already present in this environment; pull it first if needed. The container is created stopped with its image's default command, dropped capabilities, no-new-privileges, and limits of 1024 MiB, 1 CPU and 256 tasks. Optional TCP publishing binds only to 127.0.0.1. No host mounts or privileged settings are accepted. Start it separately after review.",
+      images: "Pull an image from a public registry. Private-registry credentials are not supported by this form. This can take several minutes. Review the image list before retrying a timeout.",
+      volumes: "Creates a Docker-managed local volume with no host path or driver options.",
+      networks: "Creates a bridge network. Host networking and custom drivers are not accepted.",
+    })[resource];
+    return `<details class="am-resource-editor">
+      <summary>${title}</summary>
+      <form data-portainer-create>
+        <div class="am-form-grid">${name}${image}${containerFields}${internal}</div>
+        <p class="am-field-hint">${hint}</p>
+        <button type="submit" class="am-button am-button--primary">${title}</button>
+      </form>
+    </details>`;
+  }
+
   function renderIntegrationTable(provider, connection) {
     const resource = connection.resource;
     const rows = integrationRows(connection.data);
@@ -458,6 +493,7 @@
       return `<pre class="am-log-output">${escapeHtml(JSON.stringify(connection.data || {}, null, 2))}</pre>`;
     }
     const columns = integrationColumns(provider, resource);
+    const dockerCreator = provider === "portainer" ? renderPortainerCreator(resource) : "";
     const createRoute = provider === "npm" && resource === "proxy-hosts" ? renderNpmRouteCreator() : "";
     const createEditor = provider === "npm" && resource !== "proxy-hosts" ? `
       <details class="am-resource-editor">
@@ -469,7 +505,7 @@
         </form>
       </details>` : "";
     if (!rows.length) {
-        return `${createRoute}${createEditor}<div class="am-empty-state am-integration-empty">
+        return `${dockerCreator}${createRoute}${createEditor}<div class="am-empty-state am-integration-empty">
         <span class="am-empty-state__icon" aria-hidden="true">${icon("boxes")}</span>
         <h3>No ${escapeHtml(integrationResources[provider].find(([key]) => key === resource)?.[1].toLowerCase() || "resources")} found</h3>
         <p>Refresh to check the connected service again.</p>
@@ -489,9 +525,41 @@
           ${running || paused ? `<button class="am-button am-button--danger" type="button" data-resource-action="kill" data-id="${escapeHtml(id)}">Kill</button>` : ""}
           <button class="am-button am-button--quiet" type="button" data-resource-action="logs" data-id="${escapeHtml(id)}">Logs</button>
           <button class="am-button am-button--quiet" type="button" data-resource-action="inspect" data-id="${escapeHtml(id)}">Inspect</button>
+          <button class="am-button am-button--quiet" type="button" data-resource-action="stats" data-id="${escapeHtml(id)}">Stats</button>
+          <button class="am-button am-button--quiet" type="button" data-resource-action="changes" data-id="${escapeHtml(id)}">Filesystem changes</button>
+          <details class="am-row-editor"><summary>Rename</summary>
+            <form data-portainer-change="rename" data-id="${escapeHtml(id)}">
+              <label>New name<input name="name" required maxlength="63" pattern="[A-Za-z0-9][A-Za-z0-9_.\\-]{0,62}" autocomplete="off"></label>
+              <p class="am-field-hint">Renaming can break scripts, service automation, or links that use the old container name.</p>
+              <button type="submit" class="am-button am-button--primary">Rename container</button>
+            </form>
+          </details>
           <button class="am-button am-button--danger" type="button" data-resource-action="remove" data-id="${escapeHtml(id)}">Remove</button>`;
       } else if (provider === "portainer" && ["stacks", "images", "volumes", "networks"].includes(resource)) {
-        controls = `<button class="am-button am-button--danger" type="button" data-resource-action="remove" data-id="${escapeHtml(id)}">Remove</button>`;
+        controls = `<button class="am-button am-button--quiet" type="button" data-resource-action="inspect" data-id="${escapeHtml(id)}">Inspect</button>
+          <button class="am-button am-button--danger" type="button" data-resource-action="remove" data-id="${escapeHtml(id)}">Remove</button>`;
+        if (resource === "images") {
+          controls += `<button class="am-button am-button--quiet" type="button" data-resource-action="history" data-id="${escapeHtml(id)}">History</button>
+            <details class="am-row-editor"><summary>Add tag</summary>
+              <form data-portainer-change="tag" data-id="${escapeHtml(id)}">
+                <label>Repository (without tag)<input name="repository" required maxlength="256" placeholder="myorg/web" autocomplete="off"></label>
+                <label>Tag<input name="tag" required maxlength="128" pattern="[A-Za-z0-9_][A-Za-z0-9_.\\-]{0,127}" value="latest" autocomplete="off"></label>
+                <p class="am-field-hint">Creates a local image tag; does not push to a registry.</p>
+                <button type="submit" class="am-button am-button--primary">Add image tag</button>
+              </form>
+            </details>`;
+        } else if (resource === "networks" && item.Driver === "bridge" && item.Scope === "local") {
+          controls += `<details class="am-row-editor"><summary>Connect/disconnect container</summary>
+            <form data-portainer-change="network" data-id="${escapeHtml(id)}">
+              <label>Container ID or name<input name="container" required maxlength="256" autocomplete="off"></label>
+              <label>Action<select name="action"><option value="connect">Connect</option><option value="disconnect">Disconnect</option></select></label>
+              <p class="am-field-hint">Changes connectivity on this bridge network only. Disconnecting can interrupt existing services. No host ports are published.</p>
+              <button type="submit" class="am-button am-button--primary">Apply connection change</button>
+            </form>
+          </details>`;
+        } else if (resource === "stacks") {
+          controls += `<button class="am-button am-button--quiet" type="button" data-resource-action="file" data-id="${escapeHtml(id)}">View Compose file</button>`;
+        }
       } else if (provider === "npm") {
         controls = `${resource === "certificates" ? "" : `<details class="am-row-editor"><summary>Edit JSON</summary>
             <form data-npm-update data-id="${escapeHtml(id)}">
@@ -506,7 +574,7 @@
         <td class="am-resource-actions">${controls || "—"}</td>
       </tr>`;
     }).join("");
-    return `${createRoute}${createEditor}<div class="am-deployment-table-wrap am-resource-table-wrap"><table class="table">
+    return `${dockerCreator}${createRoute}${createEditor}<div class="am-deployment-table-wrap am-resource-table-wrap"><table class="table">
       <thead><tr><th>Name</th>${header}<th>Actions</th></tr></thead><tbody>${body}</tbody>
     </table></div>`;
   }
@@ -632,11 +700,11 @@
       !window.confirm(action === "kill"
         ? "Force-stop this container immediately? Unsaved application work may be lost."
         : `Permanently ${action === "delete" ? "delete" : "remove"} this ${connection.resource} resource? This cannot be undone.`)) return;
-    if (action === "inspect" || action === "logs") {
+    if (integrationReadTitles[action]) {
       const result = await integrationCall(provider, action, connection.resource, {
         endpoint_id: connection.endpointId, id,
       });
-      openDialog(`${action === "inspect" ? "Container details" : "Container logs"}: ${id}`,
+      openDialog(`${integrationReadTitles[action]}: ${id}`,
         `<pre class="am-log-output">${escapeHtml(typeof result.data === "string" ? result.data : JSON.stringify(result.data, null, 2) || "No data returned")}</pre>`);
       return;
     }
@@ -644,6 +712,14 @@
       endpoint_id: connection.endpointId, id,
     });
     await loadIntegrationResource();
+  }
+
+  async function refreshAfterDockerChange(change) {
+    try {
+      await loadIntegrationResource();
+    } catch (error) {
+      throw new Error(`Docker ${change} succeeded, but refreshing failed: ${error.message}. Check the resource list before retrying.`);
+    }
   }
 
   function npmRoutePayload(form) {
@@ -696,7 +772,8 @@
       } else if (target.hasAttribute("data-resource-refresh")) {
         void runOperation(loadIntegrationResource, "Resource list refreshed.", false).then(renderInfrastructure);
       } else if (target.dataset.resourceAction) {
-        void runOperation(() => runIntegrationAction(target), "Infrastructure resource updated.", false).then(renderInfrastructure);
+        const notice = integrationReadTitles[target.dataset.resourceAction] ? "" : "Infrastructure resource updated.";
+        void runOperation(() => runIntegrationAction(target), notice, false).then(renderInfrastructure);
       }
     });
     host.addEventListener("change", (event) => {
@@ -722,6 +799,43 @@
       const route = form.matches("[data-npm-route]");
       if (form.matches("[data-integration-connect]")) {
         void runOperation(() => connectIntegration(form), "Connected to the service.", false).then(renderInfrastructure);
+        return;
+      }
+      if (form.matches("[data-portainer-change]")) {
+        const connection = state.integration.portainer;
+        const body = Object.fromEntries(new FormData(form).entries());
+        const action = form.dataset.portainerChange === "network" ? body.action : form.dataset.portainerChange;
+        delete body.action;
+        if (action === "disconnect" && !window.confirm(`Disconnect container "${body.container}" from this network? This can interrupt existing services.`)) return;
+        if (action === "rename" && !window.confirm("Rename this container? Scripts or service automation using its old name may stop working.")) return;
+        void runOperation(async () => {
+          await integrationCall("portainer", action, connection.resource, {
+            endpoint_id: connection.endpointId, id: form.dataset.id, body,
+          });
+          await refreshAfterDockerChange(action);
+        }, "Docker resource updated.", false).then((success) => { if (success) renderInfrastructure(); });
+        return;
+      }
+      if (form.matches("[data-portainer-create]")) {
+        const connection = state.integration.portainer;
+        const resource = connection.resource;
+        const pulling = resource === "images";
+        const body = Object.fromEntries(new FormData(form).entries());
+        void runOperation(async () => {
+          if (resource === "networks") body.internal = form.elements.internal.checked;
+          if (resource === "containers") {
+            for (const key of ["host_port", "container_port"]) {
+              if (body[key] === "") delete body[key];
+              else body[key] = Number(body[key]);
+            }
+          }
+          const result = await integrationCall("portainer", pulling ? "pull" : "create", resource, {
+            endpoint_id: connection.endpointId, body,
+          });
+          await refreshAfterDockerChange(pulling ? "image pull" : "resource creation");
+          const warnings = result.data?.Warnings || (result.data?.Warning ? [result.data.Warning] : []);
+          showNotice(`${pulling ? "Image pulled." : resource === "containers" ? "Container created stopped. Review it before starting." : "Docker resource created."}${warnings.length ? ` Warnings: ${warnings.join("; ")}` : ""}`);
+        }, "", false).then((success) => { if (success) renderInfrastructure(); });
         return;
       }
       const create = form.matches("[data-npm-create]");

@@ -2418,6 +2418,7 @@ def _integration_request(
     token: Optional[str] = None,
     api_key: bool = False,
     payload: Optional[Dict[str, Any]] = None,
+    json_lines: bool = False,
 ) -> Any:
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
     headers = {"Accept": "application/json"}
@@ -2430,13 +2431,31 @@ def _integration_request(
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
     try:
-        with opener.open(request, timeout=15) as response:
+        with opener.open(request, timeout=120 if json_lines else 15) as response:
             raw = response.read(2 * 1024 * 1024 + 1)
             if len(raw) > 2 * 1024 * 1024:
                 raise ValueError("Integration API response exceeded the 2 MiB limit")
-            if not raw:
+            if not raw and not json_lines:
                 return None
             text = raw.decode("utf-8", errors="replace")
+            if json_lines:
+                progress = None
+                for line in text.splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        progress = json.loads(line)
+                    except json.JSONDecodeError:
+                        raise RuntimeError("Docker returned invalid image-pull progress") from None
+                    if not isinstance(progress, dict):
+                        raise RuntimeError("Docker returned invalid image-pull progress")
+                    if progress.get("error") or progress.get("errorDetail"):
+                        raise RuntimeError("Docker image pull failed; check the image reference and registry permissions")
+                if not progress or not isinstance(progress.get("status"), str) or not progress["status"].startswith((
+                    "Status: Downloaded newer image for ", "Status: Image is up to date for ",
+                )):
+                    raise RuntimeError("Docker returned no image-pull completion status; check the image list before retrying")
+                return progress
             try:
                 return json.loads(text)
             except json.JSONDecodeError:
@@ -2470,7 +2489,11 @@ def _integration_request(
             raise RuntimeError(message) from None
         raise RuntimeError(f"Integration API request failed with HTTP {exc.code}") from None
     except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise RuntimeError("Integration API request timed out; check the resource state before retrying") from None
         raise RuntimeError(f"Could not reach integration API: {exc.reason}") from None
+    except (TimeoutError, socket.timeout):
+        raise RuntimeError("Integration API request timed out; check the resource state before retrying") from None
 
 
 def _positive_api_id(value: Any, label: str) -> int:
@@ -2495,6 +2518,73 @@ _NPM_RESOURCES = {
     "certificates", "access-lists",
 }
 _PORTAINER_CONTAINER_ACTIONS = {"start", "stop", "restart", "pause", "unpause", "kill", "remove", "inspect", "logs"}
+
+
+def _docker_image_reference(value: Any) -> str:
+    if (
+        not isinstance(value, str) or len(value) > 256
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:-]*(?:@sha256:[0-9a-f]{64})?", value) or "://" in value
+    ):
+        raise ValueError("Enter an image reference such as nginx:alpine, not a URL")
+    return value
+
+
+def _docker_resource_name(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", value):
+        raise ValueError("Docker resource name must use 1-63 letters, digits, dots, underscores or hyphens")
+    return value
+
+
+def _docker_resource_identifier(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value):
+        raise ValueError("A valid Docker resource ID or name is required")
+    return value
+
+
+def _portainer_create_request(resource: str, body: Any) -> Tuple[str, Dict[str, Any]]:
+    allowed = {
+        "containers": {"name", "image", "host_port", "container_port", "restart_policy"},
+        "volumes": {"name"},
+        "networks": {"name", "internal"},
+    }
+    if not isinstance(body, dict) or set(body) - allowed[resource]:
+        raise ValueError("Docker creation requires an object containing only the supported fields")
+    name = _docker_resource_name(body.get("name"))
+    if resource == "volumes":
+        return "volumes/create", {"Name": name, "Driver": "local"}
+    if resource == "networks":
+        internal = body.get("internal", False)
+        if not isinstance(internal, bool):
+            raise ValueError("The internal network option must be a boolean")
+        return "networks/create", {"Name": name, "Driver": "bridge", "CheckDuplicate": True, "Internal": internal}
+    restart_policy = body.get("restart_policy", "no")
+    if not isinstance(restart_policy, str) or restart_policy not in {"no", "always", "unless-stopped", "on-failure"}:
+        raise ValueError("Unsupported Docker restart policy")
+    limits = _resource_limits({})
+    host_config: Dict[str, Any] = {
+        "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"],
+        "Memory": limits["memory_mb"] * 1024 * 1024,
+        "NanoCpus": limits["cpu_percent"] * 10000000, "PidsLimit": limits["tasks_max"],
+        "RestartPolicy": {"Name": restart_policy},
+    }
+    result: Dict[str, Any] = {"Image": _docker_image_reference(body.get("image")), "HostConfig": host_config}
+    host_port, container_port = body.get("host_port"), body.get("container_port")
+    if host_port is not None or container_port is not None:
+        if (
+            isinstance(host_port, bool) or not isinstance(host_port, int) or not PORT_START <= host_port <= PORT_END
+            or isinstance(container_port, bool) or not isinstance(container_port, int) or not 1 <= container_port <= 65535
+        ):
+            raise ValueError("Publishing requires a host port from 8100-8999 and a container port from 1-65535")
+        if host_port in get_listening_ports():
+            raise ValueError("The selected host port is already listening on this host")
+        port_key = f"{container_port}/tcp"
+        result["ExposedPorts"] = {port_key: {}}
+        host_config["PortBindings"] = {port_key: [{"HostIp": "127.0.0.1", "HostPort": str(host_port)}]}
+        if container_port < 1024:
+            host_config["CapAdd"] = ["NET_BIND_SERVICE"]
+    return f"containers/create?{urlencode({'name': name})}", result
+
+
 def _integration_api(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Integration request must be a JSON object")
@@ -2539,6 +2629,98 @@ def _integration_api(payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError("Unsupported Portainer resource")
             data = _integration_request(base_url, path, token=token, api_key=api_key)
             return {"provider": provider, "resource": resource, "data": data}
+        if action_name == "create" and resource in {"containers", "volumes", "networks"}:
+            suffix, body = _portainer_create_request(resource, payload.get("body"))
+            data = _integration_request(
+                base_url, f"api/endpoints/{endpoint_id}/docker/{suffix}",
+                method="POST", payload=body, token=token, api_key=api_key,
+            )
+            result_key = "Name" if resource == "volumes" else "Id"
+            if not isinstance(data, dict) or not isinstance(data.get(result_key), str) or not data[result_key]:
+                raise RuntimeError("Docker returned an invalid create response; check the resource list before retrying")
+            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
+        if action_name == "pull" and resource == "images":
+            body = payload.get("body")
+            if not isinstance(body, dict) or set(body) != {"image"}:
+                raise ValueError("Image pulling requires only an image reference")
+            image = _docker_image_reference(body["image"])
+            data = _integration_request(
+                base_url, f"api/endpoints/{endpoint_id}/docker/images/create?{urlencode({'fromImage': image})}",
+                method="POST", token=token, api_key=api_key, json_lines=True,
+            )
+            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
+        if (
+            (action_name == "rename" and resource == "containers")
+            or (action_name == "tag" and resource == "images")
+            or (action_name in {"connect", "disconnect"} and resource == "networks")
+        ):
+            identifier = _docker_resource_identifier(payload.get("id"))
+            encoded_id = quote(identifier, safe="")
+            body = payload.get("body")
+            field = "name" if resource == "containers" else "repository" if resource == "images" else "container"
+            fields = {field, "tag"} if resource == "images" else {field}
+            if not isinstance(body, dict) or set(body) != fields:
+                raise ValueError("Docker changes require an object containing only the supported fields")
+            docker_body = None
+            if resource == "containers":
+                suffix = f"containers/{encoded_id}/rename?{urlencode({'name': _docker_resource_name(body['name'])})}"
+            elif resource == "images":
+                repository = _docker_image_reference(body["repository"])
+                tag = body["tag"]
+                if "@" in repository or ":" in repository.rsplit("/", 1)[-1]:
+                    raise ValueError("Enter the repository without a tag or digest; supply the tag separately")
+                if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+                    raise ValueError("Image tag must use 1-128 letters, digits, dots, underscores or hyphens")
+                suffix = f"images/{encoded_id}/tag?{urlencode({'repo': repository, 'tag': tag})}"
+            else:
+                container = _docker_resource_identifier(body["container"])
+                network = _integration_request(
+                    base_url, f"api/endpoints/{endpoint_id}/docker/networks/{encoded_id}",
+                    token=token, api_key=api_key,
+                )
+                if not isinstance(network, dict):
+                    raise RuntimeError("Docker returned invalid network details; no network change was requested")
+                if network.get("Driver") != "bridge" or network.get("Scope") != "local":
+                    raise ValueError("Container connections can only be changed on local bridge networks")
+                suffix = f"networks/{encoded_id}/{action_name}"
+                docker_body = {"Container": container}
+                if action_name == "disconnect":
+                    docker_body["Force"] = False
+            data = _integration_request(
+                base_url, f"api/endpoints/{endpoint_id}/docker/{suffix}", method="POST",
+                payload=docker_body, token=token, api_key=api_key,
+            )
+            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
+        if (
+            (action_name == "inspect" and resource in {"images", "volumes", "networks", "stacks"})
+            or (action_name in {"stats", "changes"} and resource == "containers")
+            or (action_name == "history" and resource == "images")
+            or (action_name == "file" and resource == "stacks")
+        ):
+            identifier = payload.get("id")
+            if (
+                not isinstance(identifier, (str, int)) or isinstance(identifier, bool) or not str(identifier)
+                or len(str(identifier)) > 256 or "\0" in str(identifier) or str(identifier) in {".", ".."}
+            ):
+                raise ValueError("A valid Docker resource ID is required")
+            encoded_id = quote(str(identifier), safe="")
+            if resource == "stacks":
+                path = f"api/stacks/{_positive_api_id(identifier, 'Portainer stack')}"
+                if action_name == "file":
+                    path += "/file"
+            else:
+                suffix = (
+                    "/stats?stream=false" if action_name == "stats"
+                    else f"/{action_name}" if action_name in {"history", "changes"}
+                    else "/json" if resource == "images" else ""
+                )
+                path = f"api/endpoints/{endpoint_id}/docker/{resource}/{encoded_id}{suffix}"
+            data = _integration_request(base_url, path, token=token, api_key=api_key)
+            if action_name == "file":
+                if not isinstance(data, dict) or not isinstance(data.get("StackFileContent"), str):
+                    raise RuntimeError("Portainer returned an invalid stack file response")
+                data = data["StackFileContent"]
+            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
         if resource == "containers" and action_name in _PORTAINER_CONTAINER_ACTIONS:
             identifier = payload.get("id")
             if not isinstance(identifier, str) or not identifier or len(identifier) > 256 or "\0" in identifier:

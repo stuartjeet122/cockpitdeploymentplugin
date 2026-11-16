@@ -145,9 +145,26 @@ The error now identifies the service, HTTP method, and failing API endpoint with
 
 The privileged helper makes requests from the Ubuntu host, not from your browser. Signing in to Cockpit or Cloudflare Access in the browser does not authenticate these API requests. A shared-hostname route can therefore work in a browser but return HTTP 403 to the helper. Prefer the service's direct, private API URL reachable from the host (with trusted TLS for HTTPS), or have an administrator configure authorized machine/API access through the existing proxy. The plugin does not supply Cloudflare Access service-token credentials. Do not disable Access/WAF protections, disable TLS verification, expose a private service publicly, or change the existing root-site routing to work around a denial.
 
-Portainer supports listing environments, containers, stacks, images, volumes, networks, and Docker Engine information; container start, stop, restart, pause/unpause, kill, inspect, logs, and remove; and removal of stacks, images, volumes, and networks. NPM supports listing, creating, editing, and deleting proxy hosts, redirection hosts, 404 hosts, streams, and access lists, plus listing/creating/deleting certificates. NPM's JSON editor exposes fields supported by the installed API; use the NPM interface for custom-certificate file uploads and user management. Actions are limited to these named API resources and methods; the UI does not expose an arbitrary URL/API proxy. Resource deletion is confirmed in the UI.
+The native Portainer-backed Docker controls currently support:
 
-This is an API-backed management surface for common Docker and proxy workflows, not a complete reproduction of every Portainer feature or its enterprise/Kubernetes/access-control UI. Portainer continues to manage its own users, registries, templates, Kubernetes environments, and advanced settings in its own interface.
+| Resource | Native operations |
+| --- | --- |
+| Containers | List, inspect, logs, one-shot stats, filesystem changes, rename, start/stop/restart, pause/resume, kill, remove, and create stopped containers from existing images |
+| Images | List, inspect, history, add local tags, pull public images, and remove |
+| Volumes | List, inspect, create Docker-managed local volumes, and remove |
+| Networks | List, inspect, create bridge/internal bridge networks, connect/disconnect containers on local bridge networks, and remove |
+| Stacks | List, inspect, view the read-only Compose file, and remove |
+| Environments | List and select; view Docker Engine information |
+
+Creation forms use structured fields, not arbitrary Docker API JSON. New containers use the image's default command, drop all capabilities, enable `no-new-privileges`, and receive 1024 MiB memory, one CPU, and 256-task limits. Only `NET_BIND_SERVICE` is added when explicitly publishing a privileged internal port. Optional TCP publishing uses `127.0.0.1` and host ports 8100-8999. An active host listener is rejected locally; the selected Docker daemon also rejects port conflicts when starting a container. Containers are created stopped, do not become registered App Manager applications, and must be reviewed and started separately. There is no host-path mounting, arbitrary command override, privileged mode, or custom network/volume driver option in these forms.
+
+Image pulls have a 120-second socket timeout and the existing 2 MiB response limit. Docker's HTTP-200 streaming error records are treated as failures; incomplete progress is not reported as success. The pull form does not supply private-registry credentials. A timeout does not guarantee Docker stopped the pull: inspect or refresh the image list before retrying. Daemon warnings are displayed after successful creation.
+
+Container renaming and network disconnection require confirmation because name-based automation or connectivity can break. Network membership changes recheck that the selected network is a local bridge; host, overlay, and custom-driver networks are not supported. Disconnections never force removal. Image tagging creates a local reference only, without pushing or authenticating to a registry. Container filesystem changes show Docker's path/change-kind metadata, not file contents (kind 0 = modified, 1 = added, 2 = deleted). Stack Compose files and image history are read-only and can contain sensitive configuration; review them only in a trusted session.
+
+NPM supports listing, creating, editing, and deleting proxy hosts, redirection hosts, 404 hosts, streams, and access lists, plus listing/creating/deleting certificates. NPM's JSON editor exposes fields supported by the installed API; use the NPM interface for custom-certificate file uploads and user management. Actions are limited to these named API resources and methods; the UI does not expose an arbitrary URL/API proxy. Resource deletion is confirmed in the UI.
+
+These are native Docker-management controls, not full Portainer parity. Container exec/attach consoles, configuration editing/duplication/recreation, custom commands/environment/mount configuration, stack creation/editing, image build/export/push, private-registry authentication, users/teams/RBAC, templates, Swarm/Kubernetes, and enterprise features remain in Portainer's own interface. API credentials remain session-only; server-side API-key persistence is not implemented. Portainer's security headers are not weakened and its interface is not embedded.
 
 ## Nginx routing
 

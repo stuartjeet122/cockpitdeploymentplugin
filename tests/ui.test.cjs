@@ -517,6 +517,324 @@ test("Infrastructure shows access-denial guidance and clears a rejected API key"
   } finally { ui.dom.window.close(); }
 });
 
+for (const resource of ["containers", "images", "volumes", "networks"]) {
+  test(`native Docker ${resource} form submits structured creation data once`, async () => {
+    const ui = await loadUi({
+      settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+      integration: (record) => {
+        const request = JSON.parse(record.input);
+        if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
+        if (request.action === "list") return { data: [] };
+        return { data: { Id: "created", Name: "native-data", Warnings: ["Review this resource"] } };
+      },
+    });
+    try {
+      ui.document.querySelector('[data-tab="infrastructure"]').click();
+      const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
+      connect.elements.token.value = "ptr_local-key";
+      connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      await settle(ui.window);
+      if (resource !== "containers") {
+        const select = ui.document.querySelector("[data-integration-resource]");
+        select.value = resource;
+        select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+        await settle(ui.window);
+      }
+      const form = ui.document.querySelector("[data-portainer-create]");
+      if (resource !== "images") form.elements.name.value = "native-resource";
+      if (resource === "images" || resource === "containers") form.elements.image.value = "nginx:alpine";
+      if (resource === "containers") {
+        form.elements.host_port.value = "8123";
+        form.elements.container_port.value = "80";
+        form.elements.restart_policy.value = "unless-stopped";
+      }
+      if (resource === "networks") form.elements.internal.checked = true;
+      assert.equal(form.checkValidity(), true);
+      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      await settle(ui.window);
+      const calls = ui.calls.filter((record) => record.command === "integration"
+        && ["create", "pull"].includes(JSON.parse(record.input).action));
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].values.length, 0);
+      const request = JSON.parse(calls[0].input);
+      assert.equal(request.resource, resource);
+      assert.equal(request.endpoint_id, "2");
+      assert.equal(request.token, "ptr_local-key");
+      const expected = resource === "images" ? { image: "nginx:alpine" }
+        : resource === "containers" ? {
+          name: "native-resource", image: "nginx:alpine", host_port: 8123, container_port: 80, restart_policy: "unless-stopped",
+        } : resource === "networks" ? { name: "native-resource", internal: true } : { name: "native-resource" };
+      assert.deepEqual(request.body, expected);
+      assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Review this resource/);
+      assert.equal(ui.document.querySelector("#appManagerError").classList.contains("hidden"), true);
+    } finally { ui.dom.window.close(); }
+  });
+}
+
+test("native Docker inspection, stats, changes, history and stack files open escaped read-only results", async () => {
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+    integration: (record) => {
+      const request = JSON.parse(record.input);
+      if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
+      if (request.action === "list") return { data: request.resource === "volumes"
+        ? { Volumes: [{ Name: "native-data", Driver: "local" }] }
+        : [{ Id: "container", Names: ["/web"], State: "running" }] };
+      return { data: request.action === "file"
+        ? "services:\n  web:\n    image: nginx\n# <img src=x onerror=alert(1)>"
+        : { details: "<img src=x onerror=alert(1)>", memory_stats: { usage: 512 } } };
+    },
+  });
+  try {
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
+    connect.elements.token.value = "ptr_local-key";
+    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    for (const [resource, action, title] of [
+      ["containers", "stats", "Container stats"], ["containers", "changes", "Container filesystem changes"],
+      ["images", "history", "Image history"], ["stacks", "file", "Stack Compose file"],
+      ["volumes", "inspect", "Resource details"],
+    ]) {
+      const select = ui.document.querySelector("[data-integration-resource]");
+      if (select.value !== resource) {
+        select.value = resource;
+        select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+        await settle(ui.window);
+      }
+      ui.document.querySelector(`[data-resource-action="${action}"]`).click();
+      await settle(ui.window);
+      const dialog = ui.document.querySelector("#appManagerDialog");
+      assert.ok(dialog.textContent.includes(title));
+      assert.equal(dialog.querySelector("img"), null);
+      assert.match(dialog.querySelector("pre").textContent, /<img src=x onerror=alert\(1\)>/);
+      if (action === "file") assert.match(dialog.querySelector("pre").textContent, /^services:\n  web:/);
+      const request = ui.calls.filter((record) => record.command === "integration")
+        .map((record) => JSON.parse(record.input)).find((request) => request.action === action);
+      assert.equal(request.resource, resource);
+      assert.equal(request.id, resource === "volumes" ? "native-data" : "container");
+      assert.equal(request.endpoint_id, "2");
+      assert.doesNotMatch(ui.document.querySelector("#appManagerNotice").textContent, /resource updated/i);
+      dialog.close();
+    }
+  } finally { ui.dom.window.close(); }
+});
+
+for (const [resource, action, fields] of [
+  ["containers", "rename", { name: "new-web" }],
+  ["images", "tag", { repository: "registry.example:5000/org/web", tag: "release-1" }],
+  ["networks", "connect", { container: "web" }],
+  ["networks", "disconnect", { container: "web" }],
+]) {
+  test(`native Docker ${action} submits one structured request and refreshes`, async () => {
+    const confirmations = [];
+    const ui = await loadUi({
+      settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+      integration: (record) => {
+        const request = JSON.parse(record.input);
+        if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
+        if (request.action === "list") return { data: [{
+          Id: "resource-id", Names: ["/web"], State: "running", Driver: "bridge", Scope: "local",
+        }] };
+        return { data: null };
+      },
+    }, (window) => { window.confirm = (message) => { confirmations.push(message); return true; }; });
+    try {
+      ui.document.querySelector('[data-tab="infrastructure"]').click();
+      const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
+      connect.elements.token.value = "ptr_local-key";
+      connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      await settle(ui.window);
+      if (resource !== "containers") {
+        const select = ui.document.querySelector("[data-integration-resource]");
+        select.value = resource;
+        select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+        await settle(ui.window);
+      }
+      const form = ui.document.querySelector("[data-portainer-change]");
+      for (const [name, value] of Object.entries(fields)) form.elements[name].value = value;
+      if (resource === "networks") form.elements.action.value = action;
+      assert.equal(form.checkValidity(), true);
+      const previousCalls = ui.calls.length;
+      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      await settle(ui.window);
+      const calls = ui.calls.slice(previousCalls).filter((record) => record.command === "integration");
+      assert.equal(calls.length, 2);
+      const request = JSON.parse(calls[0].input);
+      assert.deepEqual(request, {
+        provider: "portainer", action, resource, endpoint_id: "2", id: "resource-id", body: fields, token: "ptr_local-key",
+      });
+      assert.equal(calls[0].values.length, 0);
+      assert.equal(JSON.parse(calls[1].input).action, "list");
+      assert.equal(confirmations.length, ["rename", "disconnect"].includes(action) ? 1 : 0);
+      assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Docker resource updated/);
+      assert.equal(ui.document.querySelector("#appManagerError").classList.contains("hidden"), true);
+    } finally { ui.dom.window.close(); }
+  });
+}
+
+for (const action of ["rename", "disconnect"]) {
+  test(`cancelling Docker ${action} sends no request`, async () => {
+    const ui = await loadUi({
+      settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+      integration: (record) => ({ data: JSON.parse(record.input).resource === "endpoints"
+        ? [{ Id: 2, Name: "local" }] : [{ Id: "resource-id", Driver: "bridge", Scope: "local" }] }),
+    }, (window) => { window.confirm = () => false; });
+    try {
+      ui.document.querySelector('[data-tab="infrastructure"]').click();
+      const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
+      connect.elements.token.value = "ptr_local-key";
+      connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      await settle(ui.window);
+      if (action === "disconnect") {
+        const select = ui.document.querySelector("[data-integration-resource]");
+        select.value = "networks";
+        select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+        await settle(ui.window);
+      }
+      const form = ui.document.querySelector("[data-portainer-change]");
+      if (action === "rename") form.elements.name.value = "new-web";
+      else {
+        form.elements.container.value = "web";
+        form.elements.action.value = action;
+      }
+      const previousCalls = ui.calls.length;
+      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      await settle(ui.window);
+      assert.equal(ui.calls.length, previousCalls);
+      assert.equal(ui.document.querySelector("[data-portainer-change]"), form);
+    } finally { ui.dom.window.close(); }
+  });
+}
+
+test("native Docker hides network membership controls for non-local bridges", async () => {
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+    integration: (record) => ({ data: JSON.parse(record.input).resource === "endpoints"
+      ? [{ Id: 2, Name: "local" }] : [
+        { Id: "host", Driver: "host", Scope: "local" }, { Id: "overlay", Driver: "overlay", Scope: "swarm" },
+        { Id: "custom", Driver: "macvlan", Scope: "local" }, { Id: "bridge", Driver: "bridge", Scope: "swarm" },
+      ] }),
+  });
+  try {
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
+    connect.elements.token.value = "ptr_local-key";
+    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const select = ui.document.querySelector("[data-integration-resource]");
+    select.value = "networks";
+    select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+    await settle(ui.window);
+    assert.equal(ui.document.querySelector("[data-portainer-change]"), null);
+    assert.equal(ui.document.querySelectorAll('[data-resource-action="inspect"]').length, 4);
+  } finally { ui.dom.window.close(); }
+});
+
+for (const refreshFailure of [false, true]) {
+  test(`native Docker rename preserves the form on ${refreshFailure ? "refresh" : "API"} failure`, async () => {
+    let renamed = false;
+    const ui = await loadUi({
+      settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+      integration: (record) => {
+        const request = JSON.parse(record.input);
+        if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
+        if (request.action === "rename") {
+          if (!refreshFailure) return { ok: false, error: "API denied rename" };
+          renamed = true;
+          return { data: null };
+        }
+        return renamed ? { ok: false, error: "API temporarily unavailable" } : { data: [{ Id: "container" }] };
+      },
+    }, (window) => { window.confirm = () => true; });
+    try {
+      ui.document.querySelector('[data-tab="infrastructure"]').click();
+      const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
+      connect.elements.token.value = "ptr_local-key";
+      connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      await settle(ui.window);
+      const form = ui.document.querySelector("[data-portainer-change]");
+      form.elements.name.value = "new-web";
+      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+      await settle(ui.window);
+      assert.match(ui.document.querySelector("#appManagerError").textContent, refreshFailure
+        ? /rename succeeded, but refreshing failed/ : /API denied rename/);
+      assert.equal(ui.document.querySelector("[data-portainer-change]"), form);
+      assert.equal(form.elements.name.value, "new-web");
+      assert.equal(form.elements.name.disabled, false);
+      assert.equal(ui.document.querySelector("#appManagerNotice").classList.contains("hidden"), true);
+      assert.equal(ui.calls.filter((record) => record.command === "integration"
+        && JSON.parse(record.input).action === "rename").length, 1);
+    } finally { ui.dom.window.close(); }
+  });
+}
+
+test("native image pull failures keep the form and do not announce success", async () => {
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+    integration: (record) => {
+      const request = JSON.parse(record.input);
+      if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
+      if (request.action === "pull") return { ok: false, error: "Docker image pull failed; check registry permissions" };
+      return { data: [] };
+    },
+  });
+  try {
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
+    connect.elements.token.value = "ptr_local-key";
+    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const select = ui.document.querySelector("[data-integration-resource]");
+    select.value = "images";
+    select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+    await settle(ui.window);
+    const form = ui.document.querySelector("[data-portainer-create]");
+    form.elements.image.value = "private/image:tag";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerError").textContent, /registry permissions/);
+    assert.equal(ui.document.querySelector("[data-portainer-create]"), form);
+    assert.equal(form.elements.image.value, "private/image:tag");
+    assert.equal(ui.document.querySelector("#appManagerNotice").classList.contains("hidden"), true);
+    assert.equal(ui.document.querySelector('[data-resource-action="start"]'), null);
+  } finally { ui.dom.window.close(); }
+});
+
+test("native Docker creation reports when creation succeeded but refreshing failed", async () => {
+  let created = false;
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+    integration: (record) => {
+      const request = JSON.parse(record.input);
+      if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
+      if (request.action === "create") {
+        created = true;
+        return { data: { Id: "created" } };
+      }
+      return created ? { ok: false, error: "API temporarily unavailable" } : { data: [] };
+    },
+  });
+  try {
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
+    connect.elements.token.value = "ptr_local-key";
+    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const form = ui.document.querySelector("[data-portainer-create]");
+    form.elements.name.value = "native-resource";
+    form.elements.image.value = "nginx:alpine";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerError").textContent, /creation succeeded, but refreshing failed/);
+    assert.equal(ui.calls.filter((record) => record.command === "integration"
+      && JSON.parse(record.input).action === "create").length, 1);
+    assert.equal(ui.document.querySelector("#appManagerNotice").classList.contains("hidden"), true);
+  } finally { ui.dom.window.close(); }
+});
+
 test("Infrastructure edits Nginx Proxy Manager hosts through its resource API", async () => {
   const ui = await loadUi({
     settings: { config: { integrations: { portainer_url: "", npm_url: "http://127.0.0.1:81" } } },

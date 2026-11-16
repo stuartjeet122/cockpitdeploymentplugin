@@ -685,6 +685,296 @@ class AppManagerTests(unittest.TestCase):
         self.assertIsInstance(handlers[1], manager._NoRedirectHandler)
         self.assertIsNone(handlers[1].redirect_request(None, None, 302, "Found", {}, "https://other.example"))
 
+    def test_portainer_creates_stopped_containers_with_loopback_and_resource_limits(self):
+        with patch.object(manager, "get_listening_ports", return_value=set()), patch.object(
+            manager, "_integration_request", return_value={"Id": "created", "Warnings": []}
+        ) as request:
+            result = manager._integration_api({
+                "provider": "portainer", "action": "create", "resource": "containers",
+                "endpoint_id": 2, "token": "ptr_key", "body": {
+                    "name": "native-web", "image": "nginx:alpine",
+                    "host_port": 8123, "container_port": 80, "restart_policy": "unless-stopped",
+                },
+            })
+        self.assertEqual(result["data"]["Id"], "created")
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args, (
+            "http://127.0.0.1:9000", "api/endpoints/2/docker/containers/create?name=native-web",
+        ))
+        self.assertEqual(request.call_args.kwargs["method"], "POST")
+        body = request.call_args.kwargs["payload"]
+        self.assertEqual(body["Image"], "nginx:alpine")
+        host = body["HostConfig"]
+        self.assertEqual(host["PortBindings"], {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8123"}]})
+        self.assertEqual(host["CapDrop"], ["ALL"])
+        self.assertEqual(host["CapAdd"], ["NET_BIND_SERVICE"])
+        self.assertIn("no-new-privileges", host["SecurityOpt"])
+        self.assertEqual((host["Memory"], host["NanoCpus"], host["PidsLimit"]), (1024 ** 3, 10 ** 9, 256))
+        self.assertNotIn("Binds", host)
+        self.assertNotIn("Privileged", host)
+        self.assertNotIn("Cmd", body)
+
+    def test_portainer_creates_local_volumes_and_bridge_networks(self):
+        for resource, fields, response, expected in (
+            ("volumes", {"name": "native-data"}, {"Name": "native-data"},
+             {"Name": "native-data", "Driver": "local"}),
+            ("networks", {"name": "native-private", "internal": True}, {"Id": "network"},
+             {"Name": "native-private", "Driver": "bridge", "CheckDuplicate": True, "Internal": True}),
+        ):
+            with self.subTest(resource=resource), patch.object(
+                manager, "_integration_request", return_value=response
+            ) as request:
+                manager._integration_api({
+                    "provider": "portainer", "action": "create", "resource": resource,
+                    "endpoint_id": 2, "token": "ptr_key", "body": fields,
+                })
+                request.assert_called_once_with(
+                    "http://127.0.0.1:9000", f"api/endpoints/2/docker/{resource}/create",
+                    method="POST", payload=expected, token="ptr_key", api_key=True,
+                )
+
+    def test_portainer_creation_rejects_unsafe_or_invalid_options_before_requesting(self):
+        cases = (
+            ("containers", {"name": "web", "image": "nginx", "HostConfig": {"Privileged": True}}),
+            ("containers", {"name": "web", "image": "nginx", "host_port": 8080, "container_port": 80}),
+            ("containers", {"name": "web", "image": "nginx", "host_port": True, "container_port": 80}),
+            ("containers", {"name": "web", "image": "nginx", "container_port": 80}),
+            ("containers", {"name": "web", "image": "https://example.com/image"}),
+            ("containers", {"name": "web", "image": "user:private-password@registry.example/image"}),
+            ("containers", {"name": "web", "image": "nginx", "restart_policy": []}),
+            ("containers", {"name": "../web", "image": "nginx"}),
+            ("containers", {"name": "web", "image": "nginx", "host_port": 8123, "container_port": 80}),
+            ("volumes", {"name": "data", "DriverOpts": {"device": "/"}}),
+            ("networks", {"name": "network", "Driver": "host"}),
+            ("networks", {"name": "network", "internal": "true"}),
+        )
+        with patch.object(manager, "get_listening_ports", return_value={8123}), patch.object(
+            manager, "_integration_request"
+        ) as request:
+            for resource, fields in cases:
+                with self.subTest(resource=resource, fields=fields), self.assertRaises(ValueError):
+                    manager._integration_api({
+                        "provider": "portainer", "action": "create", "resource": resource,
+                        "endpoint_id": 2, "token": "ptr_key", "body": fields,
+                    })
+            request.assert_not_called()
+
+    def test_portainer_creation_rejects_success_shaped_invalid_responses(self):
+        with patch.object(manager, "_integration_request", return_value={"message": "not created"}):
+            with self.assertRaisesRegex(RuntimeError, "invalid create response"):
+                manager._integration_api({
+                    "provider": "portainer", "action": "create", "resource": "volumes",
+                    "endpoint_id": 2, "token": "ptr_key", "body": {"name": "data"},
+                })
+
+    def test_portainer_image_pull_uses_encoded_reference_and_stream_parser(self):
+        with patch.object(manager, "_integration_request", return_value={"status": "pulled"}) as request:
+            manager._integration_api({
+                "provider": "portainer", "action": "pull", "resource": "images", "endpoint_id": 2,
+                "token": "ptr_key", "body": {"image": "registry.example:5000/org/web:stable"},
+            })
+        request.assert_called_once_with(
+            "http://127.0.0.1:9000",
+            "api/endpoints/2/docker/images/create?fromImage=registry.example%3A5000%2Forg%2Fweb%3Astable",
+            method="POST", token="ptr_key", api_key=True, json_lines=True,
+        )
+
+    def test_portainer_pull_rejects_credentials_and_unsupported_fields(self):
+        with patch.object(manager, "_integration_request") as request:
+            for body in (
+                {"image": "https://registry.example/image"},
+                {"image": "user:private-password@registry.example/image"},
+                {"image": "nginx:latest", "registry_auth": "private-password"},
+            ):
+                with self.subTest(body=body), self.assertRaises(ValueError) as raised:
+                    manager._integration_api({
+                        "provider": "portainer", "action": "pull", "resource": "images", "endpoint_id": 2,
+                        "token": "ptr_key", "body": body,
+                    })
+                self.assertNotIn("private-password", str(raised.exception))
+            request.assert_not_called()
+
+    def test_docker_pull_progress_requires_explicit_completion_and_surfaces_http_200_errors(self):
+        cases = (
+            (b'{"status":"Downloading"}\n\n{"status":"Status: Downloaded newer image for nginx:alpine"}\n', None),
+            (b'{"status":"Status: Image is up to date for nginx:alpine"}\n', None),
+            (b'{"status":"Downloading"}\n{"error":"private-registry-secret"}\n', "image pull failed"),
+            (b'{"errorDetail":{"message":"private-registry-secret"}}\n', "image pull failed"),
+            (b'{"status":"Downloading"}\n', "no image-pull completion"),
+            (b'', "no image-pull completion"),
+            (b'<html>Access denied</html>', "invalid image-pull progress"),
+            (b'[]\n', "invalid image-pull progress"),
+        )
+        for raw, error in cases:
+            with self.subTest(raw=raw):
+                response = Mock()
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=None)
+                response.read.return_value = raw
+                opener = Mock()
+                opener.open.return_value = response
+                with patch.object(manager.urllib.request, "build_opener", return_value=opener):
+                    if error:
+                        with self.assertRaisesRegex(RuntimeError, error) as raised:
+                            manager._integration_request("http://127.0.0.1:9000", "api/endpoints/2/docker/images/create",
+                                                         method="POST", token="ptr_key", api_key=True, json_lines=True)
+                        self.assertNotIn("private-registry-secret", str(raised.exception))
+                    else:
+                        result = manager._integration_request(
+                            "http://127.0.0.1:9000", "api/endpoints/2/docker/images/create",
+                            method="POST", token="ptr_key", api_key=True, json_lines=True,
+                        )
+                        self.assertTrue(result["status"].startswith("Status: "))
+                self.assertEqual(opener.open.call_args.kwargs["timeout"], 120)
+
+    def test_docker_pull_timeout_reports_uncertain_resource_state(self):
+        for error in (TimeoutError(), urllib.error.URLError(TimeoutError())):
+            with self.subTest(error=type(error).__name__):
+                opener = Mock()
+                opener.open.side_effect = error
+                with patch.object(manager.urllib.request, "build_opener", return_value=opener):
+                    with self.assertRaisesRegex(RuntimeError, "check the resource state before retrying"):
+                        manager._integration_request(
+                            "http://127.0.0.1:9000", "api/endpoints/2/docker/images/create", json_lines=True,
+                        )
+
+    def test_portainer_inspects_resources_and_reads_container_stats(self):
+        for resource, action, identifier, path in (
+            ("images", "inspect", "sha256:abc", "api/endpoints/2/docker/images/sha256%3Aabc/json"),
+            ("volumes", "inspect", "native-data", "api/endpoints/2/docker/volumes/native-data"),
+            ("networks", "inspect", "native-network", "api/endpoints/2/docker/networks/native-network"),
+            ("stacks", "inspect", "7", "api/stacks/7"),
+            ("containers", "stats", "container", "api/endpoints/2/docker/containers/container/stats?stream=false"),
+            ("containers", "changes", "container", "api/endpoints/2/docker/containers/container/changes"),
+            ("images", "history", "sha256:abc", "api/endpoints/2/docker/images/sha256%3Aabc/history"),
+            ("stacks", "file", 7, "api/stacks/7/file"),
+        ):
+            response = {"StackFileContent": "services:\n  web:\n    image: nginx\n"} if action == "file" else {}
+            with self.subTest(resource=resource, action=action), patch.object(
+                manager, "_integration_request", return_value=response
+            ) as request:
+                result = manager._integration_api({
+                    "provider": "portainer", "action": action, "resource": resource,
+                    "endpoint_id": 2, "token": "ptr_key", "id": identifier,
+                })
+                request.assert_called_once_with("http://127.0.0.1:9000", path, token="ptr_key", api_key=True)
+                self.assertEqual(result["data"], response["StackFileContent"] if action == "file" else response)
+
+    def test_portainer_renames_containers_and_tags_images_with_structured_fields(self):
+        for resource, action, identifier, body, suffix in (
+            ("containers", "rename", "container", {"name": "new-web"}, "containers/container/rename?name=new-web"),
+            ("images", "tag", "sha256:abc", {"repository": "registry.example:5000/org/web", "tag": "release-1"},
+             "images/sha256%3Aabc/tag?repo=registry.example%3A5000%2Forg%2Fweb&tag=release-1"),
+        ):
+            with self.subTest(action=action), patch.object(manager, "_integration_request", return_value=None) as request:
+                manager._integration_api({
+                    "provider": "portainer", "action": action, "resource": resource,
+                    "endpoint_id": 2, "token": "ptr_key", "id": identifier, "body": body,
+                })
+                request.assert_called_once_with(
+                    "http://127.0.0.1:9000", f"api/endpoints/2/docker/{suffix}",
+                    method="POST", payload=None, token="ptr_key", api_key=True,
+                )
+
+    def test_portainer_network_membership_rechecks_bridge_and_never_forces_disconnect(self):
+        for action in ("connect", "disconnect"):
+            with self.subTest(action=action), patch.object(
+                manager, "_integration_request", side_effect=[{"Driver": "bridge", "Scope": "local"}, None]
+            ) as request:
+                manager._integration_api({
+                    "provider": "portainer", "action": action, "resource": "networks",
+                    "endpoint_id": 2, "token": "ptr_key", "id": "network", "body": {"container": "web"},
+                })
+                self.assertEqual(request.call_count, 2)
+                self.assertEqual(request.call_args_list[0].args, (
+                    "http://127.0.0.1:9000", "api/endpoints/2/docker/networks/network",
+                ))
+                body = {"Container": "web", **({"Force": False} if action == "disconnect" else {})}
+                self.assertEqual(request.call_args.args, (
+                    "http://127.0.0.1:9000", f"api/endpoints/2/docker/networks/network/{action}",
+                ))
+                self.assertEqual(request.call_args.kwargs, {
+                    "method": "POST", "payload": body, "token": "ptr_key", "api_key": True,
+                })
+
+    def test_portainer_changes_reject_unsafe_fields_and_invalid_identifiers_before_requesting(self):
+        cases = (
+            ("containers", "rename", "web", None),
+            ("containers", "rename", "web", {"name": "../new"}),
+            ("containers", "rename", "web", {"name": "new", "Image": "other"}),
+            ("containers", "rename", "..", {"name": "new"}),
+            ("containers", "rename", "web/../../info", {"name": "new"}),
+            ("images", "tag", False, {"repository": "web", "tag": "latest"}),
+            ("images", "tag", "image", {"repository": "web", "tag": "a" * 129}),
+            ("images", "tag", "image", {"repository": "web", "tag": []}),
+            ("images", "tag", "image", {"repository": "web", "tag": "-bad"}),
+            ("images", "tag", "image", {"repository": "web", "tag": "tag?force=true"}),
+            ("images", "tag", "image", {"repository": "web:old", "tag": "new"}),
+            ("images", "tag", "image", {"repository": "web@sha256:" + "a" * 64, "tag": "new"}),
+            ("images", "tag", "image", {"repository": "user:secret@registry/web", "tag": "new"}),
+            ("images", "tag", "image", {"repository": "https://registry/web", "tag": "new"}),
+            ("images", "tag", "image", {"repository": "web", "tag": "new", "force": True}),
+            ("networks", "connect", "network", {"container": "../web"}),
+            ("networks", "connect", "network", {"container": True}),
+            ("networks", "disconnect", "network", {"container": "web", "force": True}),
+            ("networks", "connect", "network", {"container": "web", "EndpointConfig": {"IPAMConfig": {}}}),
+            ("volumes", "connect", "volume", {"container": "web"}),
+            ("containers", "history", "web", {}),
+            ("networks", "file", "network", {}),
+        )
+        with patch.object(manager, "_integration_request") as request:
+            for resource, action, identifier, body in cases:
+                with self.subTest(resource=resource, action=action, body=body), self.assertRaises(ValueError):
+                    manager._integration_api({
+                        "provider": "portainer", "action": action, "resource": resource,
+                        "endpoint_id": 2, "token": "ptr_key", "id": identifier, "body": body,
+                    })
+            request.assert_not_called()
+
+    def test_portainer_refuses_membership_changes_on_non_local_bridge_networks(self):
+        for network in (
+            {"Driver": "host", "Scope": "local"}, {"Driver": "overlay", "Scope": "swarm"},
+            {"Driver": "macvlan", "Scope": "local"}, {"Driver": "bridge", "Scope": "swarm"}, {},
+        ):
+            for action in ("connect", "disconnect"):
+                with self.subTest(network=network, action=action), patch.object(
+                    manager, "_integration_request", return_value=network
+                ) as request, self.assertRaisesRegex(ValueError, "local bridge"):
+                    manager._integration_api({
+                        "provider": "portainer", "action": action, "resource": "networks",
+                        "endpoint_id": 2, "token": "ptr_key", "id": "network", "body": {"container": "web"},
+                    })
+                request.assert_called_once()
+
+    def test_portainer_network_check_failure_never_attempts_a_connection(self):
+        for response, error in (([], None), (None, RuntimeError("API unavailable"))):
+            with self.subTest(response=response), patch.object(
+                manager, "_integration_request", return_value=response, side_effect=error
+            ) as request, self.assertRaises(RuntimeError):
+                manager._integration_api({
+                    "provider": "portainer", "action": "connect", "resource": "networks",
+                    "endpoint_id": 2, "token": "ptr_key", "id": "network", "body": {"container": "web"},
+                })
+            request.assert_called_once()
+
+    def test_portainer_rejects_malformed_stack_files_and_invalid_stack_ids(self):
+        for response in (None, {}, {"StackFileContent": False}, {"StackFileContent": []}):
+            with self.subTest(response=response), patch.object(
+                manager, "_integration_request", return_value=response
+            ), self.assertRaisesRegex(RuntimeError, "invalid stack file"):
+                manager._integration_api({
+                    "provider": "portainer", "action": "file", "resource": "stacks",
+                    "endpoint_id": 2, "token": "ptr_key", "id": 7,
+                })
+        with patch.object(manager, "_integration_request") as request:
+            for identifier in (True, 0, "../7"):
+                with self.subTest(identifier=identifier), self.assertRaises(ValueError):
+                    manager._integration_api({
+                        "provider": "portainer", "action": "file", "resource": "stacks",
+                        "endpoint_id": 2, "token": "ptr_key", "id": identifier,
+                    })
+            request.assert_not_called()
+
     def test_nginx_proxy_manager_authenticates_per_request_and_never_saves_password(self):
         manager.update_settings({"integrations": {"npm_url": "http://127.0.0.1:81"}})
         with patch.object(manager, "_integration_request", side_effect=[{"token": "temporary"}, [{"id": 8}]]) as request:
