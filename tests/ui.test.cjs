@@ -395,9 +395,9 @@ test("Infrastructure API URLs are saved separately from authentication secrets",
   } finally { ui.dom.window.close(); }
 });
 
-test("Infrastructure routes reuse Cockpit's origin and preserve full URLs and empty settings", async () => {
+test("Portainer API stays local while NPM routes reuse Cockpit's origin", async () => {
   let integrations = {
-    portainer_url: "https://server.example:9090/portainer",
+    portainer_url: "http://127.0.0.1:9000",
     npm_url: "https://server.example:9090/nginx",
   };
   const ui = await loadUi({
@@ -409,26 +409,53 @@ test("Infrastructure routes reuse Cockpit's origin and preserve full URLs and em
   try {
     ui.document.querySelector('[data-tab="settings"]').click();
     let form = ui.document.querySelector("#integrationSettingsForm");
-    assert.equal(form.elements.portainer_url.value, "/portainer");
+    assert.equal(form.elements.portainer_url.value, "http://127.0.0.1:9000");
     assert.equal(form.elements.npm_url.value, "/nginx");
     assert.match(ui.document.querySelector("#integrationAddressHint").textContent, /https:\/\/server.example:9090/);
-    form.elements.portainer_url.value = " /services/containers/ ";
+    form.elements.portainer_url.value = "/manage-docker/";
+    assert.equal(form.checkValidity(), false);
+    form.elements.portainer_url.value = "http://127.0.0.1:9000";
     form.elements.npm_url.value = "/services/proxy/";
     assert.equal(form.checkValidity(), true);
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     assert.deepEqual(integrations, {
-      portainer_url: "https://server.example:9090/services/containers/",
+      portainer_url: "http://127.0.0.1:9000",
       npm_url: "https://server.example:9090/services/proxy/",
     });
     form = ui.document.querySelector("#integrationSettingsForm");
-    assert.equal(form.elements.portainer_url.value, "/services/containers/");
+    assert.equal(form.elements.portainer_url.value, "http://127.0.0.1:9000");
     assert.equal(form.elements.npm_url.value, "/services/proxy/");
     form.elements.portainer_url.value = "";
     form.elements.npm_url.value = "http://127.0.0.1:81";
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
     assert.deepEqual(integrations, { portainer_url: "", npm_url: "http://127.0.0.1:81" });
+  } finally { ui.dom.window.close(); }
+});
+
+test("Portainer browser navigation keeps its public route separate from the loopback API", async () => {
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
+    integration: (record) => {
+      const request = JSON.parse(record.input);
+      return { data: request.resource === "endpoints" ? [{ Id: 2, Name: "local" }] : [] };
+    },
+  }, undefined, "https://stuserver.online/cockpit/app-manager/index.html");
+  try {
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    const link = ui.document.querySelector('#integrationPanel a[href="/manage-docker/"]');
+    assert.equal(link.href, "https://stuserver.online/manage-docker/");
+    const form = ui.document.querySelector('[data-integration-connect="portainer"]');
+    form.elements.token.value = "ptr_local-key";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const requests = ui.calls.filter((record) => record.command === "integration");
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every((record) => record.values.length === 0));
+    assert.ok(requests.every((record) => JSON.parse(record.input).token === "ptr_local-key"));
+    assert.ok(requests.every((record) => !record.input.includes("stuserver.online")));
+    assert.equal(ui.document.querySelector('#integrationPanel a[href="/manage-docker/"]').href, link.href);
   } finally { ui.dom.window.close(); }
 });
 

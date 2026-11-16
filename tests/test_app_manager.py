@@ -593,6 +593,65 @@ class AppManagerTests(unittest.TestCase):
                 "endpoint_id": 1, "token": "ptr_private-api-key",
             })
 
+    def test_portainer_default_endpoints_use_loopback_and_api_key_without_browser_cookies(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        response.read.return_value = b'[{"Id":2,"Name":"local"}]'
+        opener = Mock()
+        opener.open.return_value = response
+        with patch.object(manager.urllib.request, "build_opener", return_value=opener) as build_opener:
+            result = manager._integration_api({
+                "provider": "portainer", "action": "list", "resource": "endpoints", "token": "ptr_private-key",
+            })
+        self.assertEqual(result["data"], [{"Id": 2, "Name": "local"}])
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:9000/api/endpoints")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_header("X-api-key"), "ptr_private-key")
+        self.assertIsNone(request.get_header("Cookie"))
+        self.assertIsNone(request.get_header("Authorization"))
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 15)
+        self.assertEqual(build_opener.call_args.args[0].proxies, {})
+        self.assertIsInstance(build_opener.call_args.args[1], manager._NoRedirectHandler)
+
+    def test_portainer_obsolete_browser_routes_use_local_backend_api(self):
+        for old_url in (
+            "https://stuserver.online/manage-docker/",
+            "https://stuserver.online/portainer",
+            "https://stuserver.online:443/manage-docker",
+            "http://127.0.0.1:9000/manage-docker",
+            "http://127.0.0.1:9000/portainer/",
+            "http://localhost:9000/portainer",
+        ):
+            with self.subTest(old_url=old_url):
+                config = manager.get_config()
+                config["integrations"] = {"portainer_url": old_url, "npm_url": "http://127.0.0.1:81"}
+                manager.write_json(Path(manager.DEFAULT_CONFIG_PATH), config)
+                with patch.object(manager, "_integration_request", return_value=[{"Id": 2}]) as request:
+                    manager._integration_api({
+                        "provider": "portainer", "action": "list", "resource": "endpoints", "token": "ptr_key",
+                    })
+                request.assert_called_once_with(
+                    "http://127.0.0.1:9000", "api/endpoints", token="ptr_key", api_key=True,
+                )
+                manager.update_settings({})
+                saved = json.loads(Path(manager.DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
+                self.assertEqual(saved["integrations"], {
+                    "portainer_url": "http://127.0.0.1:9000", "npm_url": "http://127.0.0.1:81",
+                })
+
+    def test_portainer_default_is_used_when_existing_config_has_no_portainer_setting(self):
+        manager.write_json(Path(manager.DEFAULT_CONFIG_PATH), {"integrations": {"npm_url": "http://127.0.0.1:81"}})
+        with patch.object(manager, "_integration_request", return_value=[]) as request:
+            for resource in ("endpoints", "containers", "stacks", "images", "volumes", "networks", "info"):
+                with self.subTest(resource=resource):
+                    manager._integration_api({
+                        "provider": "portainer", "action": "list", "resource": resource,
+                        "endpoint_id": 2, "token": "ptr_key",
+                    })
+                    self.assertEqual(request.call_args.args[0], "http://127.0.0.1:9000")
+
     def test_portainer_container_delete_uses_the_docker_delete_endpoint(self):
         manager.update_settings({"integrations": {"portainer_url": "https://portainer.example"}})
         with patch.object(manager, "_integration_request", return_value=None) as request:

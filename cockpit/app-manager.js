@@ -579,6 +579,7 @@
       </aside>
       <section class="am-surface am-integration-workspace">
         <div class="am-integration-workspace__heading"><div><p class="am-integration-eyebrow">SERVICE CONSOLE</p><h3>${serviceName}</h3><span class="am-field-hint">${escapeHtml(configured || "")}</span></div>
+          ${provider === "portainer" ? '<a class="am-button am-button--quiet" href="/manage-docker/" target="_blank" rel="noopener noreferrer">Open Portainer</a>' : ""}
           <span class="am-status-pill" data-status="${isConnected ? "running" : configured ? "stopped" : "unknown"}">${isConnected ? "Connected for this session" : configured ? "Needs connection" : "Not configured"}</span>
         </div>${panelContent}
       </section>
@@ -793,15 +794,16 @@
         <div class="am-surface-heading">
           <div>
             <h3>Infrastructure APIs</h3>
-            <p>Using the same address as Cockpit? Enter only each service's route. API keys and passwords are requested when you connect and are kept in memory for this Cockpit page.</p>
+            <p>Portainer API calls go directly to the local service, not through the browser's Cloudflare route. API keys and passwords are requested when you connect and are kept in memory for this Cockpit page.</p>
           </div>
         </div>
         <form id="integrationSettingsForm" class="am-settings-form">
           <div class="am-form-grid">
-            <label for="settingPortainerUrl">Portainer route or full URL<input id="settingPortainerUrl" name="portainer_url" type="text" inputmode="url" placeholder="/portainer/" aria-describedby="integrationAddressHint" value="${escapeHtml(serviceAddress(config.integrations?.portainer_url))}"></label>
+            <label for="settingPortainerUrl">Portainer backend API URL<input id="settingPortainerUrl" name="portainer_url" type="url" inputmode="url" placeholder="http://127.0.0.1:9000" aria-describedby="portainerApiHint" value="${escapeHtml(config.integrations?.portainer_url || "")}"></label>
             <label for="settingNpmUrl">Nginx Proxy Manager route or full URL<input id="settingNpmUrl" name="npm_url" type="text" inputmode="url" placeholder="/nginx/" aria-describedby="integrationAddressHint" value="${escapeHtml(serviceAddress(config.integrations?.npm_url))}"></label>
           </div>
-          <p id="integrationAddressHint" class="am-field-hint">Routes starting with / use <strong>${escapeHtml(window.location.origin)}</strong>, including its port. Enter your actual service routes, not /api; API paths are added automatically. A full HTTP(S) URL also works. Leave blank to disconnect a service.</p>
+          <p id="portainerApiHint" class="am-field-hint">For Portainer on this Ubuntu host, use http://127.0.0.1:9000 with no /manage-docker, /portainer, or /api suffix. Open Portainer uses /manage-docker/ in your browser; the backend uses the local API address.</p>
+          <p id="integrationAddressHint" class="am-field-hint">Nginx Proxy Manager routes starting with / use <strong>${escapeHtml(window.location.origin)}</strong>, including its port. The route must allow backend API access without browser login cookies. A full HTTP(S) API URL reachable from the host also works. Do not include /api; API paths are added automatically. Leave blank to disconnect a service.</p>
           <p class="am-field-hint">Use the address reachable from this Ubuntu host. HTTPS certificates are verified and redirects are not followed. HTTP does not encrypt credentials; use it only on a trusted local network.</p>
           <div class="am-form-actions"><button type="submit" class="am-button am-button--primary">Save API URLs</button></div>
         </form>
@@ -827,7 +829,7 @@
       void runOperation(async () => {
         for (const key of Object.keys(integrations)) {
           const value = integrations[key].trim();
-          integrations[key] = value.startsWith("/") && !value.startsWith("//")
+          integrations[key] = key === "npm_url" && value.startsWith("/") && !value.startsWith("//")
             ? `${window.location.origin}${value}` : value;
         }
         const previous = state.settings.integrations || {};

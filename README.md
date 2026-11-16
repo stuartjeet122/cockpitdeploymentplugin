@@ -103,7 +103,41 @@ Set the Portainer and NPM base URLs in **Settings → Infrastructure APIs**, the
 
 To remember a Portainer key, save the connection form's **Password manager account** and **API key** in your browser's password manager. Select that entry to fill the key on your next visit; the account name includes the configured Portainer URL to distinguish it from your Cockpit login or another Portainer instance. Browser/password-manager support and save prompts vary, so use the manager's manual save/fill controls if needed. App Manager does not persist the key in server files, local storage, or session storage. Delete or update the password-manager entry when revoking a key or changing the service URL. NPM's username/password fields also support normal password-manager autofill.
 
-When both services share Cockpit's address, enter only their actual routes, for example `/portainer/` and `/nginx/`. App Manager uses the current page's scheme, hostname, and port: Cockpit at `https://server.example:9090` with `/portainer/` saves `https://server.example:9090/portainer/`. Same-address URLs are displayed as routes when reopening Settings. Full HTTP(S) URLs remain supported for services at other addresses; leave a field blank to remove its connection. Enter the service base route, not `/api`; the backend appends the API paths. The routes must already proxy the service APIs and be reachable from the Ubuntu host; this setting does not create or change reverse-proxy routes.
+Portainer's backend API defaults to **`http://127.0.0.1:9000`** on the Ubuntu host. Do not append `/manage-docker`, `/portainer`, or `/api`: the authenticated environment request goes directly to `http://127.0.0.1:9000/api/endpoints` with the `X-API-Key` header. It does not go through Nginx or Cloudflare and does not use browser cookies. **Open Portainer** separately opens `/manage-docker/` in your browser. Keep Portainer's HTTP listener bound to loopback; do not expose port 9000 publicly.
+
+Existing `https://stuserver.online/manage-docker` and `https://stuserver.online/portainer` settings (including trailing slashes) are normalized to the local API address when loaded. The same browser prefixes on `http://127.0.0.1:9000` or `http://localhost:9000` are stripped. **Save API URLs** persists the corrected address; other explicitly configured service URLs and a blank (disabled) setting are preserved. Portainer requires a full backend API URL, not a browser-relative route.
+
+Nginx Proxy Manager still accepts its actual route, for example `/nginx/`, or a full HTTP(S) API base URL reachable from the Ubuntu host. A route uses Cockpit's current scheme, hostname, and port; it must allow backend API requests without a browser login session. Same-address NPM URLs are displayed as routes when reopening Settings. Leave a field blank to remove its connection. Do not include `/api`; the backend appends the API paths. These settings do not create or change reverse-proxy routes.
+
+After updating the checkout on the Ubuntu host, install the native plugin and restart Cockpit (this disconnects existing Cockpit sessions, not managed applications):
+
+```bash
+sudo bash ./scripts/install.sh
+sudo systemctl restart cockpit.socket cockpit.service
+```
+
+Verify the authenticated local endpoint on that host without putting the key in command arguments, shell history, or saved files:
+
+```bash
+python3 - <<'PY'
+import getpass
+import urllib.request
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+request = urllib.request.Request(
+    "http://127.0.0.1:9000/api/endpoints",
+    headers={"X-API-Key": getpass.getpass("Portainer API key: ")},
+)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+with opener.open(request, timeout=15) as response:
+    print(f"HTTP {response.status}")
+PY
+```
+
+Expect `HTTP 200`. An unauthenticated `/api/status` success only proves reachability, not the key's authorization to `/api/endpoints`. No TLS verification is disabled; explicitly configured HTTPS service URLs continue to use normal certificate verification.
 
 ### HTTP 401/403 or API redirects
 

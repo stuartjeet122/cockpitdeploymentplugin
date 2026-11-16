@@ -60,6 +60,7 @@ DEFAULT_PRODUCTION_ROOT = "/opt/webapps"
 DEFAULT_SOURCE_ROOT = f"{DEFAULT_STATE_ROOT}/sources"
 DEFAULT_LOG_ROOT = "/var/log/cockpit-app-manager"
 DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
+DEFAULT_PORTAINER_API_URL = "http://127.0.0.1:9000"
 PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
 PLUGIN_REPOSITORY_BRANCH = "main"
 PLUGIN_UPDATE_USER = "nobody"
@@ -111,7 +112,7 @@ def _default_config() -> Dict[str, Any]:
         "max_concurrent_builds": 1,
         "log_root": DEFAULT_LOG_ROOT,
         "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl",
-        "integrations": {"portainer_url": "", "npm_url": ""},
+        "integrations": {"portainer_url": DEFAULT_PORTAINER_API_URL, "npm_url": ""},
     }
 
 
@@ -137,6 +138,18 @@ def _validate_integration_url(value: Any, label: str) -> str:
         raise ValueError(f"{label} URL has an invalid port") from exc
     if port == 0:
         raise ValueError(f"{label} URL has an invalid port")
+    return value
+
+
+def _portainer_api_url(value: Any) -> str:
+    value = _validate_integration_url(value, "Portainer")
+    parsed = urlsplit(value)
+    if parsed.path in {"/manage-docker", "/portainer"} and (
+        (parsed.hostname == "stuserver.online" and parsed.port in {None, 443} and parsed.scheme == "https")
+        or (parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == 9000 and parsed.scheme == "http")
+    ):
+        # These are browser proxy prefixes, not part of the local Portainer API.
+        return DEFAULT_PORTAINER_API_URL
     return value
 
 
@@ -225,7 +238,7 @@ def get_config() -> Dict[str, Any]:
     if not isinstance(integrations, dict) or set(integrations) - {"portainer_url", "npm_url"}:
         raise ValueError("integrations must contain only Portainer and Nginx Proxy Manager URLs")
     config["integrations"] = {
-        "portainer_url": _validate_integration_url(integrations.get("portainer_url", ""), "Portainer"),
+        "portainer_url": _portainer_api_url(integrations.get("portainer_url", DEFAULT_PORTAINER_API_URL)),
         "npm_url": _validate_integration_url(integrations.get("npm_url", ""), "Nginx Proxy Manager"),
     }
     config["release_retention"] = 1
@@ -2342,7 +2355,7 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("integrations must contain only portainer_url and npm_url")
         current_integrations = config["integrations"]
         update["integrations"] = {
-            "portainer_url": _validate_integration_url(integrations.get("portainer_url", current_integrations["portainer_url"]), "Portainer"),
+            "portainer_url": _portainer_api_url(integrations.get("portainer_url", current_integrations["portainer_url"])),
             "npm_url": _validate_integration_url(integrations.get("npm_url", current_integrations["npm_url"]), "Nginx Proxy Manager"),
         }
     if "source_root" in update:
