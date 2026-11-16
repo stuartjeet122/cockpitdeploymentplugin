@@ -642,6 +642,65 @@ class AppManagerTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[1].kwargs["token"], "temporary")
         self.assertNotIn("private-password", Path(manager.DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
 
+    def test_integration_access_errors_explain_service_and_proxy_denials_without_secrets(self):
+        cases = (
+            (403, "api/endpoints", {}, ("Portainer", "owner has access"), False),
+            (403, "api/endpoints/2/docker/containers/json?all=true", {"CF-Ray": "request-id"},
+             ("Portainer", "passed through Cloudflare", "may have denied"), True),
+            (401, "api/tokens", {}, ("Nginx Proxy Manager", "NPM username/password"), False),
+            (403, "api/nginx/proxy-hosts", {"Server": "cloudflare"},
+             ("Nginx Proxy Manager", "passed through Cloudflare"), True),
+            (302, "api/endpoints", {"Location": "https://login.example/?secret=private-password"},
+             ("Portainer", "redirects are not followed"), False),
+        )
+        for status, path, headers, expected, cloudflare in cases:
+            with self.subTest(status=status, path=path, headers=headers):
+                error = urllib.error.HTTPError(
+                    "https://server.example/portainer/" + path, status, "Denied", headers,
+                    io.BytesIO(b'{"message":"ptr_private-key private-password"}'),
+                )
+                opener = Mock()
+                opener.open.side_effect = error
+                with patch.object(manager.urllib.request, "build_opener", return_value=opener):
+                    with self.assertRaises(RuntimeError) as raised:
+                        manager._integration_request(
+                            "https://server.example/service", path, method="POST",
+                            token="ptr_private-key", api_key=True, payload={"secret": "private-password"},
+                        )
+                message = str(raised.exception)
+                self.assertIn(f"HTTP {status}", message)
+                self.assertIn(f"POST https://server.example/service/{path}", message)
+                self.assertIn("do not share your browser", message)
+                self.assertEqual("passed through Cloudflare" in message, cloudflare)
+                for text in expected:
+                    self.assertIn(text, message)
+                self.assertNotIn("ptr_private-key", message)
+                self.assertNotIn("private-password", message)
+                self.assertNotIn("login.example", message)
+                opener.open.assert_called_once()
+
+    def test_integration_forbidden_cli_response_remains_structured_json(self):
+        manager.update_settings({"integrations": {"portainer_url": "https://server.example/portainer"}})
+        payload = {
+            "provider": "portainer", "action": "list", "resource": "endpoints", "token": "ptr_private-key",
+        }
+        error = urllib.error.HTTPError(
+            "https://server.example/portainer/api/endpoints", 403, "Forbidden", {}, None,
+        )
+        opener = Mock()
+        opener.open.side_effect = error
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(manager.urllib.request, "build_opener", return_value=opener), patch(
+            "sys.stdin", io.StringIO(json.dumps(payload))
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = manager.main(["integration"])
+        self.assertEqual(code, 1)
+        result = json.loads(stdout.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertIn("HTTP 403", result["error"])
+        self.assertIn("RuntimeError", stderr.getvalue())
+        self.assertNotIn("ptr_private-key", stdout.getvalue() + stderr.getvalue())
+
     def test_nginx_proxy_manager_rejects_certificate_updates(self):
         manager.update_settings({"integrations": {"npm_url": "http://127.0.0.1:81"}})
         with self.assertRaisesRegex(ValueError, "does not support editing certificates"):

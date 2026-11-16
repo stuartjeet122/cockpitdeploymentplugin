@@ -448,6 +448,9 @@ test("Infrastructure connects to Portainer with a session-only API key and contr
   try {
     ui.document.querySelector('[data-tab="infrastructure"]').click();
     const form = ui.document.querySelector('[data-integration-connect="portainer"]');
+    assert.equal(form.elements.username.value, "Portainer API key: https://portainer.example");
+    assert.equal(form.elements.username.autocomplete, "username");
+    assert.equal(form.elements.token.autocomplete, "current-password");
     form.elements.token.value = "ptr_session-only-secret";
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
@@ -463,6 +466,27 @@ test("Infrastructure connects to Portainer with a session-only API key and contr
       .map((record) => JSON.parse(record.input)).find((request) => request.action === "stop");
     assert.equal(stopRequest.id, "container-1");
     assert.equal(stopRequest.endpoint_id, "2");
+  } finally { ui.dom.window.close(); }
+});
+
+test("Infrastructure shows access-denial guidance and clears a rejected API key", async () => {
+  const message = "Portainer API request failed with HTTP 403. Check the API key owner's environment permissions.";
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "https://portainer.example", npm_url: "" } } },
+    integration: { ok: false, error: message },
+  });
+  try {
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    const form = ui.document.querySelector('[data-integration-connect="portainer"]');
+    form.elements.token.value = "ptr_rejected-key";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.equal(ui.document.querySelector("#appManagerError").textContent, message);
+    assert.equal(ui.document.querySelector("#appManagerError").classList.contains("hidden"), false);
+    assert.equal(ui.document.querySelector('[data-integration-connect="portainer"]').elements.token.value, "");
+    assert.equal(ui.window.localStorage.length, 0);
+    assert.equal(ui.window.sessionStorage.length, 0);
+    assert.equal(ui.document.body.textContent.includes("ptr_rejected-key"), false);
   } finally { ui.dom.window.close(); }
 });
 

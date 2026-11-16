@@ -2429,6 +2429,32 @@ def _integration_request(
             except json.JSONDecodeError:
                 return text
     except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403, 301, 302, 303, 307, 308}:
+            response_headers = exc.headers or {}
+            cloudflare = (
+                "cloudflare" in response_headers.get("Server", "").lower()
+                or bool(response_headers.get("CF-Ray"))
+                or bool(response_headers.get("CF-Mitigated"))
+            )
+            service = "Portainer" if path.startswith("api/endpoints") or path.startswith("api/stacks") else "Nginx Proxy Manager"
+            message = f"{service} API request failed with HTTP {exc.code} ({method} {base_url.rstrip('/')}/{path}). "
+            if cloudflare:
+                message += (
+                    "The response passed through Cloudflare; Cloudflare Access/WAF or the upstream service may have denied it. "
+                    "Check Cloudflare security events and the service's access logs. "
+                )
+            if exc.code in {301, 302, 303, 307, 308}:
+                message += "The API redirected instead of responding directly; redirects are not followed. "
+            elif service == "Portainer":
+                message += "Check that the API key is valid and its owner has access to the selected environment and action. "
+            else:
+                message += "Check the NPM username/password and the account's permissions. "
+            message += (
+                "Backend requests do not share your browser's Cockpit or Cloudflare Access login cookies. "
+                "Use the service's direct API URL reachable from the Ubuntu host, or configure authorized API access "
+                "through the existing proxy. Do not disable TLS verification or make the service public."
+            )
+            raise RuntimeError(message) from None
         raise RuntimeError(f"Integration API request failed with HTTP {exc.code}") from None
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach integration API: {exc.reason}") from None

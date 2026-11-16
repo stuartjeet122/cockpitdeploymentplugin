@@ -540,11 +540,12 @@
       </div>`;
     } else if (!isConnected) {
       panelContent = provider === "portainer" ? `
-        <form class="am-integration-connect" data-integration-connect="portainer">
+        <form id="portainerConnectionForm" class="am-integration-connect" data-integration-connect="portainer" autocomplete="on">
           <span class="am-integration-eyebrow">PORTAINER API</span>
           <h3>Connect to Docker</h3>
-          <p>Enter a Portainer API key. It stays in this page's memory and is cleared when you reload or close Cockpit.</p>
-          <label>API key<input name="token" type="password" autocomplete="off" required maxlength="4096" placeholder="ptr_…"></label>
+          <p>Save this account and API key in your browser's password manager, then select that saved entry next time. App Manager itself keeps the key only for this page session, not in server files.</p>
+          <label>Password manager account<input name="username" type="text" autocomplete="username" value="${escapeHtml(`Portainer API key: ${configured}`)}" readonly></label>
+          <label>API key<input name="token" type="password" autocomplete="current-password" required maxlength="4096" placeholder="ptr_…"></label>
           <button type="submit" class="am-button am-button--primary">Connect</button>
         </form>` : `
         <form class="am-integration-connect" data-integration-connect="npm">
