@@ -3942,6 +3942,76 @@ class FrameworkAdapterTests(unittest.TestCase):
 
 
 class InfrastructureConfigurationTests(unittest.TestCase):
+    def _retire_legacy_plugins(self, *directories: Path) -> subprocess.CompletedProcess:
+        installer = (Path(__file__).resolve().parent.parent / "scripts" / "install.sh").read_text(encoding="utf-8")
+        migration = installer.split("retire_legacy_plugins() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        self.assertLess(installer.index("\ninstall_files\n"), installer.index("\nretire_legacy_plugins\n"))
+        return subprocess.run(
+            [sys.executable, "-", *map(str, directories)], input=migration,
+            capture_output=True, text=True, timeout=10,
+        )
+
+    def _legacy_plugin(self, root: Path, name: str, label: str, order: int) -> Path:
+        directory = root / name
+        directory.mkdir()
+        (directory / "manifest.json").write_text(json.dumps({
+            "name": name, "menu": {name: {"label": label, "path": "index.html", "order": order}},
+        }), encoding="utf-8")
+        (directory / f"{name}.js").write_text(
+            f'// {label} Cockpit UI loaded\nconst BACKEND = "/usr/libexec/cockpit/app-manager/app-manager";\n',
+            encoding="utf-8",
+        )
+        (directory / "index.html").write_text("legacy page", encoding="utf-8")
+        (directory / f"{name}.css").write_text("legacy styles", encoding="utf-8")
+        return directory
+
+    def test_upgrade_retires_both_legacy_plugins_without_removing_other_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            docker = self._legacy_plugin(root, "docker-manager", "Docker Manager", 61)
+            nginx = self._legacy_plugin(root, "nginx-manager", "Nginx Manager", 62)
+            for directory in (docker, nginx):
+                (directory / "keep.txt").write_text("unrelated", encoding="utf-8")
+            result = self._retire_legacy_plugins(docker, nginx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(result.stdout.count("Retired legacy"), 2)
+            for directory in (docker, nginx):
+                self.assertEqual([path.name for path in directory.iterdir()], ["keep.txt"])
+            repeated = self._retire_legacy_plugins(docker, nginx)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertEqual((docker / "keep.txt").read_text(encoding="utf-8"), "unrelated")
+
+    def test_upgrade_preserves_unverified_plugins_and_missing_installations(self):
+        for changed in ("manifest.json", "nginx-manager.js"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                nginx = self._legacy_plugin(root, "nginx-manager", "Nginx Manager", 62)
+                (nginx / changed).write_text("unrelated plugin", encoding="utf-8")
+                before = {path.name: path.read_bytes() for path in nginx.iterdir()}
+                result = self._retire_legacy_plugins(root / "absent", nginx)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Leaving unverified legacy plugin untouched", result.stderr)
+                self.assertEqual({path.name: path.read_bytes() for path in nginx.iterdir()}, before)
+
+    def test_upgrade_preserves_symlinked_legacy_assets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            docker = self._legacy_plugin(root, "docker-manager", "Docker Manager", 61)
+            nginx = self._legacy_plugin(root, "nginx-manager", "Nginx Manager", 62)
+            outside = root / "outside.html"
+            outside.write_text("unrelated site", encoding="utf-8")
+            (nginx / "index.html").unlink()
+            try:
+                (nginx / "index.html").symlink_to(outside)
+            except OSError as exc:
+                self.skipTest(f"Symlinks unavailable: {exc}")
+            result = self._retire_legacy_plugins(docker, nginx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("legacy assets are not regular files", result.stderr)
+            self.assertTrue((nginx / "manifest.json").exists())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "unrelated site")
+
     def _nginx_site_fixture(self, root: Path, contents: str) -> tuple[Path, Path, str]:
         config_root = root / "etc" / "nginx"
         site_path = config_root / "sites-available" / "stuserver"
@@ -3978,8 +4048,8 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         )
         self.assertFalse((cockpit_dir / "nginx-manager").exists())
         self.assertFalse((cockpit_dir / "docker-manager").exists())
-        self.assertNotIn("NGINX_MANAGER_PLUGIN_DEST", installer)
-        self.assertNotIn("DOCKER_MANAGER_PLUGIN_DEST", installer)
+        self.assertNotIn('$APP_DIR/cockpit/nginx-manager/', installer)
+        self.assertNotIn('$APP_DIR/cockpit/docker-manager/', installer)
         self.assertNotIn("nginx-site-save", installer)
         self.assertNotIn("docker-install", installer)
         self.assertIn(

@@ -237,8 +237,41 @@ PY
   mv -f -- "$version_tmp" "$STATE_ROOT/plugin-version.json"
 }
 
+retire_legacy_plugins() {
+  python3 - "${DOCKER_MANAGER_PLUGIN_DEST:-${PLUGIN_DEST%/*}/docker-manager}" "${NGINX_MANAGER_PLUGIN_DEST:-${PLUGIN_DEST%/*}/nginx-manager}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+for raw_path, name, label in zip(sys.argv[1:], ("docker-manager", "nginx-manager"), ("Docker Manager", "Nginx Manager")):
+  directory = Path(raw_path)
+  if not directory.exists() and not directory.is_symlink():
+    continue
+  try:
+    if any(path.is_symlink() for path in (directory, *directory.parents)):
+      raise ValueError("installation path contains a symlink")
+    files = [directory / filename for filename in ("manifest.json", "index.html", f"{name}.js", f"{name}.css")]
+    if any(path.is_symlink() or (path.exists() and not path.is_file()) for path in files):
+      raise ValueError("legacy assets are not regular files")
+    manifest = json.loads(files[0].read_text(encoding="utf-8"))
+    expected_menu = {"label": label, "path": "index.html", "order": 61 if name == "docker-manager" else 62}
+    if not isinstance(manifest, dict) or manifest.get("name") != name or manifest.get("menu") != {name: expected_menu}:
+      raise ValueError("manifest does not identify this repository's legacy plugin")
+    script = files[2].read_text(encoding="utf-8")
+    if not script.startswith(f"// {label} Cockpit UI loaded\n") or 'const BACKEND = "/usr/libexec/cockpit/app-manager/app-manager";' not in script:
+      raise ValueError("JavaScript does not identify this repository's legacy backend")
+  except (OSError, UnicodeError, ValueError) as exc:
+    print(f"Leaving unverified legacy plugin untouched: {directory}: {exc}", file=sys.stderr)
+    continue
+  for path in files:
+    path.unlink(missing_ok=True)
+  print(f"Retired legacy {label} pages; use App Manager > Infrastructure.")
+PY
+}
+
 preflight
 install_files
+retire_legacy_plugins
 
 printf '\nCockpit App Manager installed.\n'
 printf 'Plugin directory: %s\n' "$PLUGIN_DEST"
