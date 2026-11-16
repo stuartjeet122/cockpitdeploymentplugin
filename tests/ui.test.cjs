@@ -358,14 +358,150 @@ async function settle(window) {
   for (let turn = 0; turn < 4; turn += 1) await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
-test("applications are the initial view and routing is configured separately", async () => {
+test("applications are the initial view and deployed apps offer separate NPM routing", async () => {
   const ui = await loadUi();
   try {
     assert.equal(ui.document.querySelector('[data-tab="websites"]').getAttribute("aria-selected"), "true");
     assert.equal(ui.document.querySelectorAll(".am-app-card").length, 2);
     assert.equal(ui.document.querySelectorAll(".am-app-route a").length, 0);
-    assert.match(ui.document.querySelector("#appsTableContainer").textContent, /configure routing in Nginx Manager/i);
+    assert.match(ui.document.querySelector("#appsTableContainer").textContent, /Create NPM route/);
     assert.equal(ui.document.querySelector('[data-action="start"][data-id="docs"]'), null);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Infrastructure API URLs are saved separately from authentication secrets", async () => {
+  let integrations = { portainer_url: "", npm_url: "" };
+  const ui = await loadUi({
+    settings: (record) => {
+      if (record.values.length) integrations = JSON.parse(record.values[0]).integrations;
+      return { config: { integrations } };
+    },
+  });
+  try {
+    ui.document.querySelector('[data-tab="settings"]').click();
+    const form = ui.document.querySelector("#integrationSettingsForm");
+    form.elements.portainer_url.value = "https://portainer.example:9443";
+    form.elements.npm_url.value = "http://127.0.0.1:81";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const saved = ui.calls.filter((record) => record.command === "settings" && record.values.length)
+      .map((record) => JSON.parse(record.values[0])).pop();
+    assert.deepEqual(saved, { integrations: {
+      portainer_url: "https://portainer.example:9443", npm_url: "http://127.0.0.1:81",
+    } });
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    assert.match(ui.document.querySelector("#integrationPanel").textContent, /Portainer/);
+    assert.match(ui.document.querySelector("#integrationPanel").textContent, /Nginx Proxy Manager/);
+  } finally { ui.dom.window.close(); }
+});
+
+test("Infrastructure connects to Portainer with a session-only API key and controls containers", async () => {
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "https://portainer.example", npm_url: "" } } },
+    integration: (record) => {
+      const request = JSON.parse(record.input);
+      if (request.resource === "endpoints") return { provider: "portainer", data: [{ Id: 2, Name: "local", Status: "Up" }] };
+      if (request.action === "list") return { provider: "portainer", data: [{
+        Id: "container-1", Names: ["/web"], Image: "example/web:latest", State: "running",
+        Status: "Up 3 hours", Ports: [],
+      }] };
+      return { provider: "portainer", action: request.action, data: null };
+    },
+  });
+  try {
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    const form = ui.document.querySelector('[data-integration-connect="portainer"]');
+    form.elements.token.value = "ptr_session-only-secret";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const requests = ui.calls.filter((record) => record.command === "integration");
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every((record) => record.values.length === 0));
+    assert.ok(requests.every((record) => JSON.parse(record.input).token === "ptr_session-only-secret"));
+    assert.match(ui.document.querySelector("#integrationPanel").textContent, /web/);
+    assert.equal(ui.document.querySelector('#integrationPanel input[type="password"]'), null);
+    ui.document.querySelector('[data-resource-action="stop"]').click();
+    await settle(ui.window);
+    const stopRequest = ui.calls.filter((record) => record.command === "integration")
+      .map((record) => JSON.parse(record.input)).find((request) => request.action === "stop");
+    assert.equal(stopRequest.id, "container-1");
+    assert.equal(stopRequest.endpoint_id, "2");
+  } finally { ui.dom.window.close(); }
+});
+
+test("Infrastructure edits Nginx Proxy Manager hosts through its resource API", async () => {
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "", npm_url: "http://127.0.0.1:81" } } },
+    integration: (record) => {
+      const request = JSON.parse(record.input);
+      if (request.action === "list") return { provider: "npm", data: [{
+        id: 8, domain_names: ["app.example.com"], forward_host: "127.0.0.1",
+        forward_port: 8100, enabled: true,
+      }] };
+      return { provider: "npm", action: request.action, data: { id: 8 } };
+    },
+  });
+  try {
+    ui.document.querySelector('[data-tab="infrastructure"]').click();
+    ui.document.querySelector('[data-integration-provider="npm"]').click();
+    const form = ui.document.querySelector('[data-integration-connect="npm"]');
+    form.elements.username.value = "admin@example.com";
+    form.elements.password.value = "session-only-password";
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const connected = ui.calls.filter((record) => record.command === "integration")[0];
+    assert.equal(connected.values.length, 0);
+    assert.equal(JSON.parse(connected.input).credentials.password, "session-only-password");
+    const editor = ui.document.querySelector('[data-npm-update]');
+    const body = JSON.parse(editor.elements.body.value);
+    body.forward_port = 8111;
+    editor.elements.body.value = JSON.stringify(body);
+    editor.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const update = ui.calls.filter((record) => record.command === "integration")
+      .map((record) => JSON.parse(record.input)).find((request) => request.action === "update");
+    assert.equal(update.resource, "proxy-hosts");
+    assert.equal(update.id, "8");
+    assert.equal(update.body.forward_port, 8111);
+    assert.equal(update.credentials.password, "session-only-password");
+  } finally { ui.dom.window.close(); }
+});
+
+test("deployed applications open a quick NPM route form with their managed port", async () => {
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "", npm_url: "http://127.0.0.1:81" } } },
+    integration: (record) => {
+      const request = JSON.parse(record.input);
+      if (request.action === "list") return { provider: "npm", data: [] };
+      return { provider: "npm", action: request.action, data: { id: 12 } };
+    },
+  });
+  try {
+    ui.document.querySelector('#appsTableContainer [data-action="route"][data-id="portal"]').click();
+    assert.equal(ui.document.querySelector('[data-tab="infrastructure"]').getAttribute("aria-selected"), "true");
+    const connect = ui.document.querySelector('[data-integration-connect="npm"]');
+    connect.elements.username.value = "admin@example.com";
+    connect.elements.password.value = "session-only-password";
+    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+
+    const route = ui.document.querySelector("[data-npm-route]");
+    assert.ok(route);
+    assert.equal(route.elements.app_id.value, "portal");
+    assert.equal(route.elements.forward_port.value, "8100");
+    route.elements.domain_names.value = "app.example.com, www.example.com";
+    route.elements.forward_host.value = "127.0.0.1";
+    route.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+
+    const created = ui.calls.filter((record) => record.command === "integration")
+      .map((record) => JSON.parse(record.input)).find((request) => request.action === "create");
+    assert.equal(created.resource, "proxy-hosts");
+    assert.deepEqual(created.body.domain_names, ["app.example.com", "www.example.com"]);
+    assert.equal(created.body.forward_host, "127.0.0.1");
+    assert.equal(created.body.forward_port, 8100);
+    assert.equal(created.body.forward_scheme, "http");
+    assert.equal(created.body.allow_websocket_upgrade, true);
   } finally { ui.dom.window.close(); }
 });
 

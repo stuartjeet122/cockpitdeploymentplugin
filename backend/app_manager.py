@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 try:
     import fcntl
@@ -111,7 +111,33 @@ def _default_config() -> Dict[str, Any]:
         "max_concurrent_builds": 1,
         "log_root": DEFAULT_LOG_ROOT,
         "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl",
+        "integrations": {"portainer_url": "", "npm_url": ""},
     }
+
+
+def _validate_integration_url(value: Any, label: str) -> str:
+    if not isinstance(value, str) or "\0" in value or len(value) > 2048:
+        raise ValueError(f"{label} URL must be a valid HTTP(S) URL")
+    value = value.strip().rstrip("/")
+    if not value:
+        return ""
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"{label} URL must use HTTP(S) and must not contain credentials, a query, or a fragment")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{label} URL has an invalid port") from exc
+    if port == 0:
+        raise ValueError(f"{label} URL has an invalid port")
+    return value
 
 
 def _atomic_json_write(path: Path, payload: Any) -> None:
@@ -195,6 +221,13 @@ def get_config() -> Dict[str, Any]:
         raise ValueError("Configuration must contain a JSON object")
     config = _default_config()
     config.update(loaded)
+    integrations = config.get("integrations", {})
+    if not isinstance(integrations, dict) or set(integrations) - {"portainer_url", "npm_url"}:
+        raise ValueError("integrations must contain only Portainer and Nginx Proxy Manager URLs")
+    config["integrations"] = {
+        "portainer_url": _validate_integration_url(integrations.get("portainer_url", ""), "Portainer"),
+        "npm_url": _validate_integration_url(integrations.get("npm_url", ""), "Nginx Proxy Manager"),
+    }
     config["release_retention"] = 1
     # Registry location is fixed so configuration cannot redirect privileged writes.
     config["registry_path"] = DEFAULT_REGISTRY_PATH
@@ -2290,6 +2323,7 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         "command_timeout_seconds",
         "max_concurrent_builds",
         "min_free_disk_mb",
+        "integrations",
     }
     update = dict(payload)
     for key in update:
@@ -2302,6 +2336,15 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError(f"{key} must be a positive integer")
     if "default_branch" in update:
         update["default_branch"] = validate_branch(update["default_branch"])
+    if "integrations" in update:
+        integrations = update["integrations"]
+        if not isinstance(integrations, dict) or set(integrations) - {"portainer_url", "npm_url"}:
+            raise ValueError("integrations must contain only portainer_url and npm_url")
+        current_integrations = config["integrations"]
+        update["integrations"] = {
+            "portainer_url": _validate_integration_url(integrations.get("portainer_url", current_integrations["portainer_url"]), "Portainer"),
+            "npm_url": _validate_integration_url(integrations.get("npm_url", current_integrations["npm_url"]), "Nginx Proxy Manager"),
+        }
     if "source_root" in update:
         update["source_root"] = str(validate_allowed_path(update["source_root"], [DEFAULT_SOURCE_ROOT]))
     if "production_root" in update:
@@ -2347,6 +2390,200 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     with _file_lock(path.with_name(path.name + ".lock")):
         _atomic_json_write(path, merged)
     return {"ok": True, "config": get_config()}
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+def _integration_request(
+    base_url: str,
+    path: str,
+    *,
+    method: str = "GET",
+    token: Optional[str] = None,
+    api_key: bool = False,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Any:
+    url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["X-API-Key" if api_key else "Authorization"] = token if api_key else f"Bearer {token}"
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=15) as response:
+            raw = response.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError("Integration API response exceeded the 2 MiB limit")
+            if not raw:
+                return None
+            text = raw.decode("utf-8", errors="replace")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Integration API request failed with HTTP {exc.code}") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach integration API: {exc.reason}") from None
+
+
+def _positive_api_id(value: Any, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"A valid {label} ID is required")
+    if isinstance(value, int):
+        identifier = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]{1,20}", value):
+        identifier = int(value)
+    else:
+        raise ValueError(f"A valid {label} ID is required")
+    if identifier < 1:
+        raise ValueError(f"A valid {label} ID is required")
+    return identifier
+
+
+_PORTAINER_RESOURCES = {
+    "endpoints", "containers", "stacks", "images", "volumes", "networks", "info",
+}
+_NPM_RESOURCES = {
+    "proxy-hosts", "redirection-hosts", "dead-hosts", "streams",
+    "certificates", "access-lists",
+}
+_PORTAINER_CONTAINER_ACTIONS = {"start", "stop", "restart", "pause", "unpause", "kill", "remove", "inspect", "logs"}
+def _integration_api(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Integration request must be a JSON object")
+    provider = payload.get("provider")
+    action_name = payload.get("action")
+    resource = payload.get("resource")
+    config = get_config()
+    integrations = config["integrations"]
+
+    if provider == "portainer":
+        base_url = integrations["portainer_url"]
+        token = payload.get("token")
+        if not base_url:
+            raise ValueError("Configure the Portainer API URL in Settings first")
+        if (
+            not isinstance(token, str) or not token or token != token.strip()
+            or len(token) > 4096 or any(ord(character) < 33 or ord(character) > 126 for character in token)
+        ):
+            raise ValueError("Enter a valid Portainer API key or token")
+        api_key = token.startswith("ptr_")
+        endpoint_id: Optional[int] = None
+        if resource != "endpoints":
+            endpoint_id = _positive_api_id(payload.get("endpoint_id"), "Portainer environment")
+        if resource not in _PORTAINER_RESOURCES:
+            raise ValueError("Unsupported Portainer resource")
+        if action_name == "list":
+            if resource == "endpoints":
+                path = "api/endpoints"
+            elif resource == "stacks":
+                path = f"api/stacks?{urlencode({'endpointId': endpoint_id})}"
+            elif resource == "info":
+                path = f"api/endpoints/{endpoint_id}/docker/info"
+            elif resource == "containers":
+                path = f"api/endpoints/{endpoint_id}/docker/containers/json?all=true"
+            elif resource == "images":
+                path = f"api/endpoints/{endpoint_id}/docker/images/json"
+            elif resource == "volumes":
+                path = f"api/endpoints/{endpoint_id}/docker/volumes"
+            elif resource == "networks":
+                path = f"api/endpoints/{endpoint_id}/docker/networks"
+            else:
+                raise ValueError("Unsupported Portainer resource")
+            data = _integration_request(base_url, path, token=token, api_key=api_key)
+            return {"provider": provider, "resource": resource, "data": data}
+        if resource == "containers" and action_name in _PORTAINER_CONTAINER_ACTIONS:
+            identifier = payload.get("id")
+            if not isinstance(identifier, str) or not identifier or len(identifier) > 256 or "\0" in identifier:
+                raise ValueError("A valid container ID is required")
+            encoded_id = quote(identifier, safe="")
+            if action_name == "remove":
+                suffix = "?force=true"
+                method = "DELETE"
+            elif action_name in {"inspect", "logs"}:
+                suffix = "json" if action_name == "inspect" else "logs?stdout=true&stderr=true&tail=200&timestamps=true"
+                method = "GET"
+            else:
+                suffix = action_name
+                method = "POST"
+            path = f"api/endpoints/{endpoint_id}/docker/containers/{encoded_id}"
+            path += suffix if suffix.startswith("?") else f"/{suffix}"
+            data = _integration_request(
+                base_url, path, method=method, token=token, api_key=api_key,
+            )
+            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
+        if action_name == "remove" and resource in {"images", "volumes", "networks", "stacks"}:
+            identifier = payload.get("id")
+            if not isinstance(identifier, (str, int)) or isinstance(identifier, bool) or not str(identifier) or len(str(identifier)) > 256:
+                raise ValueError("A valid resource ID is required")
+            encoded_id = quote(str(identifier), safe="")
+            if resource == "stacks":
+                stack_id = _positive_api_id(identifier, "Portainer stack")
+                path = f"api/stacks/{stack_id}?{urlencode({'endpointId': endpoint_id})}"
+            elif resource == "images":
+                path = f"api/endpoints/{endpoint_id}/docker/images/{encoded_id}?force=false"
+            elif resource == "volumes":
+                path = f"api/endpoints/{endpoint_id}/docker/volumes/{encoded_id}"
+            else:
+                path = f"api/endpoints/{endpoint_id}/docker/networks/{encoded_id}"
+            data = _integration_request(base_url, path, method="DELETE", token=token, api_key=api_key)
+            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
+        raise ValueError("Unsupported Portainer action")
+
+    if provider == "npm":
+        base_url = integrations["npm_url"]
+        if not base_url:
+            raise ValueError("Configure the Nginx Proxy Manager API URL in Settings first")
+        if resource not in _NPM_RESOURCES:
+            raise ValueError("Unsupported Nginx Proxy Manager resource")
+        if resource == "certificates" and action_name == "update":
+            raise ValueError("Nginx Proxy Manager does not support editing certificates")
+        credentials = payload.get("credentials")
+        if not isinstance(credentials, dict):
+            raise ValueError("Enter your Nginx Proxy Manager credentials")
+        username, password = credentials.get("username"), credentials.get("password")
+        if (
+            not isinstance(username, str) or not username or len(username) > 320
+            or not isinstance(password, str) or not password or len(password) > 4096
+            or "\0" in username or "\0" in password
+        ):
+            raise ValueError("Enter a valid Nginx Proxy Manager username and password")
+        auth = _integration_request(
+            base_url, "api/tokens", method="POST",
+            payload={"identity": username, "secret": password},
+        )
+        token = auth.get("token") if isinstance(auth, dict) else None
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("Nginx Proxy Manager did not return an API token")
+        path = f"api/nginx/{resource}"
+        if action_name == "list":
+            data = _integration_request(base_url, path, token=token)
+        elif action_name in {"create", "update"}:
+            body = payload.get("body")
+            if not isinstance(body, dict):
+                raise ValueError("A JSON object is required for this Nginx Proxy Manager change")
+            if action_name == "update":
+                path += f"/{_positive_api_id(payload.get('id'), 'Nginx Proxy Manager resource')}"
+            data = _integration_request(
+                base_url, path, method="POST" if action_name == "create" else "PUT",
+                token=token, payload=body,
+            )
+        elif action_name == "delete":
+            identifier = _positive_api_id(payload.get("id"), "Nginx Proxy Manager resource")
+            data = _integration_request(base_url, f"{path}/{identifier}", method="DELETE", token=token)
+        else:
+            raise ValueError("Unsupported Nginx Proxy Manager action")
+        return {"provider": provider, "resource": resource, "action": action_name, "data": data}
+
+    raise ValueError("Unsupported integration provider")
 
 
 def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -4551,6 +4788,7 @@ def _build_parser() -> argparse.ArgumentParser:
     env_get.add_argument("app_id")
     env_save = commands.add_parser("env-save")
     env_save.add_argument("app_id")
+    commands.add_parser("integration")
     rollback = commands.add_parser("rollback")
     rollback.add_argument("app_id")
     rollback.add_argument("release_id", nargs="?")
@@ -4620,6 +4858,11 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         if len(contents.encode("utf-8")) > MAX_ENV_FILE_BYTES:
             raise ValueError(f"Environment file must be smaller than {MAX_ENV_FILE_BYTES} bytes")
         return save_environment_app(args.app_id, contents)
+    if args.command == "integration":
+        raw = sys.stdin.read(2 * 1024 * 1024 + 1)
+        if len(raw.encode("utf-8")) > 2 * 1024 * 1024:
+            raise ValueError("Integration request must be smaller than 2 MiB")
+        return _integration_api(parse_payload(raw))
     operations = {
         "deploy": deploy_app,
         "pull": pull_app,

@@ -61,6 +61,7 @@
       <nav class="am-tabs" role="tablist" aria-label="App Manager sections">
         <button id="tab-websites" class="am-tab tab active" type="button" role="tab" aria-selected="true" aria-controls="websites" tabindex="0" data-tab="websites"><i data-lucide="layout-grid" aria-hidden="true"></i>Applications <span id="appCount" class="am-tab-count">0</span></button>
         <button id="tab-deployments" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="deployments" tabindex="-1" data-tab="deployments"><i data-lucide="git-branch" aria-hidden="true"></i>Deployments</button>
+        <button id="tab-infrastructure" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="infrastructure" tabindex="-1" data-tab="infrastructure"><i data-lucide="boxes" aria-hidden="true"></i>Infrastructure</button>
         <button id="tab-overview" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="overview" tabindex="-1" data-tab="overview"><i data-lucide="activity" aria-hidden="true"></i>Activity</button>
         <button id="tab-settings" class="am-tab tab" type="button" role="tab" aria-selected="false" aria-controls="settings" tabindex="-1" data-tab="settings"><i data-lucide="settings-2" aria-hidden="true"></i>Settings</button>
       </nav>
@@ -110,6 +111,17 @@
           </div>
         </div>
         <div id="deploymentHistory"></div>
+      </section>
+
+      <section id="infrastructure" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-infrastructure" tabindex="0" hidden>
+        <div class="am-section-heading">
+          <div>
+            <h2>Infrastructure</h2>
+            <p class="am-section-copy">Manage Docker and proxy resources through your installed Portainer and Nginx Proxy Manager APIs.</p>
+          </div>
+          <button id="refreshInfrastructure" class="am-button am-button--quiet" type="button"><i data-lucide="refresh-cw"></i> Refresh</button>
+        </div>
+        <div id="integrationPanel"></div>
       </section>
 
       <section id="settings" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
@@ -167,7 +179,7 @@
           <div class="am-form-grid__wide">
             <label for="appRoute">Application path prefix</label>
             <input id="appRoute" required name="route" autocomplete="off" spellcheck="false" placeholder="/customer-portal/ or /" maxlength="256" pattern="/|/([a-z0-9]([a-z0-9\-]{0,62}[a-z0-9])?/)+" />
-            <small class="am-field-hint">This path configures the app's base path only. Set up domains and reverse-proxy routing separately in Cockpit's Nginx Manager.</small>
+            <small class="am-field-hint">This path configures the app's base path only. Set up domains and reverse-proxy routing separately through NPM in Infrastructure.</small>
           </div>
           <div>
             <label for="appHealthCheck">Health-check path</label>

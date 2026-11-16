@@ -560,6 +560,95 @@ class AppManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "retains only the current deployment"):
             manager.update_settings({"release_retention": 2})
 
+    def test_integration_settings_validate_service_urls_without_accepting_credentials(self):
+        result = manager.update_settings({"integrations": {
+            "portainer_url": "https://portainer.example:9443/",
+            "npm_url": "http://127.0.0.1:81",
+        }})
+        self.assertEqual(result["config"]["integrations"], {
+            "portainer_url": "https://portainer.example:9443",
+            "npm_url": "http://127.0.0.1:81",
+        })
+        for value in ("ftp://portainer.example", "https://user:pass@example.com", "http://npm.local/?secret=1", "http://npm.local:0"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                manager.update_settings({"integrations": {"portainer_url": value}})
+
+    def test_portainer_requests_are_allowlisted_and_api_keys_are_not_persisted(self):
+        manager.update_settings({"integrations": {"portainer_url": "https://portainer.example"}})
+        with patch.object(manager, "_integration_request", return_value=[{"Id": "container"}]) as request:
+            result = manager._integration_api({
+                "provider": "portainer", "action": "list", "resource": "containers",
+                "endpoint_id": 1, "token": "ptr_private-api-key",
+            })
+        self.assertEqual(result["data"], [{"Id": "container"}])
+        request.assert_called_once_with(
+            "https://portainer.example",
+            "api/endpoints/1/docker/containers/json?all=true",
+            token="ptr_private-api-key", api_key=True,
+        )
+        self.assertNotIn("ptr_private-api-key", Path(manager.DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(ValueError, "Unsupported Portainer resource"):
+            manager._integration_api({
+                "provider": "portainer", "action": "list", "resource": "arbitrary",
+                "endpoint_id": 1, "token": "ptr_private-api-key",
+            })
+
+    def test_portainer_container_delete_uses_the_docker_delete_endpoint(self):
+        manager.update_settings({"integrations": {"portainer_url": "https://portainer.example"}})
+        with patch.object(manager, "_integration_request", return_value=None) as request:
+            manager._integration_api({
+                "provider": "portainer", "action": "remove", "resource": "containers",
+                "endpoint_id": 3, "id": "container id", "token": "ptr_key",
+            })
+        request.assert_called_once_with(
+            "https://portainer.example",
+            "api/endpoints/3/docker/containers/container%20id?force=true",
+            method="DELETE", token="ptr_key", api_key=True,
+        )
+
+    def test_integration_http_requests_disable_redirects_and_proxy_environment(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        response.read.return_value = b'{"ok":true}'
+        opener = Mock()
+        opener.open.return_value = response
+        with patch.object(manager.urllib.request, "build_opener", return_value=opener) as build_opener:
+            result = manager._integration_request(
+                "https://portainer.example", "api/endpoints", token="ptr_api-key", api_key=True,
+            )
+        self.assertEqual(result, {"ok": True})
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("X-api-key"), "ptr_api-key")
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 15)
+        handlers = build_opener.call_args.args
+        self.assertEqual(handlers[0].proxies, {})
+        self.assertIsInstance(handlers[1], manager._NoRedirectHandler)
+        self.assertIsNone(handlers[1].redirect_request(None, None, 302, "Found", {}, "https://other.example"))
+
+    def test_nginx_proxy_manager_authenticates_per_request_and_never_saves_password(self):
+        manager.update_settings({"integrations": {"npm_url": "http://127.0.0.1:81"}})
+        with patch.object(manager, "_integration_request", side_effect=[{"token": "temporary"}, [{"id": 8}]]) as request:
+            result = manager._integration_api({
+                "provider": "npm", "action": "list", "resource": "proxy-hosts",
+                "credentials": {"username": "admin@example.com", "password": "private-password"},
+            })
+        self.assertEqual(result["data"], [{"id": 8}])
+        self.assertEqual(request.call_args_list[0].args, ("http://127.0.0.1:81", "api/tokens"))
+        self.assertEqual(request.call_args_list[0].kwargs["payload"], {
+            "identity": "admin@example.com", "secret": "private-password",
+        })
+        self.assertEqual(request.call_args_list[1].args, ("http://127.0.0.1:81", "api/nginx/proxy-hosts"))
+        self.assertEqual(request.call_args_list[1].kwargs["token"], "temporary")
+        self.assertNotIn("private-password", Path(manager.DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
+
+    def test_nginx_proxy_manager_rejects_certificate_updates(self):
+        manager.update_settings({"integrations": {"npm_url": "http://127.0.0.1:81"}})
+        with self.assertRaisesRegex(ValueError, "does not support editing certificates"):
+            manager._integration_api({
+                "provider": "npm", "action": "update", "resource": "certificates", "id": 8,
+            })
+
     def test_environment_file_normalizes_supported_dotenv_values(self):
         normalized = manager._parse_environment_file(
             "# Runtime secrets\n"
@@ -4404,7 +4493,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertTrue((cockpit_dir / "app-manager.js").is_file())
         frontend = (cockpit_dir / "app-manager.js").read_text(encoding="utf-8")
         self.assertIn("Application path prefix", frontend)
-        self.assertIn("configure routing in Nginx Manager", frontend)
+        self.assertIn("Create NPM route", frontend)
         self.assertIn("function renderAppList()", frontend)
         self.assertIn('data-action="deployment-log"', frontend)
         self.assertNotIn("process.close()", frontend)

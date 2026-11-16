@@ -5,7 +5,7 @@
 This repository is a native Cockpit plugin for hosting multiple web apps on an Ubuntu Server host without disrupting the existing site infrastructure. The app is split into three layers:
 
 - Cockpit UI assets in `cockpit/` that load under the Cockpit navigation menu as `App Manager`.
-- Python backend logic in `backend/app_manager.py` that implements validation, registry management, deployment, and system service control.
+- Python backend logic in `backend/app_manager.py` that implements validation, registry management, deployment, system service control, and allowlisted Portainer/Nginx Proxy Manager API requests.
 - Framework-specific deployment behavior in `backend/adapters.py` for Next.js, Go, Node.js, Python, and static HTML projects.
 
 The backend is designed to run as a privileged Cockpit helper. It stores state under `/var/lib/cockpit/app-manager` and exposes a JSON-only CLI that the Cockpit UI shells out to.
@@ -41,11 +41,13 @@ Dockerfile deployments use `build_config.dockerfile`, `build_config.app_director
 - The Cockpit UI is plain HTML/JavaScript in `cockpit/`.
 - The plugin must remain a native Cockpit integration, not a standalone site.
 - UI actions should call the backend with structured JSON input and render backend responses cleanly.
-- Treat the application path as build/runtime configuration only; App Manager must not create domains or modify host web-server routing.
+- Treat the application path as build/runtime configuration only. The Infrastructure workspace may manage explicitly selected Portainer and Nginx Proxy Manager resources via their REST APIs; deployments themselves must not create domains or modify host web-server routing.
 
 ## Security requirements
 
 - Do not store passwords, tokens, or credentials in plain-text registry files.
+- Infrastructure API credentials are session-only, passed to the backend over stdin, and must not be persisted in registry/configuration files or included in command arguments.
+- Infrastructure API requests must use explicit provider/resource/action allowlists, bounded responses, timeouts, verified TLS, and no redirect following; never expose an arbitrary privileged URL proxy.
 - Accept only HTTPS or SSH Git remotes; reject dangerous or malformed URLs.
 - Prevent path traversal and symlink escape via `validate_allowed_path()` and path-boundary checks.
 - Reserve ports from 8100–8999 and never reuse port 8080 or an active listening port.
