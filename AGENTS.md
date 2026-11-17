@@ -15,7 +15,7 @@ The backend is designed to run as a privileged Cockpit helper. It stores state u
 The project supports the following frameworks and fallback detection rules:
 
 - `nextjs` — detected via `next.config.*` or a `next` dependency in `package.json`.
-- `react` — detected via React plus Vite or `react-scripts` dependencies; builds a static frontend with no runtime service. Optional `build_config.app_directory` selects the project and `build_config.output_directory` selects its build output (`dist` for Vite, `build` for Create React App). Static serving and SPA fallback remain administrator-managed.
+- `react` — detected via React plus Vite or `react-scripts` dependencies; builds static frontend files served by a managed HTTP service bound to `127.0.0.1`. Optional `build_config.app_directory` selects the project and `build_config.output_directory` selects its build output (`dist` for Vite, `build` for Create React App). React deep links fall back to that app's `index.html`.
 - `go` — detected via `go.mod`.
 - `node` — detected via `package.json` when not a Next.js or supported React frontend.
 - `python` — detected via `requirements.txt` or `pyproject.toml`.
@@ -42,7 +42,7 @@ If detection is uncertain or the app uses a nonstandard startup pattern, supply 
 - The plugin must remain a native Cockpit integration, not a standalone site.
 - UI actions should call the backend with structured JSON input and render backend responses cleanly.
 - The project-directory picker calls `repository-tree` with `{id, repo_url, branch}` over stdin. Browse only validated Git remotes/branches in temporary no-checkout clones as the dedicated app account; never mutate the live source/release. Folder selection configures `build_config.app_directory` for Next.js/React and must preserve other build configuration.
-- The application path configures builds/runtime only. Do not generate or export Nginx configurations, expose Nginx management/API controls, create domains, or write/reload host routing. After successful deployment, persist provider-neutral `publication` details and show How to make public on the app card and completed deployment dialog. Show the actual deployed loopback IP/port for dynamic apps or exact content folder with no runtime port for static builds; include manual routing guidance and never claim the app is publicly reachable.
+- The application path configures builds/runtime only. Do not generate or export Nginx configurations, expose Nginx management/API controls, create domains, or write/reload host routing. After successful deployment, persist provider-neutral `publication` details and show How to make public on the app card and completed deployment dialog. Show the actual deployed loopback IP/port for every app and the exact content folder for static builds; include manual routing guidance and never claim the app is publicly reachable.
 - Portainer and Nginx Proxy Manager tabs only open external browser links configured in Settings (`integrations.portainer_url` and `integrations.npm_url`); do not embed them, proxy APIs or collect credentials. Ignore retired Nginx snippet metadata when reading old registrations.
 - Shared release preparation scopes known local HTML/CSS/manifest assets, including responsive image candidates and literal CSS `url()` values. Preserve source, comments, data/external URLs, already-prefixed references and other applications; do not rewrite arbitrary runtime JavaScript.
 
@@ -66,7 +66,7 @@ If detection is uncertain or the app uses a nonstandard startup pattern, supply 
 - A systemd timer checks configured repository branches every five minutes and deploys new commits using the same safe fast-forward workflow.
 - Each app gets its own service account, systemd unit, logs, config directory, and loopback-bound runtime port.
 - Dynamic apps run on `127.0.0.1` only, never on a public interface.
-- Static apps should be deployed as files with no unnecessary runtime process. Serving and virtual-host routing are configured separately by the host administrator.
+- Static apps should be deployed as files and served by the managed, loopback-only static HTTP service; Nginx and virtual-host routing remain separately configured by the host administrator.
 - Publication guidance uses a snapshot of the last successful deployment, not pending edits. Explain static serving/React SPA fallback, prefix preservation for dynamic Next.js versus stripping for other runtimes, and externally configured forwarded headers. Dynamic candidate ports may change: tell administrators to check the guide and update external routes after deployments, including automatic updates.
 
 ## Directory structure

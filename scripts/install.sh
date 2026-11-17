@@ -105,7 +105,8 @@ preflight() {
   [[ -f "$APP_DIR/cockpit/app-manager.css" ]] || fail "Cockpit plugin stylesheet is missing."
   [[ -f "$APP_DIR/cockpit/app-manager.js" ]] || fail "Cockpit plugin JavaScript is missing."
   [[ -f "$APP_DIR/cockpit/icons.js" ]] || fail "Offline icons are missing; run npm ci and npm run build:icons in the project."
-  [[ -f "$APP_DIR/backend/app_manager.py" && -f "$APP_DIR/backend/adapters.py" ]] ||
+  [[ -f "$APP_DIR/backend/app_manager.py" && -f "$APP_DIR/backend/adapters.py" &&
+    -f "$APP_DIR/backend/static_server.py" ]] ||
     fail "Required backend modules are missing."
   [[ -f "$APP_DIR/backend/prepare_next_assets.cjs" ]] || fail "Next.js asset preparation helper is missing."
   [[ -f "$APP_DIR/config/defaults.json" ]] || fail "Default configuration is missing."
@@ -155,6 +156,7 @@ install_files() {
 
   install -o root -g root -m 0755 "$APP_DIR/backend/app_manager.py" "$BACKEND_DEST/app-manager"
   install -o root -g root -m 0644 "$APP_DIR/backend/adapters.py" "$BACKEND_DEST/adapters.py"
+  install -o root -g root -m 0644 "$APP_DIR/backend/static_server.py" "$BACKEND_DEST/static_server.py"
   install -o root -g root -m 0644 "$APP_DIR/backend/runtime_checks.py" "$BACKEND_DEST/runtime_checks.py"
   install -o root -g root -m 0644 "$APP_DIR/backend/prepare_next_assets.cjs" "$BACKEND_DEST/prepare_next_assets.cjs"
   install -o root -g root -m 0644 "$APP_DIR/config/defaults.json" "$CONFIG_DEST/defaults.json"

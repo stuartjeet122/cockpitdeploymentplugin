@@ -1445,6 +1445,24 @@ def _static_root_relative_path(value: Any) -> Path:
     return Path(*parts)
 
 
+def _static_release_root(release_dir: Path, static_root: Any) -> Path:
+    app_root = release_dir / "app"
+    relative = _static_root_relative_path(static_root)
+    content_root = app_root / relative
+    current = app_root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError("Static output directory must not contain symlink components")
+    try:
+        content_root.resolve(strict=True).relative_to(app_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("Static output directory is missing or escapes the application release") from exc
+    if not content_root.is_dir() or not (content_root / "index.html").is_file():
+        raise RuntimeError("Static release is missing index.html")
+    return content_root
+
+
 def _static_content_root(app: Dict[str, Any], config: Dict[str, Any]) -> Path:
     app_root = _app_paths(app["id"], config)["current"] / "app"
     content_root = app_root / _static_root_relative_path(app.get("static_root"))
@@ -1461,7 +1479,8 @@ def _publication_info(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, 
     route = validate_app_route(app.get("route"), app["id"])
     if _is_static_app(app):
         return {
-            "kind": "static", "route": route,
+            "kind": "static", "route": route, "scheme": "http",
+            "host": "127.0.0.1", "port": app["port"], "upstream_path": route,
             "content_root": str(_static_content_root(app, config)),
             "spa_fallback": app.get("framework") == "react",
         }
@@ -1478,8 +1497,8 @@ def app_health_url(app: Dict[str, Any]) -> Optional[str]:
     if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
         raise ValueError("Health-check URL must be a local path")
     if _is_static_app(app):
-        return None
-    if app.get("framework") == "nextjs":
+        health = validate_app_route(app.get("route"), app["id"])
+    elif app.get("framework") == "nextjs":
         health = _routed_health_path(app)
     port = app.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
@@ -1488,9 +1507,6 @@ def app_health_url(app: Dict[str, Any]) -> Optional[str]:
 
 
 def check_app_health(app: Dict[str, Any], timeout_seconds: int = 30) -> bool:
-    if _is_static_app(app):
-        index = _static_content_root(app, get_config()) / "index.html"
-        return index.is_file()
     url = app_health_url(app)
     if url is None:
         return False
@@ -1848,15 +1864,20 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
                 or not isinstance(publication.get("route"), str)):
                 raise ValueError("Application publication must contain deployed connection details")
             validate_app_route(publication.get("route"), app_id)
-            if publication["kind"] == "runtime":
+            legacy_static = publication["kind"] == "static" and not any(
+                field in publication for field in ("host", "scheme", "port", "upstream_path")
+            )
+            if not legacy_static:
                 port = publication.get("port")
                 if (publication.get("host") != "127.0.0.1" or publication.get("scheme") != "http"
                     or isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END
                     or publication.get("upstream_path") not in ("/", publication.get("route"))):
-                    raise ValueError("Application publication contains invalid runtime connection details")
-            elif (not isinstance(publication.get("content_root"), str)
-                  or not publication["content_root"]
-                  or not isinstance(publication.get("spa_fallback"), bool)):
+                    raise ValueError("Application publication contains invalid upstream connection details")
+            if publication["kind"] == "static" and (
+                not isinstance(publication.get("content_root"), str)
+                or not publication["content_root"]
+                or not isinstance(publication.get("spa_fallback"), bool)
+            ):
                 raise ValueError("Application publication contains invalid static content details")
         if app_id in seen_ids:
             raise ValueError(f"Duplicate application ID in registry: {app_id}")
@@ -3690,7 +3711,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             _append_deployment_log(deployment_log, f"Source revision: {commit or 'unavailable'}")
             service_path = _service_path(app_snapshot)
             previous_service_content = _verified_service_bytes(app_snapshot, service_path)
-            expects_runtime = framework not in {"static", "react"} or bool(app_snapshot.get("build_config", {}).get("start_command"))
+            expects_runtime = True
             if not native and expects_runtime and current_release is not None and previous_service_content is not None and previous_app.get("status") == "running":
                 staged = True
                 old_service_retired = False
@@ -3762,9 +3783,26 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 app_snapshot.pop("static_export", None)
                 app_snapshot.pop("static_root", None)
             hosting_framework = "static" if framework == "static" or static_export else framework
+            static_server_required = hosting_framework == "static" and not runtime_required
+            static_release_root = (
+                _static_release_root(release_dir, static_root) if hosting_framework == "static" else None
+            )
             record["static_export"] = static_export
+            if hosting_framework == "static":
+                record["static_root"] = static_root
             _seal_release(release_dir, release_group, public=hosting_framework == "static")
-            command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
+            if static_server_required:
+                command = [
+                    sys.executable, str(Path(__file__).with_name("static_server.py")),
+                    "--root", str(static_release_root), "--port", str(app_snapshot["port"]),
+                    "--base-path", validate_app_route(app_snapshot.get("route"), app_snapshot["id"]),
+                ]
+                if framework == "react":
+                    command.append("--spa-fallback")
+                runtime_required = True
+            else:
+                command = build_result["start_command"]
+            command = _release_command_path(command, release_dir, paths["current"])
             working_directory = None
             build_working_directory = build_result.get("working_directory")
             if build_working_directory is not None:
@@ -3811,14 +3849,13 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 _raise_if_deployment_cancelled(cancel_file)
                 _append_deployment_log(deployment_log, "Waiting for the application health check")
                 if not _wait_for_health(app_snapshot, int(config["health_timeout_seconds"])):
-                    raise RuntimeError(_startup_failure(app_snapshot, config, Path(build_result["start_command"][0])))
+                    raise RuntimeError(_startup_failure(app_snapshot, config, Path(command[0])))
                 _assert_loopback_binding(app_snapshot, int(config["command_timeout_seconds"]))
                 if native and app_snapshot["python_services"].get("worker"):
                     _start_worker(app_snapshot)
             elif hosting_framework == "static":
-                static_release_root = release_dir / "app" / _static_root_relative_path(static_root)
-                if not (static_release_root / "index.html").is_file():
-                    raise RuntimeError("Static release is missing index.html")
+                if static_release_root is None:
+                    raise RuntimeError("Static release directory was not prepared")
             _raise_if_deployment_cancelled(cancel_file)
             if staged:
                 _atomic_symlink(release_dir, paths["current"])
@@ -4011,6 +4048,13 @@ def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any
         release = _resolved_path(Path(target_record["release"]))
         if not _path_is_within(release, paths["releases"]) or not release.is_dir():
             raise ValueError("Rollback release is outside the managed releases directory or missing")
+        target_framework = target_record.get("framework", app.get("framework"))
+        target_static = target_record.get("static_export") is True or (
+            target_framework == "static" and not app.get("build_config", {}).get("start_command")
+        )
+        target_static_root = target_record.get("static_root")
+        if target_static and target_framework != "static" and not target_static_root:
+            raise RuntimeError("This older static release has no output-directory metadata; redeploy before rolling it back")
         username = app["service_user"]
         service_path = _service_path(app)
         if not service_path.exists():
@@ -4018,8 +4062,12 @@ def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any
         previous_running = app.get("status") == "running"
         native = bool(app.get("python_services"))
         worker_path = _service_path(_worker_app(app))
-        saved_web = _verified_service_bytes(app, service_path) if native else None
+        saved_web = _verified_service_bytes(app, service_path) if native or target_static else None
         saved_worker = _verified_service_bytes(app, worker_path) if native else None
+        rollback_app = dict(
+            app, framework=target_framework, static_export=target_record.get("static_export", False),
+            static_root=target_static_root,
+        )
         try:
             if native:
                 _stop_native_runtime(app)
@@ -4029,12 +4077,27 @@ def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any
                     command = python_command(app["python_services"]["worker"]["command"], app, release / "app")
                     _write_service(_worker_app(app), release, _release_command_path(command, release, paths["current"]), config)
                 _systemctl("daemon-reload")
+            elif target_static:
+                _static_release_root(release, target_static_root)
+                root = paths["current"] / "app" / _static_root_relative_path(target_static_root)
+                command = [
+                    sys.executable, str(Path(__file__).with_name("static_server.py")),
+                    "--root", str(root), "--port", str(app["port"]),
+                    "--base-path", validate_app_route(app.get("route"), app_id),
+                ]
+                if target_framework == "react":
+                    command.append("--spa-fallback")
+                _write_service(
+                    app, release, _release_command_path(command, release, paths["current"]), config
+                )
+                _systemctl("daemon-reload")
             _atomic_symlink(release, paths["current"])
             _systemctl("restart", service_path.name)
-            if not _wait_for_health(app, int(config["health_timeout_seconds"])):
+            if not _wait_for_health(rollback_app, int(config["health_timeout_seconds"])):
                 raise RuntimeError("Rolled-back application did not pass its health check")
-            if native:
+            if native or target_static:
                 _assert_loopback_binding(app, int(config["command_timeout_seconds"]))
+            if native:
                 if app["python_services"].get("worker"):
                     _start_worker(app)
         except Exception as exc:
@@ -4044,6 +4107,9 @@ def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any
                     _stop_native_runtime(app)
                     _restore_service_file(service_path, saved_web)
                     _restore_service_file(worker_path, saved_worker)
+                    _systemctl("daemon-reload")
+                elif target_static:
+                    _restore_service_file(service_path, saved_web)
                     _systemctl("daemon-reload")
                 if current_release is not None and current_release.is_dir():
                     _atomic_symlink(current_release, paths["current"])
@@ -4069,6 +4135,13 @@ def rollback_app(app_id: str, release_id: Optional[str] = None) -> Dict[str, Any
             stored = _find_app(current_registry, app_id)
             stored["status"] = "running"
             stored["updated_at"] = now_iso()
+            stored["framework"] = target_framework
+            stored["static_export"] = target_record.get("static_export", False)
+            if target_static_root:
+                stored["static_root"] = target_static_root
+            else:
+                stored.pop("static_root", None)
+            stored["publication"] = _publication_info(rollback_app, config)
             _record_deployment(stored, {
                 "id": f"rollback-{uuid.uuid4().hex[:12]}",
                 "name": stored["name"],
@@ -4090,8 +4163,6 @@ def _service_action(app_id: str, action_name: str) -> Dict[str, Any]:
         with _registry_transaction() as registry:
             app = _find_app(registry, app_id)
             app_snapshot = dict(app)
-        if _is_static_app(app_snapshot):
-            raise RuntimeError("Static applications have no runtime service; manage their Nginx routing separately")
         config = get_config()
         service_path = _service_path(app_snapshot)
         if not service_path.exists():
@@ -4304,31 +4375,30 @@ def metrics_app(app_id: str) -> Dict[str, Any]:
     metrics = {"checked_at": now_iso(), "sample_time": time.monotonic(), "cpu_percent": None,
                "memory_bytes": None, "peak_memory_bytes": None, "tasks": None, "restarts": None,
                "uptime_seconds": None, "service_state": "not-required", "errors": []}
-    if not _is_static_app(app):
-        try:
-            result = _systemctl("show", _service_path(app).name,
-                                "--property=ActiveState,CPUUsageNSec,MemoryCurrent,MemoryPeak,TasksCurrent,NRestarts,ActiveEnterTimestampMonotonic,InvocationID", timeout=5)
-            properties = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
-            metrics["service_state"] = properties.get("ActiveState", "unknown")
-            for name, property_name in (("memory_bytes", "MemoryCurrent"), ("peak_memory_bytes", "MemoryPeak"),
-                                        ("tasks", "TasksCurrent"), ("restarts", "NRestarts"), ("cpu_usage_nsec", "CPUUsageNSec")):
-                value = properties.get(property_name, "")
-                metrics[name] = int(value) if re.fullmatch(r"[0-9]{1,20}", value) and int(value) < 2 ** 64 - 1 else None
-            metrics["invocation_id"] = properties.get("InvocationID")
-            entered = properties.get("ActiveEnterTimestampMonotonic", "")
-            if metrics["service_state"] == "active" and entered.isdigit() and int(entered) > 0:
-                metrics["uptime_seconds"] = max(0, metrics["sample_time"] - int(entered) / 1000000)
-            previous = app.get("metrics", {})
-            previous_time = previous.get("sample_time")
-            elapsed = metrics["sample_time"] - previous_time if type(previous_time) in (int, float) and 0 <= previous_time < metrics["sample_time"] else 0
-            previous_cpu = previous.get("cpu_usage_nsec")
-            if elapsed > 0 and metrics["invocation_id"] and metrics["invocation_id"] == previous.get("invocation_id") and metrics.get("cpu_usage_nsec") is not None and type(previous_cpu) is int and 0 <= previous_cpu < 2 ** 64 - 1:
-                difference = metrics["cpu_usage_nsec"] - previous_cpu
-                if difference >= 0:
-                    metrics["cpu_percent"] = round(difference / elapsed / 10000000, 1)
-        except (OSError, RuntimeError) as exc:
-            metrics["service_state"] = "unknown"
-            metrics["errors"].append(str(exc))
+    try:
+        result = _systemctl("show", _service_path(app).name,
+                            "--property=ActiveState,CPUUsageNSec,MemoryCurrent,MemoryPeak,TasksCurrent,NRestarts,ActiveEnterTimestampMonotonic,InvocationID", timeout=5)
+        properties = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
+        metrics["service_state"] = properties.get("ActiveState", "unknown")
+        for name, property_name in (("memory_bytes", "MemoryCurrent"), ("peak_memory_bytes", "MemoryPeak"),
+                                    ("tasks", "TasksCurrent"), ("restarts", "NRestarts"), ("cpu_usage_nsec", "CPUUsageNSec")):
+            value = properties.get(property_name, "")
+            metrics[name] = int(value) if re.fullmatch(r"[0-9]{1,20}", value) and int(value) < 2 ** 64 - 1 else None
+        metrics["invocation_id"] = properties.get("InvocationID")
+        entered = properties.get("ActiveEnterTimestampMonotonic", "")
+        if metrics["service_state"] == "active" and entered.isdigit() and int(entered) > 0:
+            metrics["uptime_seconds"] = max(0, metrics["sample_time"] - int(entered) / 1000000)
+        previous = app.get("metrics", {})
+        previous_time = previous.get("sample_time")
+        elapsed = metrics["sample_time"] - previous_time if type(previous_time) in (int, float) and 0 <= previous_time < metrics["sample_time"] else 0
+        previous_cpu = previous.get("cpu_usage_nsec")
+        if elapsed > 0 and metrics["invocation_id"] and metrics["invocation_id"] == previous.get("invocation_id") and metrics.get("cpu_usage_nsec") is not None and type(previous_cpu) is int and 0 <= previous_cpu < 2 ** 64 - 1:
+            difference = metrics["cpu_usage_nsec"] - previous_cpu
+            if difference >= 0:
+                metrics["cpu_percent"] = round(difference / elapsed / 10000000, 1)
+    except (OSError, RuntimeError) as exc:
+        metrics["service_state"] = "unknown"
+        metrics["errors"].append(str(exc))
     for name, directory in (("disk", paths["production"]), ("storage", paths["storage"]),
                              ("logs", paths["logs"]), ("source", paths["source"])):
         usage = _directory_usage(directory)
@@ -4342,15 +4412,13 @@ def metrics_app(app_id: str) -> Dict[str, Any]:
 def health_check_app(app_id: str) -> Dict[str, Any]:
     app = _find_app(get_registry(), app_id)
     url = app_health_url(app)
-    static = _is_static_app(app)
-    service_state = "not-required" if static else "unknown"
+    service_state = "unknown"
     service_error = None
-    if not static:
-        try:
-            result = _systemctl("show", "--property=ActiveState", "--value", _service_path(app).name, timeout=5)
-            service_state = (result.stdout or "").strip() or "unknown"
-        except (OSError, RuntimeError) as exc:
-            service_error = str(exc)
+    try:
+        result = _systemctl("show", "--property=ActiveState", "--value", _service_path(app).name, timeout=5)
+        service_state = (result.stdout or "").strip() or "unknown"
+    except (OSError, RuntimeError) as exc:
+        service_error = str(exc)
     healthy = check_app_health(app, 3)
     health = {"checked_at": now_iso(), "service_state": service_state, "service_error": service_error,
               "local_healthy": healthy, "local_error": None if healthy else "Local readiness check failed"}

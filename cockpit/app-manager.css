@@ -1435,6 +1435,31 @@ body:has(.am-dialog--deployment[open]) { overflow: hidden; }
 .am-app-card[data-framework="go"] .am-app-avatar { background: #edf5fb; color: #2b6684; border-color: #d3e4ee; }
 .am-app-card[data-framework="python"] .am-app-avatar { background: #fff8df; color: #80600c; border-color: #eddfbd; }
 .am-app-card[data-framework="static"] .am-app-avatar { background: #f8edf0; color: #a53a5b; border-color: #efd6de; }
+.am-app-meta dd code { display: inline-block; margin: 0; font-size: 0.8125rem; }
+.am-app-actions > .am-button--primary { min-width: 7.5rem; }
+.am-app-actions > .am-button:not(.am-icon-button) { min-height: 2.5rem; }
+.am-app-card { border-radius: 0.5rem; }
+.am-app-card__heading { gap: 0.75rem; }
+.am-app-route { margin-top: 1rem; }
+.am-app-manager { padding-block-start: 1.5rem; }
+.am-tabs { gap: 0.75rem; }
+.am-dialog .am-settings-paths dd code { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .am-app-manager { padding: 1rem; }
+  .am-header { align-items: flex-start; }
+  .am-header-actions { gap: 0.5rem; }
+  .am-header-actions [data-open-add] { flex: 1 1 100%; }
+  .am-app-toolbar { align-items: stretch; }
+  .am-search { flex-basis: 100%; max-width: none; }
+  .am-filters { max-width: 100%; overflow-x: auto; }
+  .am-sort { margin-left: 0; }
+  .am-app-card { padding: 1rem; }
+  .am-app-actions > .am-button:not(.am-icon-button) { flex: 1 1 auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .am-panel, .am-app-card { animation: none; }
+  .am-button, .am-app-card { transition: none; }
+}
 .am-status-pill { border-radius: 0.25rem; }
 .am-app-route { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.25rem; font-size: 0.875rem; color: var(--am-muted); }
 .am-app-route a { display: inline-flex; min-width: 0; align-items: center; gap: 0.35rem; color: var(--am-accent); overflow-wrap: anywhere; text-decoration: none; }

@@ -794,24 +794,27 @@ for (const closeFirst of [true, false]) {
   });
 }
 
-test("React and exported frontends display static content without runtime or NPM proxy controls", async () => {
+test("React and exported frontends show their managed server destinations and runtime controls", async () => {
   const apps = [
-    { ...fixtureApps[0], id: "react", name: "React Shop", framework: "react", static_export: true, static_root: "frontend/dist" },
-    { ...fixtureApps[0], id: "export", static_export: true, static_root: "out" },
+    { ...fixtureApps[0], id: "react", name: "React Shop", framework: "react", static_export: true, static_root: "frontend/dist",
+      publication: { kind: "static", scheme: "http", host: "127.0.0.1", port: 8112, route: "/portal/", upstream_path: "/portal/", content_root: "/opt/webapps/react/current/app/frontend/dist", spa_fallback: true } },
+    { ...fixtureApps[0], id: "export", static_export: true, static_root: "out",
+      publication: { kind: "static", scheme: "http", host: "127.0.0.1", port: 8113, route: "/portal/", upstream_path: "/portal/", content_root: "/opt/webapps/export/current/app/out", spa_fallback: false } },
     { ...fixtureApps[0], id: "server", framework: "node" },
   ];
   const ui = await loadUi({ list: { apps }, health: { healthy: true, url: null } });
   try {
     for (const id of ["react", "export"]) {
       const card = ui.document.querySelector(`[data-action="deploy"][data-id="${id}"]`).closest("article");
-      assert.match(card.textContent, /Static files: current\/app\//);
+      assert.match(card.textContent, /127\.0\.0\.1:81/);
       assert.equal(card.querySelector('[data-action="route"]'), null);
-      for (const action of ["start", "stop", "restart"]) assert.equal(card.querySelector(`[data-action="${action}"]`), null);
+      assert.ok(card.querySelector('[data-action="stop"]'));
+      assert.ok(card.querySelector('[data-action="restart"]'));
     }
     assert.equal(ui.document.querySelector('[data-action="route"][data-id="server"]'), null);
     ui.document.querySelector('[data-action="health"][data-id="react"]').click();
     await settle(ui.window);
-    assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Static release is available/);
+    assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Static server health check passed/);
     ui.document.querySelector('[data-action="edit"][data-id="react"]').click();
     const form = ui.document.querySelector(".am-dialog-form");
     assert.equal(form.elements.framework.value, "react");
@@ -1136,10 +1139,11 @@ test("How to make public uses the latest deployed IP, port and prefix without ch
   } finally { ui.dom.window.close(); }
 });
 
-test("How to make public explains static hosting without inventing a runtime port", async () => {
+test("How to make public shows the static server destination and content details", async () => {
   const ui = await loadUi({
     list: { apps: [{ ...fixtureApps[0], framework: "react", port: 8122, publication: {
-      kind: "static", route: "/portal/", content_root: "/opt/webapps/portal/current/app/frontend/dist", spa_fallback: true,
+      kind: "static", scheme: "http", host: "127.0.0.1", port: 8122, upstream_path: "/portal/",
+      route: "/portal/", content_root: "/opt/webapps/portal/current/app/frontend/dist", spa_fallback: true,
     } }] },
     "deployment-logs": { app_id: "portal", deployment_id: "latest", status: "deployed", active: false, logs: "Done" },
   });
@@ -1148,9 +1152,12 @@ test("How to make public explains static hosting without inventing a runtime por
     await settle(ui.window);
     const body = ui.document.querySelector(".am-dialog-body").textContent;
     assert.match(body, /\/opt\/webapps\/portal\/current\/app\/frontend\/dist/);
-    assert.match(body, /None - static files only/);
-    assert.match(body, /For React client-side navigation/);
-    assert.doesNotMatch(body, /8122|Upstream IP|Proxy to the HTTP upstream/);
+    assert.match(body, /127\.0\.0\.1/);
+    assert.match(body, /8122/);
+    assert.match(body, /http:\/\/127\.0\.0\.1:8122\/portal\//);
+    assert.match(body, /React client-side navigation falls back/);
+    assert.match(body, /Preserve the public prefix upstream/);
+    assert.match(body, /Managed static server/);
   } finally { ui.dom.window.close(); }
 });
 

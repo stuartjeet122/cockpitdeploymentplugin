@@ -254,12 +254,14 @@
       }
       const deploying = app.status === "deploying";
       const staticApp = isStaticApp(app);
+      const hasPublicationTarget = !staticApp || app.publication?.host === "127.0.0.1"
+        && Number.isInteger(app.publication?.port);
       const appId = escapeHtml(app.id);
       const unavailable = deploying ? " disabled data-unavailable" : "";
       const runtimeUnavailable = deploying || !app.last_deploy ? " disabled data-unavailable" : "";
-      const serviceControl = staticApp ? "" : observedStatus(app) === "running"
+      const serviceControl = hasPublicationTarget ? (observedStatus(app) === "running"
         ? `<button type="button" data-action="stop" data-id="${appId}"${runtimeUnavailable}>${icon("pause")} Stop application</button>`
-        : `<button type="button" data-action="start" data-id="${appId}"${runtimeUnavailable}>${icon("play")} Start application</button>`;
+        : `<button type="button" data-action="start" data-id="${appId}"${runtimeUnavailable}>${icon("play")} Start application</button>`) : "";
       const appInitial = String(app.name || "A").trim().charAt(0).toUpperCase() || "A";
       const deployControl = app.status === "deploying"
         ? `<button type="button" class="am-button am-button--primary" data-action="deployment-log" data-id="${appId}">${icon("loader-circle")} View deployment</button>`
@@ -281,7 +283,7 @@
           <p class="am-repository" title="${escapeHtml(app.repo_url)}">${icon("git-branch")}<span>${escapeHtml(app.repo_url)}</span></p>
           <dl class="am-app-meta">
             <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
-            <div><dt>${staticApp ? "Content" : "Runtime"}</dt><dd>${staticApp ? escapeHtml(app.static_root ? `Static files: current/app/${app.static_root}` : "Static files") : `127.0.0.1:${escapeHtml(app.port)}`}</dd></div>
+            <div><dt>Destination</dt><dd>${!hasPublicationTarget ? "Redeploy to enable server" : `<code>127.0.0.1:${escapeHtml(app.publication?.port ?? app.port)}</code>`}</dd></div>
             <div class="am-meta-wide"><dt>Last deployed</dt><dd>${escapeHtml(formatDate(app.last_deploy))}${app.deployed_commit ? ` <code>${escapeHtml(app.deployed_commit.slice(0, 7))}</code>` : ""}</dd></div>
             <div><dt>Readiness</dt><dd data-health="${app.health ? (app.health.local_healthy ? "healthy" : "failed") : "unknown"}" title="${escapeHtml(app.health?.local_error || "")}">${app.health ? (app.health.local_healthy ? "Healthy" : "Failed") : "Not checked"}</dd></div>
           </dl>
@@ -306,15 +308,15 @@
           ${lastFailure ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${app.status === "running" ? "Latest deployment failed. Previous release is still live." : "Latest deployment failed."} <button type="button" data-action="deployment-log" data-id="${appId}">View log</button></span></p>` : ""}
           <div class="am-app-actions" aria-label="Actions for ${escapeHtml(app.name)}">
             ${deployControl}
-            <button type="button" class="am-button" data-action="how-public" data-id="${appId}"${runtimeUnavailable}>${icon("globe")} How to make public</button>
+            <button type="button" class="am-button" data-action="how-public" data-id="${appId}"${runtimeUnavailable || !hasPublicationTarget ? " disabled data-unavailable" : ""}>${icon("globe")} How to make public</button>
             <span class="am-action-spacer"></span>
             <button type="button" class="am-button am-icon-button" data-action="environment" data-id="${appId}" title="Environment variables" aria-label="Environment variables for ${escapeHtml(app.name)}"${unavailable}>${icon("key-round")}</button>
             <button type="button" class="am-button am-icon-button" data-action="logs" data-id="${appId}" title="Application logs" aria-label="Logs for ${escapeHtml(app.name)}">${icon("square-terminal")}</button>
             <details class="am-app-menu"><summary class="am-button am-icon-button" title="More actions" aria-label="More actions for ${escapeHtml(app.name)}">${icon("ellipsis")}</summary>
               <div class="am-menu-panel">
                 ${serviceControl}
-                ${staticApp ? "" : `<button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>`}
-                <button type="button" data-action="health" data-id="${appId}"${runtimeUnavailable}>${icon("activity")} Check health</button>
+                ${hasPublicationTarget ? `<button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>` : ""}
+                <button type="button" data-action="health" data-id="${appId}"${runtimeUnavailable || !hasPublicationTarget ? " disabled data-unavailable" : ""}>${icon("activity")} Check health</button>
                 <button type="button" data-action="preflight" data-id="${appId}"${unavailable}>${icon("search")} Run preflight</button>
                 ${app.python_services?.worker ? `<button type="button" data-action="worker-status" data-id="${appId}">${icon("activity")} Worker status</button>
                 <button type="button" data-action="worker-logs" data-id="${appId}">${icon("square-terminal")} Worker logs</button>
@@ -1491,14 +1493,25 @@
   function showPublicationGuide(app) {
     const info = app.publication;
     if (!info) throw new Error("Deploy or redeploy this application to record its connection details, then open How to make public again.");
+    if (info.kind === "static" && (!info.host || !info.port || !info.upstream_path)) {
+      throw new Error("This static app predates the managed file server. Redeploy it to create a loopback destination and refresh this guide.");
+    }
     const runtime = info.kind === "runtime";
+    const localTarget = `${info.scheme}://${info.host}:${info.port}${info.upstream_path}`;
     const fields = [
+      ["Application type", frameworkName(app.framework)],
       ["Public path", info.route],
       ["Public URL pattern (after routing)", `https://YOUR-DOMAIN${info.route}`],
-      ...(runtime ? [
-        ["Upstream scheme", info.scheme], ["Upstream IP (same host)", info.host], ["Upstream port", info.port],
-        ["Local target", `${info.scheme}://${info.host}:${info.port}${info.upstream_path}`],
-      ] : [["Static content directory", info.content_root], ["Runtime port", "None - static files only"]]),
+      ["Upstream protocol", info.scheme.toUpperCase()],
+      ["Destination IP (same host)", info.host],
+      ["Destination port", info.port],
+      ["Upstream path", info.upstream_path],
+      ["Complete upstream target", localTarget],
+      ...(runtime ? [] : [
+        ["Managed static server", "HTTP, bound to 127.0.0.1"],
+        ["Static content directory", info.content_root],
+        ["React SPA fallback", info.spa_fallback ? "Enabled (index.html for extensionless routes)" : "Disabled (unknown paths return 404)"],
+      ]),
     ];
     openDialog(`How to make public: ${app.name}`, `
       <p>These are the last successful deployment's details, not a live public URL. App Manager does not create, manage or reload web-server configuration.</p>
@@ -1508,13 +1521,11 @@
         <li>${info.route === "/" ? "Use a separate hostname for this root-path app; do not replace the existing root site or Cockpit route." : `In your existing Nginx server, add a route only for <code>${escapeHtml(info.route)}</code>, including a redirect from the path without its trailing slash. Leave the root site, Cockpit, Portainer and other application routes unchanged.`}</li>
         <li>${runtime
           ? `Proxy to the HTTP upstream IP and port above. ${info.route === "/" ? "Forward the root path unchanged." : info.upstream_path === info.route ? "Preserve the application prefix upstream (Next.js basePath)." : "Strip the public prefix before forwarding to this runtime."} Forward Host and X-Forwarded-Proto, and set X-Forwarded-Prefix to the public prefix. Configure the app's trusted-proxy/root-path handling.`
-          : `Serve files from the exact content directory above under the public path, mapping the prefix to that directory. Use index.html for directory indexes. ${info.spa_fallback ? "For React client-side navigation, fall back to this app's index.html; missing assets should return 404." : "Unknown paths should return 404."} Deny dotfiles and never expose the entire repository or environment files.`}</li>
+          : `Proxy to the managed static server above. Preserve the public prefix upstream; this server removes the configured prefix and serves files from the exact content directory above. ${info.spa_fallback ? "React client-side navigation falls back to this app's index.html; missing assets still return 404." : "Unknown paths return 404."} The server denies dotfiles and cannot expose the repository or environment files.`}</li>
         <li>Review access controls and WebSocket settings for the new route. Validate and reload through your proxy's normal workflow; for host Nginx, run <code>sudo nginx -t</code> before <code>sudo systemctl reload nginx</code>. App Manager does not run these commands.</li>
         <li>Visit your domain plus the public path. Check assets, deep links and API requests, then verify the existing root site still works. React Router needs a matching basename; computed API and asset URLs must honor the base path.</li>
       </ol>
-      <p>${runtime
-        ? "127.0.0.1 is the deployment server, not your browser or an isolated proxy container. A separate/containerized proxy needs administrator-arranged connectivity; do not expose the app port publicly. Redeployment, including automatic updates, can change the port: reopen this guide and update your external route."
-        : "Static builds have no listening IP or port. The web server needs read access to this directory; do not start an unnecessary runtime. Reopen this guide after changing the output directory or application path."}</p>`);
+      <p>127.0.0.1 is the deployment server, not your browser or an isolated proxy container. A separate/containerized proxy needs administrator-arranged connectivity; do not expose the app port publicly. Redeployment, including automatic updates, can change the port: reopen this guide and update your external route.</p>`);
   }
 
   async function showUpdateReview(app) {
@@ -1596,7 +1607,7 @@
         await refreshData();
         if (!result.healthy) throw new Error(`Health check failed (${result.url}).`);
         showNotice(isStaticApp(app)
-          ? "Static release is available."
+          ? `Static server health check passed (${result.url}).`
           : `Runtime health check passed (${result.url}).`);
       }, "", false);
       return;

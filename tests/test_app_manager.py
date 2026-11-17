@@ -293,7 +293,7 @@ class AppManagerTests(unittest.TestCase):
                 framework="react", build_config={"start_command": ["npm", "start"]},
             ))
 
-    def test_react_deployment_builds_as_static_with_managed_environment_and_no_service(self):
+    def test_react_deployment_builds_static_files_and_activates_a_loopback_service(self):
         for tool, route in (("vite", "/frontend/"), ("react-scripts", "/frontend/"), ("vite", "/")):
             with self.subTest(tool=tool, route=route):
                 app = self.add_app("React " + tool + (" root" if route == "/" else ""), framework="auto", route=route,
@@ -334,7 +334,9 @@ class AppManagerTests(unittest.TestCase):
                     manager, "_atomic_symlink"
                 ), patch.object(manager, "_systemctl") as systemctl, patch.object(
                     manager, "_prune_releases"
-                ), patch.object(adapters, "_prepare_build_copy_permissions"):
+                ), patch.object(adapters, "_prepare_build_copy_permissions"), patch.multiple(
+                    manager, _wait_for_health=Mock(return_value=True), _assert_loopback_binding=Mock()
+                ):
                     result = manager.deploy_app(app["id"])
                 self.assertEqual(result["app"]["framework"], "react")
                 self.assertEqual(result["app"]["static_root"], "frontend/site")
@@ -343,15 +345,17 @@ class AppManagerTests(unittest.TestCase):
                 self.assertEqual(result["publication"], result["app"]["publication"])
                 self.assertEqual(result["publication"]["route"], route)
                 self.assertEqual(result["publication"]["kind"], "static")
+                self.assertEqual(result["publication"]["host"], "127.0.0.1")
+                self.assertEqual(result["publication"]["port"], app["port"])
+                self.assertEqual(result["publication"]["upstream_path"], route)
                 self.assertTrue(result["publication"]["spa_fallback"])
                 self.assertEqual(Path(result["publication"]["content_root"]), paths["current"] / "app" / "frontend" / "site")
-                self.assertNotIn("port", result["publication"])
                 self.assertNotIn("nginx_route", result["app"])
                 self.assertEqual((Path(result["deployment"]["release"]) / "app" / "frontend" / "site" / "index.html").read_text(), "<h1>React release</h1>")
                 self.assertTrue(seal.call_args.kwargs["public"])
-                self.assertIsNone(manager.app_health_url(result["app"]))
-                write_service.assert_not_called()
-                systemctl.assert_not_called()
+                self.assertEqual(manager.app_health_url(result["app"]), f"http://127.0.0.1:{app['port']}{route}")
+                write_service.assert_called_once()
+                systemctl.assert_any_call("restart", Path(self.temp_dir.name, "react.service").name)
                 self.assertTrue(environments)
                 for environment in environments:
                     self.assertEqual(environment["PUBLIC_URL"], route.rstrip("/") or "/")
@@ -374,10 +378,24 @@ class AppManagerTests(unittest.TestCase):
             info = manager._publication_info(dict(app, static_export=True, static_root="frontend/out"), config)
         self.assertEqual(info["kind"], "static")
         self.assertFalse(info["spa_fallback"])
-        self.assertNotIn("port", info)
+        self.assertEqual(info["host"], "127.0.0.1")
+        self.assertEqual(info["port"], app["port"])
+        self.assertEqual(info["upstream_path"], "/music/")
         self.assertEqual(Path(info["content_root"]), manager._app_paths(app["id"], config)["current"] / "app" / "frontend" / "out")
         systemctl.assert_not_called()
         write.assert_not_called()
+
+    def test_legacy_static_publication_remains_valid_until_server_redeploy(self):
+        app = self.add_app(framework="react", route="/portal/")["app"]
+        info = {
+            "kind": "static", "route": "/portal/",
+            "content_root": str(manager._app_paths(app["id"], manager.get_config())["current"] / "app"),
+            "spa_fallback": True,
+        }
+        registry = {"apps": [dict(app, publication=info)]}
+        manager._validate_registry(registry)
+        self.assertNotIn("host", registry["apps"][0]["publication"])
+        self.assertNotIn("port", registry["apps"][0]["publication"])
 
     def test_retired_nginx_data_is_ignored_and_export_command_is_removed(self):
         config = manager.get_config()
@@ -2514,11 +2532,13 @@ class AppManagerTests(unittest.TestCase):
             manager, "_prune_releases"
         ), patch(
             "backend.adapters._prepare_build_copy_permissions"
+        ), patch.multiple(
+            manager, _wait_for_health=Mock(return_value=True), _assert_loopback_binding=Mock()
         ):
             result = manager.deploy_app(app["id"])
 
-        write_service.assert_not_called()
-        systemctl.assert_not_called()
+        write_service.assert_called_once()
+        systemctl.assert_any_call("restart", Path(self.temp_dir.name, "next-export.service").name)
         seal_release.assert_called_once()
         self.assertTrue(seal_release.call_args.kwargs["public"])
         self.assertEqual(result["app"]["framework"], "nextjs")
@@ -2746,9 +2766,10 @@ class AppManagerTests(unittest.TestCase):
         paths["releases"].mkdir(parents=True)
         paths["current"].mkdir()
         (paths["source"] / "index.html").write_text("Ready", encoding="utf-8")
-        service_path = Path(self.temp_dir.name) / "previous.service"
+        primary_service_path = Path(self.temp_dir.name) / "previous.service"
+        secondary_service_path = Path(self.temp_dir.name) / "candidate.service"
         previous_service = f"# Managed by Cockpit App Manager\nDescription=Cockpit App Manager - {app['id']}\nUser={app['service_user']}\n"
-        service_path.write_bytes(previous_service.encode("utf-8"))
+        primary_service_path.write_bytes(previous_service.encode("utf-8"))
         with manager._registry_transaction() as registry:
             manager._find_app(registry, app["id"])["status"] = "running"
         with patch.object(manager, "_require_root"), patch.object(
@@ -2758,38 +2779,89 @@ class AppManagerTests(unittest.TestCase):
         ), patch.object(manager, "git_output", return_value="a" * 40), patch.object(
             manager, "_prepare_release_directory", side_effect=lambda path, user: path.mkdir()
         ), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
-            manager, "_service_path", return_value=service_path
+            manager, "_service_path", side_effect=lambda candidate: (
+                secondary_service_path if candidate.get("service_slot") == "secondary" else primary_service_path
+            )
         ), patch.object(manager, "_environment_values_app", return_value={}), patch.object(
             manager, "_seal_release"
         ), patch.object(manager, "_retire_legacy_root_service"), patch.object(
             manager, "_atomic_symlink"
         ), patch.object(manager, "_restore_service_file") as restore, patch.object(
             manager, "_systemctl"
-        ) as systemctl, patch(
+        ) as systemctl, patch.object(manager, "_write_service"), patch.multiple(
+        manager, _wait_for_health=Mock(return_value=True), _assert_loopback_binding=Mock()
+        ), patch(
             "backend.adapters._prepare_build_copy_permissions"
         ):
             result = manager.deploy_app(app["id"])
         self.assertEqual(result["app"]["framework"], "static")
         self.assertFalse(result["app"]["static_export"])
-        self.assertEqual(restore.call_args_list[0].args, (service_path, None))
+        self.assertEqual(restore.call_args_list[0].args, (primary_service_path, None))
         actions = [item.args for item in systemctl.call_args_list]
-        self.assertIn(("disable", "--now", service_path.name), actions)
+        self.assertIn(("restart", secondary_service_path.name), actions)
+        self.assertIn(("disable", "--now", primary_service_path.name), actions)
         stored = manager._find_app(manager.get_registry(), app["id"])
         self.assertEqual(stored["status"], "running")
         self.assertEqual(stored["deployments"][0]["status"], "deployed")
 
-    def test_static_health_checks_the_release_without_a_runtime(self):
+    def test_static_health_checks_the_loopback_server_for_the_configured_prefix(self):
         app = self.add_app()["app"]
-        index = manager._app_paths(app["id"], manager.get_config())["current"] / "app" / "index.html"
-        index.parent.mkdir(parents=True)
-        index.write_text("<h1>Live</h1>", encoding="utf-8")
-        app.update(status="running")
+        app.update(status="running", route="/site/")
         with patch.object(manager.urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value.__enter__.return_value.status = 200
             self.assertTrue(manager.check_app_health(app))
-            opener.assert_not_called()
-        self.assertIsNone(manager.app_health_url(app))
+            opener.assert_called_once()
+        self.assertEqual(manager.app_health_url(app), f"http://127.0.0.1:{app['port']}/site/")
         app["status"] = "stopped"
-        self.assertTrue(manager.check_app_health(app))
+        with patch.object(manager.urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value.__enter__.return_value.status = 200
+            self.assertTrue(manager.check_app_health(app))
+
+    def test_static_rollback_restores_the_selected_output_directory_and_publication(self):
+        app = self.add_app("Rollback static", framework="react", route="/portal/")["app"]
+        paths = manager._app_paths(app["id"], manager.get_config())
+        paths["releases"].mkdir(parents=True)
+        paths["current"].mkdir()
+        release = paths["releases"] / "older"
+        (release / "app" / "previous-dist").mkdir(parents=True)
+        (release / "app" / "previous-dist" / "index.html").write_text("old", encoding="utf-8")
+        service_path = Path(self.temp_dir.name) / "rollback.service"
+        service_path.write_text(
+            "\n".join((
+                "# Managed by Cockpit App Manager",
+                f"Description=Cockpit App Manager - {app['id']}",
+                f"User={app['service_user']}",
+            )),
+            encoding="utf-8",
+        )
+        with manager._registry_transaction() as registry:
+            stored = manager._find_app(registry, app["id"])
+            stored.update({
+                "status": "running", "static_export": True, "static_root": "new-dist",
+                "deployments": [
+                    {"id": "current", "status": "deployed", "release": str(paths["current"])},
+                    {
+                        "id": "older", "status": "deployed", "release": str(release),
+                        "framework": "react", "static_export": True, "static_root": "previous-dist",
+                    },
+                ],
+            })
+        with patch.object(manager, "_service_path", return_value=service_path), patch.object(
+            manager, "_write_service"
+        ) as write_service, patch.object(manager, "_atomic_symlink"), patch.object(
+            manager, "_systemctl"
+        ), patch.multiple(
+            manager, _wait_for_health=Mock(return_value=True), _assert_loopback_binding=Mock()
+        ):
+            result = manager.rollback_app(app["id"], "older")
+        self.assertIn(str(paths["current"] / "app" / "previous-dist"), write_service.call_args.args[2])
+        stored = manager._find_app(manager.get_registry(), app["id"])
+        self.assertEqual(stored["static_root"], "previous-dist")
+        self.assertEqual(stored["publication"]["port"], app["port"])
+        self.assertEqual(
+            Path(stored["publication"]["content_root"]),
+            paths["current"] / "app" / "previous-dist",
+        )
 
     def test_nextjs_health_path_matches_the_public_base_path(self):
         app = {"id": "demo", "framework": "nextjs", "port": 8123, "route": "/apps/demo/"}

@@ -41,21 +41,6 @@
 
       <div id="appManagerNotice" class="am-notice hidden" role="status" aria-live="polite"></div>
       <div id="appManagerError" class="am-error hidden" role="alert" aria-live="assertive"></div>
-      <section class="am-welcome" aria-labelledby="amWelcomeTitle">
-        <div class="am-welcome-copy">
-          <p class="am-welcome-kicker"><span aria-hidden="true"></span> Cockpit application platform</p>
-          <h2 id="amWelcomeTitle">Build, ship,<br class="am-welcome-break"> <span>and run.</span></h2>
-          <p>Deploy releases and check application runtime health in Cockpit.</p>
-        </div>
-        <div class="am-welcome-visual" aria-hidden="true">
-          <div class="am-welcome-orbit"></div>
-          <div class="am-welcome-tile am-welcome-tile--back"><i data-lucide="activity"></i></div>
-          <div class="am-welcome-tile am-welcome-tile--middle"><i data-lucide="globe"></i></div>
-          <div class="am-welcome-tile am-welcome-tile--front"><i data-lucide="boxes"></i></div>
-          <span class="am-welcome-spark am-welcome-spark--one"></span>
-          <span class="am-welcome-spark am-welcome-spark--two"></span>
-        </div>
-      </section>
       <div id="overviewCards" class="am-metrics" aria-label="Application summary"></div>
 
       <nav class="am-tabs" role="tablist" aria-label="App Manager sections">
@@ -207,7 +192,7 @@
             <div id="reactSetupFields" class="am-form-grid__wide" hidden>
               <label for="appOutputDirectory">React output directory <span class="am-optional">Optional</span></label>
               <input id="appOutputDirectory" name="output_directory" placeholder="dist (Vite) or build (Create React App)" maxlength="256" autocomplete="off" disabled />
-              <small class="am-field-hint">Builds static production files, without a start command or development server. Configure static serving and SPA fallback separately on the host.</small>
+              <small class="am-field-hint">Builds production files that App Manager serves on its loopback destination. No project start command or development server is needed.</small>
             </div>
             <div class="am-form-grid__wide"><label for="appGoPackage">Go main package <span class="am-optional">Optional</span></label><input id="appGoPackage" name="go_package" placeholder="./cmd/server" autocomplete="off" pattern="\.(?:/[A-Za-z0-9_\-][A-Za-z0-9_.\-]*)*" /></div>
             <div class="am-form-grid__wide"><label for="appStartCommand">Start command <span class="am-optional">JSON argument array</span></label><textarea id="appStartCommand" name="start_command" rows="2" spellcheck="false" placeholder='["node", "dist/server.js"]'></textarea></div>
