@@ -1276,6 +1276,57 @@ def _scoped_file_url(value: str, root: Path, route: str) -> str:
     return value
 
 
+def _prefix_srcset(value: str, root: Path, route: str) -> str:
+    replacements = []
+    position = 0
+    while position < len(value):
+        while position < len(value) and (value[position].isspace() or value[position] == ","):
+            position += 1
+        start = position
+        while position < len(value) and not value[position].isspace():
+            position += 1
+        end = position
+        while end > start and value[end - 1] == ",":
+            end -= 1
+        scoped = _scoped_file_url(value[start:end], root, route)
+        if scoped != value[start:end]:
+            replacements.append((start, end, scoped))
+        if end != position:
+            continue
+        parentheses = 0
+        while position < len(value):
+            char = value[position]
+            position += 1
+            if char == "," and not parentheses:
+                break
+            if char == "(":
+                parentheses += 1
+            elif char == ")" and parentheses:
+                parentheses -= 1
+    for start, end, scoped in reversed(replacements):
+        value = value[:start] + scoped + value[end:]
+    return value
+
+
+_CSS_ASSET_URL_RE = re.compile(
+    r"""/\*.*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"""
+    r"""(?<![\w-])url\(\s*(?:"(?P<double>[^"\\]*)"|'(?P<single>[^'\\]*)'|(?P<bare>[^\s"'()\\]*))\s*\)""",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _prefix_css_urls(content: str, root: Path, route: str) -> str:
+    def replace(match):
+        for group in ("double", "single", "bare"):
+            value = match.group(group)
+            if value is not None:
+                scoped = _scoped_file_url(value, root, route)
+                start, end = match.start(group) - match.start(), match.end(group) - match.start()
+                return match[0][:start] + scoped + match[0][end:]
+        return match[0]
+    return _CSS_ASSET_URL_RE.sub(replace, content)
+
+
 def _prefix_web_manifest(path: Path, root: Path, route: str) -> None:
     contents = path.read_text(encoding="utf-8")
     try:
@@ -1310,16 +1361,22 @@ class _StaticAssetParser(HTMLParser):
         for line in content.splitlines(keepends=True):
             self.offsets.append(self.offsets[-1] + len(line))
         self.replacements = []
+        self.in_style = False
 
     def handle_starttag(self, tag, attrs):
+        if tag == "style":
+            self.in_style = True
         updated = []
         changed = False
         for name, value in attrs:
             if tag == "base" and name == "href" and value == "/":
                 value = self.route
                 changed = True
-            elif tag != "base" and name in {"src", "href", "poster", "data"} and value:
-                scoped = _scoped_file_url(value, self.root, self.route)
+            elif value and tag != "base" and name in {"src", "href", "poster", "data", "srcset", "imagesrcset", "style"}:
+                prepare = _prefix_srcset if name in {"srcset", "imagesrcset"} else (
+                    _prefix_css_urls if name == "style" else _scoped_file_url
+                )
+                scoped = prepare(value, self.root, self.route)
                 changed = changed or scoped != value
                 value = scoped
             updated.append(name if value is None else f'{name}="{escape(value, quote=True)}"')
@@ -1330,7 +1387,22 @@ class _StaticAssetParser(HTMLParser):
             start = self.offsets[line - 1] + column
             self.replacements.append((start, start + len(original), "<" + tag + " " + " ".join(updated) + ending))
 
-    handle_startendtag = handle_starttag
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag == "style":
+            self.in_style = False
+
+    def handle_endtag(self, tag):
+        if tag == "style":
+            self.in_style = False
+
+    def handle_data(self, data):
+        if self.in_style:
+            scoped = _prefix_css_urls(data, self.root, self.route)
+            if scoped != data:
+                line, column = self.getpos()
+                start = self.offsets[line - 1] + column
+                self.replacements.append((start, start + len(data), scoped))
 
 
 def _prefix_static_html_assets(app_dir: Path, route: str) -> None:
@@ -1344,6 +1416,11 @@ def _prefix_static_html_assets(app_dir: Path, route: str) -> None:
                 continue
             if path.suffix == ".webmanifest" or name == "manifest.json":
                 _prefix_web_manifest(path, app_dir.resolve(strict=True), route)
+            elif path.suffix == ".css":
+                content = path.read_text(encoding="utf-8")
+                scoped = _prefix_css_urls(content, app_dir.resolve(strict=True), route)
+                if scoped != content:
+                    path.write_text(scoped, encoding="utf-8")
             elif path.suffix == ".html":
                 content = path.read_text(encoding="utf-8")
                 parser = _StaticAssetParser(content, app_dir, route)

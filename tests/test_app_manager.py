@@ -6,12 +6,15 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, call as mock_call, patch
@@ -294,9 +297,9 @@ class AppManagerTests(unittest.TestCase):
             ))
 
     def test_react_deployment_builds_as_static_with_managed_environment_and_no_service(self):
-        for tool in ("vite", "react-scripts"):
-            with self.subTest(tool=tool):
-                app = self.add_app("React " + tool, framework="auto", route="/frontend/",
+        for tool, route in (("vite", "/frontend/"), ("react-scripts", "/frontend/"), ("vite", "/")):
+            with self.subTest(tool=tool, route=route):
+                app = self.add_app("React " + tool + (" root" if route == "/" else ""), framework="auto", route=route,
                                    build_config={"app_directory": "frontend", "output_directory": "site"})["app"]
                 paths = manager._app_paths(app["id"], manager.get_config())
                 project = paths["source"] / "frontend"
@@ -340,6 +343,14 @@ class AppManagerTests(unittest.TestCase):
                 self.assertEqual(result["app"]["static_root"], "frontend/site")
                 self.assertTrue(result["app"]["static_export"])
                 self.assertEqual(result["deployment"]["status"], "deployed")
+                self.assertEqual(result["routing"], result["app"]["nginx_route"])
+                if route == "/":
+                    self.assertIsNone(result["routing"])
+                    self.assertIn("root path /", result["routing_error"])
+                else:
+                    self.assertTrue(result["routing"]["activation_required"])
+                    self.assertIn("/current/app/frontend/site", result["routing"]["snippet"])
+                    self.assertIsNone(result["routing_error"])
                 self.assertEqual((Path(result["deployment"]["release"]) / "app" / "frontend" / "site" / "index.html").read_text(), "<h1>React release</h1>")
                 self.assertTrue(seal.call_args.kwargs["public"])
                 self.assertIsNone(manager.app_health_url(result["app"]))
@@ -347,11 +358,171 @@ class AppManagerTests(unittest.TestCase):
                 systemctl.assert_not_called()
                 self.assertTrue(environments)
                 for environment in environments:
-                    self.assertEqual(environment["PUBLIC_URL"], "/frontend")
+                    self.assertEqual(environment["PUBLIC_URL"], route.rstrip("/") or "/")
                     self.assertEqual(environment["BUILD_PATH"], "site")
                     self.assertEqual(environment["VITE_LABEL"], "public")
                     self.assertEqual(environment["CI"], "true")
                     self.assertEqual(environment["npm_config_registry"], "http://127.0.0.1:4873/")
+
+    def test_nginx_route_snippets_scope_static_files_and_proxy_prefixes(self):
+        config = manager.get_config()
+        app = self.add_app("Music", framework="react", route="/apps/music/")["app"]
+        app["static_root"] = "frontend/site output"
+        with patch.object(manager, "_systemctl") as systemctl, patch.object(manager, "_atomic_json_write") as write:
+            routing = manager._render_nginx_route(app, config)
+        snippet = routing["snippet"]
+        root = manager._app_paths(app["id"], config)["current"] / "app" / app["static_root"]
+        self.assertIn(f'root "{root.as_posix()}";', snippet)
+        self.assertIn("location = /apps/music {", snippet)
+        self.assertIn("return 308 /apps/music/$is_args$args;", snippet)
+        self.assertIn("location ^~ /apps/music/ {", snippet)
+        self.assertIn("rewrite ^/apps/music/(.*)$ /$1 break;", snippet)
+        self.assertIn("try_files $uri/index.html $uri @app_manager_music;", snippet)
+        self.assertIn('if ($http_accept !~* "text/html") { return 404; }', snippet)
+        self.assertIn('if ($uri ~ "(^|/)\\.") { return 404; }', snippet)
+        self.assertNotIn("location / {", snippet)
+        self.assertNotIn("proxy_pass", snippet)
+        systemctl.assert_not_called()
+        write.assert_not_called()
+        for framework in ("static", "nextjs"):
+            exported = manager._render_nginx_route(dict(app, framework=framework, static_export=True), config)["snippet"]
+            self.assertIn("try_files $uri/index.html $uri =404;", exported)
+            self.assertNotIn("@app_manager_", exported)
+        for framework in ("nextjs", "node", "go", "python"):
+            with self.subTest(framework=framework):
+                dynamic = dict(app, framework=framework, static_export=False)
+                proxy = manager._render_nginx_route(dynamic, config)["snippet"]
+                suffix = "" if framework == "nextjs" else "/"
+                self.assertIn(f"proxy_pass http://127.0.0.1:{app['port']}{suffix};", proxy)
+                self.assertIn("proxy_set_header X-Forwarded-Prefix /apps/music;", proxy)
+                self.assertNotIn("    root ", proxy)
+
+    def test_nginx_route_export_rejects_root_unsafe_paths_and_invalid_ports(self):
+        app = self.add_app(framework="react")["app"]
+        config = manager.get_config()
+        with self.assertRaisesRegex(ValueError, "root path"):
+            manager._render_nginx_route(dict(app, route="/"), config)
+        for path in ("../secrets", "/tmp/output", 'dist/$host', 'dist/"injected', "dist/\n"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                manager._render_nginx_route(dict(app, static_root=path), config)
+        for port in (8080, 9000, True, "8100"):
+            with self.subTest(port=port), self.assertRaisesRegex(ValueError, "invalid port"):
+                manager._render_nginx_route(dict(app, framework="node", port=port), config)
+
+    def test_registry_rejects_corrupted_nginx_route_exports(self):
+        app = self.add_app()["app"]
+        for fields in ({"nginx_route": []}, {"nginx_route": {"snippet": 1}}, {"nginx_route_error": {}}):
+            with self.subTest(fields=fields):
+                manager.save_registry({"apps": [dict(app, **fields)]})
+                with self.assertRaisesRegex(ValueError, "Application nginx_route"):
+                    manager.get_registry()
+
+    def test_nginx_route_cli_requires_a_current_matching_deployment_and_is_read_only(self):
+        app = self.add_app(framework="react")["app"]
+        with self.assertRaisesRegex(ValueError, "Deploy this application"):
+            manager.nginx_route_app(app["id"])
+        config = manager.get_config()
+        app.update(static_root="frontend/dist", static_export=True, last_deploy=manager.now_iso())
+        app["nginx_route"] = manager._render_nginx_route(app, config)
+        output = manager._app_paths(app["id"], config)["current"] / "app" / "frontend" / "dist"
+        output.mkdir(parents=True)
+        index = output / "index.html"
+        index.write_text("Ready", encoding="utf-8")
+        manager.save_registry({"apps": [app]})
+        before = Path(manager.DEFAULT_REGISTRY_PATH).read_bytes()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), patch.object(manager, "_systemctl") as systemctl:
+            self.assertEqual(manager.main(["nginx-route", app["id"]]), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {"ok": True, **app["nginx_route"]})
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(Path(manager.DEFAULT_REGISTRY_PATH).read_bytes(), before)
+        systemctl.assert_not_called()
+        index.unlink()
+        with self.assertRaisesRegex(ValueError, "missing index.html"):
+            manager.nginx_route_app(app["id"])
+        index.write_text("Ready", encoding="utf-8")
+        manager.edit_app(app["id"], {"route": "/changed/"})
+        with self.assertRaisesRegex(ValueError, "configuration changed; redeploy"):
+            manager.nginx_route_app(app["id"])
+
+    @unittest.skipUnless(shutil.which("nginx"), "requires an Nginx executable for isolated HTTP checks")
+    def test_nginx_route_serves_assets_directory_indexes_and_spa_without_changing_root(self):
+        app = self.add_app("Music", framework="react", route="/apps/music/")["app"]
+        app["static_root"] = "frontend/dist"
+        content = manager._app_paths(app["id"], manager.get_config())["current"] / "app" / app["static_root"]
+        for filename, value in {
+            "index.html": "<h1>React frontend</h1>",
+            "assets/app.js": "console.log('scoped');",
+            "assets/style.css": "body {color: red}",
+            "guide/index.html": "<h1>Guide</h1>",
+            ".env": "SECRET=not-public",
+        }.items():
+            path = content / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value, encoding="utf-8")
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        prefix = (Path(self.temp_dir.name) / "nginx").resolve()
+        prefix.mkdir()
+        configuration = prefix / "nginx.conf"
+        configuration.write_text(
+            f'pid "{(prefix / "nginx.pid").as_posix()}";\n'
+            f'error_log "{(prefix / "error.log").as_posix()}";\n'
+            "events {}\nhttp {\naccess_log off;\n"
+            "types { text/html html; text/css css; application/javascript js; }\n"
+            + "".join(f'{kind}_temp_path "{(prefix / kind).as_posix()}";\n'
+                      for kind in ("client_body", "proxy", "fastcgi", "uwsgi", "scgi"))
+            + f"server {{ listen 127.0.0.1:{port};\n"
+            "location = / { return 200 'root-site-preserved'; }\n"
+            "location / { return 404; }\n"
+            + manager._render_nginx_route(app, manager.get_config())["snippet"]
+            + "}\n}\n", encoding="utf-8",
+        )
+        command = [shutil.which("nginx"), "-p", prefix.as_posix(), "-c", configuration.as_posix(), "-e", "stderr"]
+        checked = subprocess.run([*command, "-t"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        process = subprocess.Popen([*command, "-g", "daemon off; master_process off;"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def fetch(path, accept="*/*"):
+            request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"Accept": accept})
+            try:
+                response = opener.open(request, timeout=1)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                return response.status, response.read().decode(), response.headers
+
+        try:
+            for attempt in range(50):
+                if process.poll() is not None:
+                    self.fail("Isolated Nginx exited: " + process.stderr.read().decode())
+                try:
+                    fetch("/")
+                    break
+                except urllib.error.URLError:
+                    if attempt == 49:
+                        raise
+                    time.sleep(0.1)
+            self.assertEqual(fetch("/")[:2], (200, "root-site-preserved"))
+            self.assertEqual(fetch("/apps/music/")[:2], (200, "<h1>React frontend</h1>"))
+            script = fetch("/apps/music/assets/app.js")
+            self.assertEqual(script[:2], (200, "console.log('scoped');"))
+            self.assertEqual(script[2]["Content-Type"], "application/javascript")
+            self.assertEqual(fetch("/apps/music/assets/style.css")[2]["Content-Type"], "text/css")
+            self.assertEqual(fetch("/apps/music/guide/")[:2], (200, "<h1>Guide</h1>"))
+            self.assertEqual(fetch("/apps/music/player/123?mode=play", "text/html")[:2], (200, "<h1>React frontend</h1>"))
+            self.assertEqual(fetch("/apps/music/assets/missing.js")[0], 404)
+            self.assertEqual(fetch("/apps/music/.env", "text/html")[0], 404)
+            self.assertEqual(fetch("/assets/app.js")[0], 404)
+            self.assertEqual(fetch("/apps/music?keep=1")[0], 200)
+            (content / "index.html").unlink()
+            self.assertEqual(fetch("/apps/music/missing", "text/html")[0], 404)
+        finally:
+            process.terminate()
+            process.communicate(timeout=10)
 
 
     def python_payload(self, **overrides):
@@ -2526,12 +2697,14 @@ class AppManagerTests(unittest.TestCase):
                     for name, replacement in mocks.items():
                         stack.enter_context(patch.object(manager, name, replacement))
                     if health_passes:
-                        manager.deploy_app(app["id"])
+                        result = manager.deploy_app(app["id"])
                         self.assertLess(events.index("health"), events.index("symlink"))
                         self.assertLess(events.index("symlink"), events.index(("disable", "--now", primary.name)))
                         stored = manager._find_app(manager.get_registry(), app["id"])
                         self.assertEqual(stored["service_slot"], "secondary")
                         self.assertEqual(stored["deployed_commit"], "b" * 40)
+                        self.assertIn(f"proxy_pass http://127.0.0.1:{stored['port']};", result["routing"]["snippet"])
+                        self.assertNotIn(f"127.0.0.1:{app['port']};", result["routing"]["snippet"])
                         self.assertFalse(paths["source"].exists())
                     else:
                         with self.assertRaisesRegex(RuntimeError, "health check"):
@@ -3771,6 +3944,52 @@ class FrameworkAdapterTests(unittest.TestCase):
             self.assertIn('const url="/assets/icon.svg";', output)
             self.assertIn('src="//cdn.example/icon.svg"', output)
             self.assertNotIn("/docs/docs/", output)
+            self.assertEqual((source / "index.html").read_text(encoding="utf-8"), page)
+
+    def test_static_css_and_responsive_assets_are_scoped_without_rewriting_code_or_data_urls(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            (source / "assets").mkdir(parents=True)
+            (source / "assets" / "icon.svg").write_text("<svg/>", encoding="utf-8")
+            css = (
+                '/* url(/assets/icon.svg) */\n'
+                '.icon { background: URL( "/assets/icon.svg?v=1#mark" ); }\n'
+                '.literal::after { content: "url(/assets/icon.svg)"; }\n'
+                ".raw { mask: url(/assets/icon.svg); }\n"
+                '.keep { a: url("//cdn.example/icon.svg"); b: url("/other-app/icon.svg"); '
+                'c: url("/docs/assets/icon.svg"); d: url(data:image/svg+xml;base64,AAAA); '
+                'e: url("../assets/icon.svg"); f: url("/assets/../assets/icon.svg"); }\n'
+            )
+            (source / "site.css").write_text(css, encoding="utf-8")
+            page = (
+                '<link rel="preload" imagesrcset="/assets/icon.svg 1x, /assets/icon.svg?v=2 2x">'
+                '<img srcset="data:image/svg+xml;base64,AAAA 1x, /assets/icon.svg 2x">'
+                '<img srcset="/assets/icon.svg, /other-app/icon.svg 2x">'
+                '<div style="background:url(/assets/icon.svg)"></div>'
+                '<style>.logo { background:url(/assets/icon.svg) }</style>'
+                '<script>const text = "url(/assets/icon.svg)";</script>'
+            )
+            (source / "index.html").write_text(page, encoding="utf-8")
+            result = get_adapter("static").build({"route": "/docs/"}, source, root / "release")
+            output = Path(result["release_dir"]) / "app"
+            prepared = (output / "site.css").read_text(encoding="utf-8")
+            self.assertIn('URL( "/docs/assets/icon.svg?v=1#mark" )', prepared)
+            self.assertIn("mask: url(/docs/assets/icon.svg)", prepared)
+            self.assertIn('/* url(/assets/icon.svg) */', prepared)
+            self.assertIn('content: "url(/assets/icon.svg)"', prepared)
+            self.assertIn(css[css.index(".keep"):], prepared)
+            html = (output / "index.html").read_text(encoding="utf-8")
+            self.assertIn('imagesrcset="/docs/assets/icon.svg 1x, /docs/assets/icon.svg?v=2 2x"', html)
+            self.assertIn('srcset="data:image/svg+xml;base64,AAAA 1x, /docs/assets/icon.svg 2x"', html)
+            self.assertIn('srcset="/docs/assets/icon.svg, /other-app/icon.svg 2x"', html)
+            self.assertIn('style="background:url(/docs/assets/icon.svg)"', html)
+            self.assertIn('<style>.logo { background:url(/docs/assets/icon.svg) }</style>', html)
+            self.assertIn('const text = "url(/assets/icon.svg)"', html)
+            adapters._prefix_static_html_assets(output, "/docs/")
+            self.assertEqual((output / "index.html").read_text(encoding="utf-8"), html)
+            self.assertEqual((output / "site.css").read_text(encoding="utf-8"), prepared)
+            self.assertEqual((source / "site.css").read_text(encoding="utf-8"), css)
             self.assertEqual((source / "index.html").read_text(encoding="utf-8"), page)
 
     def test_all_frameworks_prepare_html_and_manifest_in_the_release_copy(self):

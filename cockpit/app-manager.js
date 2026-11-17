@@ -277,7 +277,7 @@
             </div>
             ${renderStatus(observedStatus(app))}
           </header>
-          <div class="am-app-route">${icon("globe")}<code>${escapeHtml(app.route)}</code><span class="am-route-state">Routing is managed separately</span></div>
+          <div class="am-app-route">${icon("globe")}<code>${escapeHtml(app.route)}</code><span class="am-route-state">${app.nginx_route ? "Nginx snippet available; activation is manual" : "Routing is managed separately"}</span></div>
           <p class="am-repository" title="${escapeHtml(app.repo_url)}">${icon("git-branch")}<span>${escapeHtml(app.repo_url)}</span></p>
           <dl class="am-app-meta">
             <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
@@ -302,6 +302,7 @@
           ${app.deployment_mode === "approval" && app.pending_update && app.pending_update.commit !== app.deployed_commit ? `<p class="am-route-state">Awaiting approval: <code>${escapeHtml(app.pending_update.commit.slice(0, 7))}</code></p>` : ""}
           ${app.health && (app.health.local_healthy === false || app.health.service_error) ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${escapeHtml(app.health.local_error || app.health.service_error)}</span></p>` : ""}
           ${app.auto_deploy_state?.error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Automatic deployment: ${escapeHtml(app.auto_deploy_state.error)}</span></p>` : ""}
+          ${app.nginx_route_error ? `<p class="am-route-state">Nginx snippet unavailable: ${escapeHtml(app.nginx_route_error)}</p>` : ""}
           ${app.deployments?.[0]?.cleanup_error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Deployment is live; cleanup needs attention: ${escapeHtml(app.deployments[0].cleanup_error)}</span></p>` : ""}
           ${lastFailure ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${app.status === "running" ? "Latest deployment failed. Previous release is still live." : "Latest deployment failed."} <button type="button" data-action="deployment-log" data-id="${appId}">View log</button></span></p>` : ""}
           <div class="am-app-actions" aria-label="Actions for ${escapeHtml(app.name)}">
@@ -315,6 +316,7 @@
                 ${staticApp ? "" : `<button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>`}
                 <button type="button" data-action="health" data-id="${appId}"${runtimeUnavailable}>${icon("activity")} Check health</button>
                 <button type="button" data-action="preflight" data-id="${appId}"${unavailable}>${icon("search")} Run preflight</button>
+                <button type="button" data-action="nginx-route" data-id="${appId}"${deploying || !app.last_deploy || app.route === "/" ? " disabled data-unavailable" : ""}>${icon("globe")} Nginx route</button>
                 ${app.python_services?.worker ? `<button type="button" data-action="worker-status" data-id="${appId}">${icon("activity")} Worker status</button>
                 <button type="button" data-action="worker-logs" data-id="${appId}">${icon("square-terminal")} Worker logs</button>
                 <button type="button" data-action="worker-restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart worker</button>` : ""}
@@ -871,7 +873,7 @@
         <label>Deployment policy<select name="deployment_mode"><option value="automatic"${app.deployment_mode !== "approval" ? " selected" : ""}>Automatic</option><option value="approval"${app.deployment_mode === "approval" ? " selected" : ""}>Approval required</option></select></label>
         <label class="am-checkbox"><input type="checkbox" name="auto_deploy"${app.auto_deploy !== false ? " checked" : ""}> Automatic deployment</label>
       </div>
-      <small class="am-field-hint">App Manager only configures the application path. Configure domains and routing separately in Nginx Proxy Manager; Next.js receives APP_BASE_PATH during build.</small>
+      <small class="am-field-hint">Deployment configures the base path and generates an Nginx snippet. Activate it separately in Nginx Proxy Manager; the existing root site is not changed.</small>
       <div class="am-project-directory">
         <label for="editAppDirectory">Project directory</label>
         <input id="editAppDirectory" name="app_directory" value="${escapeHtml(app.build_config?.app_directory || "")}" placeholder="Repository root (or apps/web)" autocomplete="off">
@@ -1231,9 +1233,7 @@
     }
   }
 
-  async function copyDeploymentLog() {
-    const text = state.logTarget?.logs || "";
-    if (!text) throw new Error("There is no deployment log to copy yet.");
+  async function copyText(text) {
     if (window.navigator.clipboard?.writeText) {
       await window.navigator.clipboard.writeText(text);
       return;
@@ -1253,16 +1253,26 @@
     if (!copied) throw new Error("Clipboard access is unavailable in this Cockpit session.");
   }
 
+  async function copyDeploymentLog() {
+    const text = state.logTarget?.logs || "";
+    if (!text) throw new Error("There is no deployment log to copy yet.");
+    await copyText(text);
+  }
+
   function downloadDeploymentLog() {
     const text = state.logTarget?.logs || "";
     if (!text) throw new Error("There is no deployment log to download yet.");
     const appId = String(state.logTarget.appId || "application").replace(/[^a-z0-9-]/gi, "-");
     const deploymentId = String(state.logTarget.deploymentId || "latest").replace(/[^a-z0-9-]/gi, "-");
+    downloadText(text, `deployment-${appId}-${deploymentId}.txt`);
+  }
+
+  function downloadText(text, filename) {
     const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `deployment-${appId}-${deploymentId}.txt`;
+    link.download = filename;
     document.body.append(link);
     link.click();
     link.remove();
@@ -1472,6 +1482,35 @@
       ${(report.warnings || []).map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}`);
   }
 
+  async function showNginxRoute(app) {
+    const result = await callBackend("nginx-route", [app.id]);
+    if (typeof result.snippet !== "string" || !result.snippet.trim() || typeof result.filename !== "string") {
+      throw new Error("The backend did not return an Nginx route snippet.");
+    }
+    openDialog(`Nginx route: ${app.name}`, `
+      <p>Generated for <code>${escapeHtml(result.route)}</code>. This snippet is not active.</p>
+      <p>In the existing Nginx Proxy Manager proxy host, add it to <strong>Advanced</strong>, replacing only this application's previous snippet. Check for conflicting custom locations, test the configuration, then save/reload through NPM. Keep the root site and other applications unchanged.</p>
+      <p>${isStaticApp(app)
+        ? "NPM must be able to read the generated /opt/webapps content path. React browser navigations fall back to index.html; asset requests must resolve to real files."
+        : "Next.js keeps the prefix upstream; other runtimes receive a stripped path and X-Forwarded-Prefix. Dynamic redeployments can change the port: replace this snippet after every deployment, including automatic deployments."}</p>
+      <p>Vite/CRA and Next.js builds use the base path. Application routers and computed API/asset URLs must also honor it; React Router needs a matching basename.</p>
+      <p>Review access controls and WebSocket settings for these locations; settings on the existing / location do not automatically carry over.</p>
+      <pre id="nginxRouteSnippet" class="am-log-output" tabindex="0" aria-label="Nginx route snippet">${escapeHtml(result.snippet)}</pre>
+      <button id="copyNginxRouteButton" type="button" class="am-button">${icon("copy")} Copy snippet</button>
+      <button id="downloadNginxRouteButton" type="button" class="am-button">${icon("download")} Download .conf</button>
+      <button id="nginxRouteManagerButton" type="button" class="am-button">Nginx Proxy Manager ${icon("arrow-up-right")}</button>`);
+    byId("copyNginxRouteButton").addEventListener("click", () => {
+      void runOperation(() => copyText(result.snippet), "Nginx route snippet copied.", false);
+    });
+    byId("downloadNginxRouteButton").addEventListener("click", () => {
+      try { downloadText(result.snippet, result.filename); } catch (error) { showError(error); }
+    });
+    byId("nginxRouteManagerButton").addEventListener("click", () => {
+      byId("appManagerDialog").close();
+      byId("tab-npm").click();
+    });
+  }
+
   async function showUpdateReview(app) {
     const result = await callBackend("review-update", [app.id]);
     const pending = result.pending_update;
@@ -1502,6 +1541,10 @@
     }
     if (action === "logs") {
       showLogs(appId);
+      return;
+    }
+    if (action === "nginx-route") {
+      await runOperation(() => showNginxRoute(app), "", false);
       return;
     }
     if (["worker-status", "worker-logs", "worker-restart"].includes(action)) {

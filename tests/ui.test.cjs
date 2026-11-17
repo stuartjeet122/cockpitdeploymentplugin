@@ -1111,6 +1111,65 @@ test("deployment logs can be copied and downloaded as plain text", async () => {
   } finally { ui.dom.window.close(); }
 });
 
+test("Nginx snippets can be read, copied and downloaded without activating host routing", async () => {
+  const snippet = 'location ^~ /portal/ {\n    proxy_pass http://127.0.0.1:8100;\n}\n# <script>not HTML</script>\n';
+  const ui = await loadUi({
+    "nginx-route": { route: "/portal/", filename: "app-manager-portal.conf", snippet, activation_required: true },
+  });
+  let copied, downloaded, downloadName;
+  Object.defineProperty(ui.window.navigator, "clipboard", {
+    configurable: true, value: { writeText: async (text) => { copied = text; } },
+  });
+  Object.defineProperty(ui.window.URL, "createObjectURL", {
+    configurable: true, value: (blob) => { downloaded = blob; return "blob:nginx-route"; },
+  });
+  Object.defineProperty(ui.window.URL, "revokeObjectURL", { configurable: true, value: () => {} });
+  ui.window.HTMLAnchorElement.prototype.click = function () { downloadName = this.download; };
+  try {
+    ui.document.querySelector('[data-action="nginx-route"][data-id="portal"]').click();
+    await settle(ui.window);
+    assert.equal(ui.document.querySelector("#nginxRouteSnippet").textContent, snippet);
+    assert.equal(ui.document.querySelector("#nginxRouteSnippet script"), null);
+    const body = ui.document.querySelector(".am-dialog-body").textContent;
+    assert.match(body, /not active/);
+    assert.match(body, /existing Nginx Proxy Manager proxy host/);
+    assert.match(body, /after every deployment, including automatic deployments/);
+    ui.document.querySelector("#copyNginxRouteButton").click();
+    await settle(ui.window);
+    assert.equal(copied, snippet);
+    ui.document.querySelector("#downloadNginxRouteButton").click();
+    assert.equal(downloadName, "app-manager-portal.conf");
+    assert.equal(downloaded.type, "text/plain;charset=utf-8");
+    ui.document.querySelector("#nginxRouteManagerButton").click();
+    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+    assert.equal(ui.document.querySelector("#tab-npm").getAttribute("aria-selected"), "true");
+    assert.deepEqual(ui.calls.filter(call => call.command === "nginx-route").map(call => call.values), [["portal"]]);
+    assert.ok(!ui.calls.some(call => /reload|activate|infrastructure/.test(call.command)));
+  } finally { ui.dom.window.close(); }
+});
+
+test("Nginx route export disables unsafe states and surfaces missing or stale deployment errors", async () => {
+  const ui = await loadUi({
+    list: { apps: [
+      ...fixtureApps,
+      { ...fixtureApps[0], id: "root", route: "/" },
+      { ...fixtureApps[0], id: "busy", status: "deploying" },
+      { ...fixtureApps[0], id: "legacy", framework: "docker" },
+    ] },
+    "nginx-route": { ok: false, error: "Application routing configuration changed; redeploy before exporting its Nginx route" },
+  });
+  try {
+    for (const id of ["docs", "root", "busy"]) {
+      assert.equal(ui.document.querySelector(`[data-action="nginx-route"][data-id="${id}"]`).disabled, true, id);
+    }
+    assert.equal(ui.document.querySelector('[data-action="nginx-route"][data-id="legacy"]'), null);
+    ui.document.querySelector('[data-action="nginx-route"][data-id="portal"]').click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector("#appManagerError").textContent, /redeploy before exporting/);
+    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+  } finally { ui.dom.window.close(); }
+});
+
 test("delayed dialog loads prevent competing edits and duplicate requests", async () => {
   for (const command of ["env-get", "deployment-logs"]) {
     let release;

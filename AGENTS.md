@@ -42,7 +42,8 @@ If detection is uncertain or the app uses a nonstandard startup pattern, supply 
 - The plugin must remain a native Cockpit integration, not a standalone site.
 - UI actions should call the backend with structured JSON input and render backend responses cleanly.
 - The project-directory picker calls `repository-tree` with `{id, repo_url, branch}` over stdin. Browse only validated Git remotes/branches in temporary no-checkout clones as the dedicated app account; never mutate the live source/release. Folder selection configures `build_config.app_directory` for Next.js/React and must preserve other build configuration.
-- Treat the application path as build/runtime configuration only. Portainer and Nginx Proxy Manager tabs only open external browser links configured in Settings; do not embed their interfaces, proxy APIs, collect credentials, create domains, or modify host web-server routing.
+- The application path configures builds/runtime and an inactive app-specific Nginx snippet generated on successful deployment. Expose it through the read-only `nginx-route` CLI and copy/download dialog; only the administrator activates it in NPM. Refuse `/` exports, use managed static paths or validated loopback ports, and never write/reload live Nginx configuration. Portainer and Nginx Proxy Manager tabs only open external browser links configured in Settings; do not embed their interfaces, proxy APIs, collect credentials, or create domains.
+- Shared release preparation scopes known local HTML/CSS/manifest assets, including responsive image candidates and literal CSS `url()` values. Preserve source, comments, data/external URLs, already-prefixed references and other applications; do not rewrite arbitrary runtime JavaScript.
 
 ## Security requirements
 
@@ -65,6 +66,7 @@ If detection is uncertain or the app uses a nonstandard startup pattern, supply 
 - Each app gets its own service account, systemd unit, logs, config directory, and loopback-bound runtime port.
 - Dynamic apps run on `127.0.0.1` only, never on a public interface.
 - Static apps should be deployed as files with no unnecessary runtime process. Serving and virtual-host routing are configured separately by the host administrator.
+- Generated snippets serve static files through `current` (React gets an HTML-navigation SPA fallback). Dynamic Next.js preserves its prefix upstream; other runtimes receive a stripped path and `X-Forwarded-Prefix`. Dynamic candidate ports may change, so the administrator must replace the snippet after each deployment, including automatic updates. Do not silently activate or claim live/public routing.
 
 ## Directory structure
 
