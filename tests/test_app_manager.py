@@ -67,8 +67,13 @@ class AppManagerTests(unittest.TestCase):
             ("python-requirements", {"requirements.txt": "flask\n"}, "python"),
             ("python-pyproject", {"pyproject.toml": "[project]\nname = 'demo'\n"}, "python"),
             ("node", {"package.json": '{"scripts":{"start":"node server.js"}}'}, "node"),
-            ("dockerfile", {"Dockerfile": "FROM scratch\n"}, "docker"),
-            ("docker-compose", {"compose.yaml": "services: {}\n"}, "docker"),
+            ("react-vite", {"package.json": '{"dependencies":{"react":"^19"},"devDependencies":{"vite":"^7"}}'}, "react"),
+            ("react-cra", {"package.json": '{"dependencies":{"react":"^18","react-scripts":"5"}}'}, "react"),
+            ("react-next", {"package.json": '{"dependencies":{"react":"^19","next":"^15","vite":"^6"}}'}, "nextjs"),
+            ("react-node-server", {"package.json": '{"dependencies":{"react":"^19"},"scripts":{"start":"node server.js"}}'}, "node"),
+            ("react-vite-server", {"package.json": '{"dependencies":{"react":"^19","vite":"^7"},"scripts":{"start":"node server.js"}}'}, "node"),
+            ("react-go-backend", {"go.mod": "module example.com/demo\n", "package.json": '{"dependencies":{"react":"^19","vite":"^6"}}'}, "go"),
+            ("react-with-dockerfile", {"Dockerfile": "FROM scratch\n", "package.json": '{"dependencies":{"react":"^19","vite":"^6"}}'}, "react"),
             ("static", {"index.html": "<html></html>"}, "static"),
         )
         for name, files, expected in cases:
@@ -77,6 +82,168 @@ class AppManagerTests(unittest.TestCase):
                 for filename, contents in files.items():
                     (repo / filename).write_text(contents, encoding="utf-8")
                 self.assertEqual(detect_framework(repo), expected)
+
+    def test_container_only_repositories_and_docker_registration_are_unsupported(self):
+        for filename in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / filename).write_text("FROM scratch\n" if filename == "Dockerfile" else "services: {}\n", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "Could not detect"):
+                    detect_framework(root)
+        with self.assertRaisesRegex(ValueError, "Unsupported framework"):
+            get_adapter("docker")
+        with self.assertRaisesRegex(ValueError, "Framework must be one of"):
+            self.add_app(framework="docker")
+
+    def test_external_manager_settings_preserve_browser_paths_and_reject_unsafe_urls(self):
+        self.assertEqual(manager.get_settings()["config"]["integrations"], {"portainer_url": "", "npm_url": ""})
+        for portainer, npm in (
+            ("/manage-docker/", "/nginx/"),
+            ("https://stuserver.online/portainer/", "https://proxy.example:81/"),
+            ("https://portainer.example:9443/", "/"),
+            ("", ""),
+        ):
+            with self.subTest(portainer=portainer, npm=npm):
+                result = manager.update_settings({"integrations": {"portainer_url": portainer, "npm_url": npm}})
+                expected = {"portainer_url": portainer, "npm_url": npm}
+                self.assertEqual(result["config"]["integrations"], expected)
+                self.assertEqual(manager.get_settings()["config"]["integrations"], expected)
+        for value in (
+            "javascript:alert(1)", "ftp://example.com", "//example.com/path", "///example.com",
+            "/\\example.com", "https://user:pass@example.com", "http://example.com:0",
+            "https://example.com:invalid", "https://example.com/?secret=1", "/path#fragment",
+            "https://example.com/\npath", "\t/path", "/path\x7f", "/?", "/#", True,
+        ):
+            for key in ("portainer_url", "npm_url"):
+                with self.subTest(value=value, key=key), self.assertRaises(ValueError):
+                    manager.update_settings({"integrations": {key: value}})
+
+    def test_retired_integration_command_returns_structured_failure(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = manager.main(["integration"])
+        self.assertNotEqual(status, 0)
+        self.assertFalse(json.loads(stdout.getvalue())["ok"])
+        self.assertIn("invalid choice", stderr.getvalue())
+
+    def test_legacy_docker_registrations_are_read_only_and_do_not_block_native_apps(self):
+        native = self.add_app("Native Site")["app"]
+        legacy = self.add_app("Legacy Container")["app"]
+        registry = manager.get_registry()
+        stored = next(app for app in registry["apps"] if app["id"] == legacy["id"])
+        stored.update({
+            "framework": "docker", "status": "running", "auto_deploy": True,
+            "build_config": {"docker_mode": "compose", "compose_file": "compose.yaml", "compose_service": "web"},
+            "compose_images": ["cockpit-app-manager-legacy-container-web:0123456789abcdef"],
+            "container_image": "cockpit-app-manager-legacy-container:0123456789abcdef",
+            "deployments": [{"id": "20261108220923-abcdef12", "status": "deploying"}],
+        })
+        Path(stored["source_path"]).mkdir(parents=True)
+        manager.write_json(Path(manager.DEFAULT_REGISTRY_PATH), registry)
+        before = Path(manager.DEFAULT_REGISTRY_PATH).read_bytes()
+        with patch.object(manager, "run_command", side_effect=AssertionError("Must not execute host commands")), \
+                patch.object(manager, "_run_as_user", side_effect=AssertionError("Must not run application commands")), \
+                patch.object(manager, "git_output", side_effect=AssertionError("Must not inspect legacy source")), \
+                patch.object(manager, "_require_root"):
+            apps = manager.list_apps()["apps"]
+            unsupported = next(app for app in apps if app["id"] == legacy["id"])
+            self.assertTrue(unsupported["unsupported"])
+            self.assertEqual(unsupported["status"], "unsupported")
+            self.assertEqual(len(apps), 2)
+            self.assertTrue(manager.get_deployments()["deployments"][0]["unsupported"])
+            self.assertEqual(manager.auto_deploy_apps()["results"], [
+                {"app_id": legacy["id"], "status": "unsupported"},
+                {"app_id": native["id"], "status": "awaiting-first-deployment"},
+            ])
+            for command in (
+                "deploy", "deployment-start", "pull", "start", "stop", "restart", "remove",
+                "health", "preflight", "prerequisites", "metrics", "review-update",
+                "worker-status", "worker-restart", "worker-logs", "logs", "env-get", "env-save",
+                "rollback", "deployment-logs",
+            ):
+                with self.subTest(command=command), patch.object(sys, "stdin", io.StringIO("KEY=value\n")), \
+                        self.assertRaisesRegex(ValueError, "no longer supported"):
+                    manager._dispatch(manager._build_parser().parse_args([command, legacy["id"]]))
+            for arguments in (
+                ["edit", legacy["id"], "{}"],
+                ["approve", legacy["id"], "a" * 40],
+                ["deployment-abort", legacy["id"], "20261108220923-abcdef12"],
+            ):
+                with self.subTest(arguments=arguments), self.assertRaisesRegex(ValueError, "no longer supported"):
+                    manager._dispatch(manager._build_parser().parse_args(arguments))
+        self.assertEqual(Path(manager.DEFAULT_REGISTRY_PATH).read_bytes(), before)
+        self.assertEqual(manager.list_apps(framework="static")["apps"][0]["id"], native["id"])
+
+    def test_react_output_configuration_is_validated_when_registering(self):
+        for output in (None, True, "", ".", "..", "../dist", "/tmp/dist", "dist//assets", "dist/../src", "C:\\dist", "dist\nx"):
+            with self.subTest(output=output), self.assertRaisesRegex(ValueError, "output_directory"):
+                manager.validate_app_payload(self.add_payload(
+                    framework="react", build_config={"output_directory": output},
+                ))
+        with self.assertRaisesRegex(ValueError, "without a start command"):
+            manager.validate_app_payload(self.add_payload(
+                framework="react", build_config={"start_command": ["npm", "start"]},
+            ))
+
+    def test_react_deployment_builds_as_static_with_managed_environment_and_no_service(self):
+        for tool in ("vite", "react-scripts"):
+            with self.subTest(tool=tool):
+                app = self.add_app("React " + tool, framework="auto", route="/frontend/",
+                                   build_config={"app_directory": "frontend", "output_directory": "site"})["app"]
+                paths = manager._app_paths(app["id"], manager.get_config())
+                project = paths["source"] / "frontend"
+                project.mkdir(parents=True)
+                paths["releases"].mkdir(parents=True)
+                (project / "package.json").write_text(json.dumps({
+                    "dependencies": {"react": "^19", tool: "^6" if tool == "vite" else "5"},
+                    "scripts": {"build": f"{tool} build"},
+                }), encoding="utf-8")
+                environments = []
+
+                def run_as_user(username, command, cwd=None, timeout=900, **kwargs):
+                    if "--version" in command:
+                        return subprocess.CompletedProcess(command, 0, stdout="22.12.0" if command[0] == "node" else "10.3.0", stderr="")
+                    environments.append(kwargs["environment"])
+                    if command[:3] == ["pnpm", "run", "build"]:
+                        output = cwd / kwargs["environment"]["BUILD_PATH"]
+                        output.mkdir()
+                        (output / "index.html").write_text("<h1>React release</h1>", encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                with patch.object(manager, "_require_root"), patch.object(
+                    manager, "ensure_app_user", return_value=app["service_user"]
+                ), patch.object(manager, "_setup_app_directories", return_value=paths), patch.object(
+                    manager, "clone_or_update_repo"
+                ), patch.object(manager, "git_output", return_value="a" * 40), patch.object(
+                    manager, "_prepare_release_directory", side_effect=lambda path, user: path.mkdir()
+                ), patch.object(manager, "_account_ids", return_value=(1001, 1001)), patch.object(
+                    manager, "_service_path", return_value=Path(self.temp_dir.name) / "react.service"
+                ), patch.object(manager, "_environment_values_app", return_value={"VITE_LABEL": "public", "PUBLIC_URL": "/wrong"}), patch.object(
+                    manager, "_run_as_user", side_effect=run_as_user
+                ), patch.object(manager, "_seal_release") as seal, patch.object(
+                    manager, "_write_service"
+                ) as write_service, patch.object(manager, "_retire_legacy_root_service"), patch.object(
+                    manager, "_atomic_symlink"
+                ), patch.object(manager, "_systemctl") as systemctl, patch.object(
+                    manager, "_prune_releases"
+                ), patch.object(adapters, "_prepare_build_copy_permissions"):
+                    result = manager.deploy_app(app["id"])
+                self.assertEqual(result["app"]["framework"], "react")
+                self.assertEqual(result["app"]["static_root"], "frontend/site")
+                self.assertTrue(result["app"]["static_export"])
+                self.assertEqual(result["deployment"]["status"], "deployed")
+                self.assertEqual((Path(result["deployment"]["release"]) / "app" / "frontend" / "site" / "index.html").read_text(), "<h1>React release</h1>")
+                self.assertTrue(seal.call_args.kwargs["public"])
+                self.assertIsNone(manager.app_health_url(result["app"]))
+                write_service.assert_not_called()
+                systemctl.assert_not_called()
+                self.assertTrue(environments)
+                for environment in environments:
+                    self.assertEqual(environment["PUBLIC_URL"], "/frontend")
+                    self.assertEqual(environment["BUILD_PATH"], "site")
+                    self.assertEqual(environment["VITE_LABEL"], "public")
+                    self.assertEqual(environment["CI"], "true")
+                    self.assertEqual(environment["npm_config_registry"], "http://127.0.0.1:4873/")
 
 
     def python_payload(self, **overrides):
@@ -560,503 +727,6 @@ class AppManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "retains only the current deployment"):
             manager.update_settings({"release_retention": 2})
 
-    def test_integration_settings_validate_service_urls_without_accepting_credentials(self):
-        result = manager.update_settings({"integrations": {
-            "portainer_url": "https://portainer.example:9443/",
-            "npm_url": "http://127.0.0.1:81",
-        }})
-        self.assertEqual(result["config"]["integrations"], {
-            "portainer_url": "https://portainer.example:9443",
-            "npm_url": "http://127.0.0.1:81",
-        })
-        for value in ("ftp://portainer.example", "https://user:pass@example.com", "http://npm.local/?secret=1", "http://npm.local:0"):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                manager.update_settings({"integrations": {"portainer_url": value}})
-
-    def test_portainer_requests_are_allowlisted_and_api_keys_are_not_persisted(self):
-        manager.update_settings({"integrations": {"portainer_url": "https://portainer.example"}})
-        with patch.object(manager, "_integration_request", return_value=[{"Id": "container"}]) as request:
-            result = manager._integration_api({
-                "provider": "portainer", "action": "list", "resource": "containers",
-                "endpoint_id": 1, "token": "ptr_private-api-key",
-            })
-        self.assertEqual(result["data"], [{"Id": "container"}])
-        request.assert_called_once_with(
-            "https://portainer.example",
-            "api/endpoints/1/docker/containers/json?all=true",
-            token="ptr_private-api-key", api_key=True,
-        )
-        self.assertNotIn("ptr_private-api-key", Path(manager.DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
-        with self.assertRaisesRegex(ValueError, "Unsupported Portainer resource"):
-            manager._integration_api({
-                "provider": "portainer", "action": "list", "resource": "arbitrary",
-                "endpoint_id": 1, "token": "ptr_private-api-key",
-            })
-
-    def test_portainer_default_endpoints_use_loopback_and_api_key_without_browser_cookies(self):
-        response = Mock()
-        response.__enter__ = Mock(return_value=response)
-        response.__exit__ = Mock(return_value=None)
-        response.read.return_value = b'[{"Id":2,"Name":"local"}]'
-        opener = Mock()
-        opener.open.return_value = response
-        with patch.object(manager.urllib.request, "build_opener", return_value=opener) as build_opener:
-            result = manager._integration_api({
-                "provider": "portainer", "action": "list", "resource": "endpoints", "token": "ptr_private-key",
-            })
-        self.assertEqual(result["data"], [{"Id": 2, "Name": "local"}])
-        request = opener.open.call_args.args[0]
-        self.assertEqual(request.full_url, "http://127.0.0.1:9000/api/endpoints")
-        self.assertEqual(request.get_method(), "GET")
-        self.assertEqual(request.get_header("X-api-key"), "ptr_private-key")
-        self.assertIsNone(request.get_header("Cookie"))
-        self.assertIsNone(request.get_header("Authorization"))
-        self.assertEqual(opener.open.call_args.kwargs["timeout"], 15)
-        self.assertEqual(build_opener.call_args.args[0].proxies, {})
-        self.assertIsInstance(build_opener.call_args.args[1], manager._NoRedirectHandler)
-
-    def test_portainer_obsolete_browser_routes_use_local_backend_api(self):
-        for old_url in (
-            "https://stuserver.online/manage-docker/",
-            "https://stuserver.online/portainer",
-            "https://stuserver.online:443/manage-docker",
-            "http://127.0.0.1:9000/manage-docker",
-            "http://127.0.0.1:9000/portainer/",
-            "http://localhost:9000/portainer",
-        ):
-            with self.subTest(old_url=old_url):
-                config = manager.get_config()
-                config["integrations"] = {"portainer_url": old_url, "npm_url": "http://127.0.0.1:81"}
-                manager.write_json(Path(manager.DEFAULT_CONFIG_PATH), config)
-                with patch.object(manager, "_integration_request", return_value=[{"Id": 2}]) as request:
-                    manager._integration_api({
-                        "provider": "portainer", "action": "list", "resource": "endpoints", "token": "ptr_key",
-                    })
-                request.assert_called_once_with(
-                    "http://127.0.0.1:9000", "api/endpoints", token="ptr_key", api_key=True,
-                )
-                manager.update_settings({})
-                saved = json.loads(Path(manager.DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
-                self.assertEqual(saved["integrations"], {
-                    "portainer_url": "http://127.0.0.1:9000", "npm_url": "http://127.0.0.1:81",
-                })
-
-    def test_portainer_default_is_used_when_existing_config_has_no_portainer_setting(self):
-        manager.write_json(Path(manager.DEFAULT_CONFIG_PATH), {"integrations": {"npm_url": "http://127.0.0.1:81"}})
-        with patch.object(manager, "_integration_request", return_value=[]) as request:
-            for resource in ("endpoints", "containers", "stacks", "images", "volumes", "networks", "info"):
-                with self.subTest(resource=resource):
-                    manager._integration_api({
-                        "provider": "portainer", "action": "list", "resource": resource,
-                        "endpoint_id": 2, "token": "ptr_key",
-                    })
-                    self.assertEqual(request.call_args.args[0], "http://127.0.0.1:9000")
-
-    def test_portainer_container_delete_uses_the_docker_delete_endpoint(self):
-        manager.update_settings({"integrations": {"portainer_url": "https://portainer.example"}})
-        with patch.object(manager, "_integration_request", return_value=None) as request:
-            manager._integration_api({
-                "provider": "portainer", "action": "remove", "resource": "containers",
-                "endpoint_id": 3, "id": "container id", "token": "ptr_key",
-            })
-        request.assert_called_once_with(
-            "https://portainer.example",
-            "api/endpoints/3/docker/containers/container%20id?force=true",
-            method="DELETE", token="ptr_key", api_key=True,
-        )
-
-    def test_integration_http_requests_disable_redirects_and_proxy_environment(self):
-        response = Mock()
-        response.__enter__ = Mock(return_value=response)
-        response.__exit__ = Mock(return_value=None)
-        response.read.return_value = b'{"ok":true}'
-        opener = Mock()
-        opener.open.return_value = response
-        with patch.object(manager.urllib.request, "build_opener", return_value=opener) as build_opener:
-            result = manager._integration_request(
-                "https://portainer.example", "api/endpoints", token="ptr_api-key", api_key=True,
-            )
-        self.assertEqual(result, {"ok": True})
-        request = opener.open.call_args.args[0]
-        self.assertEqual(request.get_header("X-api-key"), "ptr_api-key")
-        self.assertEqual(opener.open.call_args.kwargs["timeout"], 15)
-        handlers = build_opener.call_args.args
-        self.assertEqual(handlers[0].proxies, {})
-        self.assertIsInstance(handlers[1], manager._NoRedirectHandler)
-        self.assertIsNone(handlers[1].redirect_request(None, None, 302, "Found", {}, "https://other.example"))
-
-    def test_portainer_creates_stopped_containers_with_loopback_and_resource_limits(self):
-        with patch.object(manager, "get_listening_ports", return_value=set()), patch.object(
-            manager, "_integration_request", return_value={"Id": "created", "Warnings": []}
-        ) as request:
-            result = manager._integration_api({
-                "provider": "portainer", "action": "create", "resource": "containers",
-                "endpoint_id": 2, "token": "ptr_key", "body": {
-                    "name": "native-web", "image": "nginx:alpine",
-                    "host_port": 8123, "container_port": 80, "restart_policy": "unless-stopped",
-                },
-            })
-        self.assertEqual(result["data"]["Id"], "created")
-        request.assert_called_once()
-        self.assertEqual(request.call_args.args, (
-            "http://127.0.0.1:9000", "api/endpoints/2/docker/containers/create?name=native-web",
-        ))
-        self.assertEqual(request.call_args.kwargs["method"], "POST")
-        body = request.call_args.kwargs["payload"]
-        self.assertEqual(body["Image"], "nginx:alpine")
-        host = body["HostConfig"]
-        self.assertEqual(host["PortBindings"], {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8123"}]})
-        self.assertEqual(host["CapDrop"], ["ALL"])
-        self.assertEqual(host["CapAdd"], ["NET_BIND_SERVICE"])
-        self.assertIn("no-new-privileges", host["SecurityOpt"])
-        self.assertEqual((host["Memory"], host["NanoCpus"], host["PidsLimit"]), (1024 ** 3, 10 ** 9, 256))
-        self.assertNotIn("Binds", host)
-        self.assertNotIn("Privileged", host)
-        self.assertNotIn("Cmd", body)
-
-    def test_portainer_creates_local_volumes_and_bridge_networks(self):
-        for resource, fields, response, expected in (
-            ("volumes", {"name": "native-data"}, {"Name": "native-data"},
-             {"Name": "native-data", "Driver": "local"}),
-            ("networks", {"name": "native-private", "internal": True}, {"Id": "network"},
-             {"Name": "native-private", "Driver": "bridge", "CheckDuplicate": True, "Internal": True}),
-        ):
-            with self.subTest(resource=resource), patch.object(
-                manager, "_integration_request", return_value=response
-            ) as request:
-                manager._integration_api({
-                    "provider": "portainer", "action": "create", "resource": resource,
-                    "endpoint_id": 2, "token": "ptr_key", "body": fields,
-                })
-                request.assert_called_once_with(
-                    "http://127.0.0.1:9000", f"api/endpoints/2/docker/{resource}/create",
-                    method="POST", payload=expected, token="ptr_key", api_key=True,
-                )
-
-    def test_portainer_creation_rejects_unsafe_or_invalid_options_before_requesting(self):
-        cases = (
-            ("containers", {"name": "web", "image": "nginx", "HostConfig": {"Privileged": True}}),
-            ("containers", {"name": "web", "image": "nginx", "host_port": 8080, "container_port": 80}),
-            ("containers", {"name": "web", "image": "nginx", "host_port": True, "container_port": 80}),
-            ("containers", {"name": "web", "image": "nginx", "container_port": 80}),
-            ("containers", {"name": "web", "image": "https://example.com/image"}),
-            ("containers", {"name": "web", "image": "user:private-password@registry.example/image"}),
-            ("containers", {"name": "web", "image": "nginx", "restart_policy": []}),
-            ("containers", {"name": "../web", "image": "nginx"}),
-            ("containers", {"name": "web", "image": "nginx", "host_port": 8123, "container_port": 80}),
-            ("volumes", {"name": "data", "DriverOpts": {"device": "/"}}),
-            ("networks", {"name": "network", "Driver": "host"}),
-            ("networks", {"name": "network", "internal": "true"}),
-        )
-        with patch.object(manager, "get_listening_ports", return_value={8123}), patch.object(
-            manager, "_integration_request"
-        ) as request:
-            for resource, fields in cases:
-                with self.subTest(resource=resource, fields=fields), self.assertRaises(ValueError):
-                    manager._integration_api({
-                        "provider": "portainer", "action": "create", "resource": resource,
-                        "endpoint_id": 2, "token": "ptr_key", "body": fields,
-                    })
-            request.assert_not_called()
-
-    def test_portainer_creation_rejects_success_shaped_invalid_responses(self):
-        with patch.object(manager, "_integration_request", return_value={"message": "not created"}):
-            with self.assertRaisesRegex(RuntimeError, "invalid create response"):
-                manager._integration_api({
-                    "provider": "portainer", "action": "create", "resource": "volumes",
-                    "endpoint_id": 2, "token": "ptr_key", "body": {"name": "data"},
-                })
-
-    def test_portainer_image_pull_uses_encoded_reference_and_stream_parser(self):
-        with patch.object(manager, "_integration_request", return_value={"status": "pulled"}) as request:
-            manager._integration_api({
-                "provider": "portainer", "action": "pull", "resource": "images", "endpoint_id": 2,
-                "token": "ptr_key", "body": {"image": "registry.example:5000/org/web:stable"},
-            })
-        request.assert_called_once_with(
-            "http://127.0.0.1:9000",
-            "api/endpoints/2/docker/images/create?fromImage=registry.example%3A5000%2Forg%2Fweb%3Astable",
-            method="POST", token="ptr_key", api_key=True, json_lines=True,
-        )
-
-    def test_portainer_pull_rejects_credentials_and_unsupported_fields(self):
-        with patch.object(manager, "_integration_request") as request:
-            for body in (
-                {"image": "https://registry.example/image"},
-                {"image": "user:private-password@registry.example/image"},
-                {"image": "nginx:latest", "registry_auth": "private-password"},
-            ):
-                with self.subTest(body=body), self.assertRaises(ValueError) as raised:
-                    manager._integration_api({
-                        "provider": "portainer", "action": "pull", "resource": "images", "endpoint_id": 2,
-                        "token": "ptr_key", "body": body,
-                    })
-                self.assertNotIn("private-password", str(raised.exception))
-            request.assert_not_called()
-
-    def test_docker_pull_progress_requires_explicit_completion_and_surfaces_http_200_errors(self):
-        cases = (
-            (b'{"status":"Downloading"}\n\n{"status":"Status: Downloaded newer image for nginx:alpine"}\n', None),
-            (b'{"status":"Status: Image is up to date for nginx:alpine"}\n', None),
-            (b'{"status":"Downloading"}\n{"error":"private-registry-secret"}\n', "image pull failed"),
-            (b'{"errorDetail":{"message":"private-registry-secret"}}\n', "image pull failed"),
-            (b'{"status":"Downloading"}\n', "no image-pull completion"),
-            (b'', "no image-pull completion"),
-            (b'<html>Access denied</html>', "invalid image-pull progress"),
-            (b'[]\n', "invalid image-pull progress"),
-        )
-        for raw, error in cases:
-            with self.subTest(raw=raw):
-                response = Mock()
-                response.__enter__ = Mock(return_value=response)
-                response.__exit__ = Mock(return_value=None)
-                response.read.return_value = raw
-                opener = Mock()
-                opener.open.return_value = response
-                with patch.object(manager.urllib.request, "build_opener", return_value=opener):
-                    if error:
-                        with self.assertRaisesRegex(RuntimeError, error) as raised:
-                            manager._integration_request("http://127.0.0.1:9000", "api/endpoints/2/docker/images/create",
-                                                         method="POST", token="ptr_key", api_key=True, json_lines=True)
-                        self.assertNotIn("private-registry-secret", str(raised.exception))
-                    else:
-                        result = manager._integration_request(
-                            "http://127.0.0.1:9000", "api/endpoints/2/docker/images/create",
-                            method="POST", token="ptr_key", api_key=True, json_lines=True,
-                        )
-                        self.assertTrue(result["status"].startswith("Status: "))
-                self.assertEqual(opener.open.call_args.kwargs["timeout"], 120)
-
-    def test_docker_pull_timeout_reports_uncertain_resource_state(self):
-        for error in (TimeoutError(), urllib.error.URLError(TimeoutError())):
-            with self.subTest(error=type(error).__name__):
-                opener = Mock()
-                opener.open.side_effect = error
-                with patch.object(manager.urllib.request, "build_opener", return_value=opener):
-                    with self.assertRaisesRegex(RuntimeError, "check the resource state before retrying"):
-                        manager._integration_request(
-                            "http://127.0.0.1:9000", "api/endpoints/2/docker/images/create", json_lines=True,
-                        )
-
-    def test_portainer_inspects_resources_and_reads_container_stats(self):
-        for resource, action, identifier, path in (
-            ("images", "inspect", "sha256:abc", "api/endpoints/2/docker/images/sha256%3Aabc/json"),
-            ("volumes", "inspect", "native-data", "api/endpoints/2/docker/volumes/native-data"),
-            ("networks", "inspect", "native-network", "api/endpoints/2/docker/networks/native-network"),
-            ("stacks", "inspect", "7", "api/stacks/7"),
-            ("containers", "stats", "container", "api/endpoints/2/docker/containers/container/stats?stream=false"),
-            ("containers", "changes", "container", "api/endpoints/2/docker/containers/container/changes"),
-            ("images", "history", "sha256:abc", "api/endpoints/2/docker/images/sha256%3Aabc/history"),
-            ("stacks", "file", 7, "api/stacks/7/file"),
-        ):
-            response = {"StackFileContent": "services:\n  web:\n    image: nginx\n"} if action == "file" else {}
-            with self.subTest(resource=resource, action=action), patch.object(
-                manager, "_integration_request", return_value=response
-            ) as request:
-                result = manager._integration_api({
-                    "provider": "portainer", "action": action, "resource": resource,
-                    "endpoint_id": 2, "token": "ptr_key", "id": identifier,
-                })
-                request.assert_called_once_with("http://127.0.0.1:9000", path, token="ptr_key", api_key=True)
-                self.assertEqual(result["data"], response["StackFileContent"] if action == "file" else response)
-
-    def test_portainer_renames_containers_and_tags_images_with_structured_fields(self):
-        for resource, action, identifier, body, suffix in (
-            ("containers", "rename", "container", {"name": "new-web"}, "containers/container/rename?name=new-web"),
-            ("images", "tag", "sha256:abc", {"repository": "registry.example:5000/org/web", "tag": "release-1"},
-             "images/sha256%3Aabc/tag?repo=registry.example%3A5000%2Forg%2Fweb&tag=release-1"),
-        ):
-            with self.subTest(action=action), patch.object(manager, "_integration_request", return_value=None) as request:
-                manager._integration_api({
-                    "provider": "portainer", "action": action, "resource": resource,
-                    "endpoint_id": 2, "token": "ptr_key", "id": identifier, "body": body,
-                })
-                request.assert_called_once_with(
-                    "http://127.0.0.1:9000", f"api/endpoints/2/docker/{suffix}",
-                    method="POST", payload=None, token="ptr_key", api_key=True,
-                )
-
-    def test_portainer_network_membership_rechecks_bridge_and_never_forces_disconnect(self):
-        for action in ("connect", "disconnect"):
-            with self.subTest(action=action), patch.object(
-                manager, "_integration_request", side_effect=[{"Driver": "bridge", "Scope": "local"}, None]
-            ) as request:
-                manager._integration_api({
-                    "provider": "portainer", "action": action, "resource": "networks",
-                    "endpoint_id": 2, "token": "ptr_key", "id": "network", "body": {"container": "web"},
-                })
-                self.assertEqual(request.call_count, 2)
-                self.assertEqual(request.call_args_list[0].args, (
-                    "http://127.0.0.1:9000", "api/endpoints/2/docker/networks/network",
-                ))
-                body = {"Container": "web", **({"Force": False} if action == "disconnect" else {})}
-                self.assertEqual(request.call_args.args, (
-                    "http://127.0.0.1:9000", f"api/endpoints/2/docker/networks/network/{action}",
-                ))
-                self.assertEqual(request.call_args.kwargs, {
-                    "method": "POST", "payload": body, "token": "ptr_key", "api_key": True,
-                })
-
-    def test_portainer_changes_reject_unsafe_fields_and_invalid_identifiers_before_requesting(self):
-        cases = (
-            ("containers", "rename", "web", None),
-            ("containers", "rename", "web", {"name": "../new"}),
-            ("containers", "rename", "web", {"name": "new", "Image": "other"}),
-            ("containers", "rename", "..", {"name": "new"}),
-            ("containers", "rename", "web/../../info", {"name": "new"}),
-            ("images", "tag", False, {"repository": "web", "tag": "latest"}),
-            ("images", "tag", "image", {"repository": "web", "tag": "a" * 129}),
-            ("images", "tag", "image", {"repository": "web", "tag": []}),
-            ("images", "tag", "image", {"repository": "web", "tag": "-bad"}),
-            ("images", "tag", "image", {"repository": "web", "tag": "tag?force=true"}),
-            ("images", "tag", "image", {"repository": "web:old", "tag": "new"}),
-            ("images", "tag", "image", {"repository": "web@sha256:" + "a" * 64, "tag": "new"}),
-            ("images", "tag", "image", {"repository": "user:secret@registry/web", "tag": "new"}),
-            ("images", "tag", "image", {"repository": "https://registry/web", "tag": "new"}),
-            ("images", "tag", "image", {"repository": "web", "tag": "new", "force": True}),
-            ("networks", "connect", "network", {"container": "../web"}),
-            ("networks", "connect", "network", {"container": True}),
-            ("networks", "disconnect", "network", {"container": "web", "force": True}),
-            ("networks", "connect", "network", {"container": "web", "EndpointConfig": {"IPAMConfig": {}}}),
-            ("volumes", "connect", "volume", {"container": "web"}),
-            ("containers", "history", "web", {}),
-            ("networks", "file", "network", {}),
-        )
-        with patch.object(manager, "_integration_request") as request:
-            for resource, action, identifier, body in cases:
-                with self.subTest(resource=resource, action=action, body=body), self.assertRaises(ValueError):
-                    manager._integration_api({
-                        "provider": "portainer", "action": action, "resource": resource,
-                        "endpoint_id": 2, "token": "ptr_key", "id": identifier, "body": body,
-                    })
-            request.assert_not_called()
-
-    def test_portainer_refuses_membership_changes_on_non_local_bridge_networks(self):
-        for network in (
-            {"Driver": "host", "Scope": "local"}, {"Driver": "overlay", "Scope": "swarm"},
-            {"Driver": "macvlan", "Scope": "local"}, {"Driver": "bridge", "Scope": "swarm"}, {},
-        ):
-            for action in ("connect", "disconnect"):
-                with self.subTest(network=network, action=action), patch.object(
-                    manager, "_integration_request", return_value=network
-                ) as request, self.assertRaisesRegex(ValueError, "local bridge"):
-                    manager._integration_api({
-                        "provider": "portainer", "action": action, "resource": "networks",
-                        "endpoint_id": 2, "token": "ptr_key", "id": "network", "body": {"container": "web"},
-                    })
-                request.assert_called_once()
-
-    def test_portainer_network_check_failure_never_attempts_a_connection(self):
-        for response, error in (([], None), (None, RuntimeError("API unavailable"))):
-            with self.subTest(response=response), patch.object(
-                manager, "_integration_request", return_value=response, side_effect=error
-            ) as request, self.assertRaises(RuntimeError):
-                manager._integration_api({
-                    "provider": "portainer", "action": "connect", "resource": "networks",
-                    "endpoint_id": 2, "token": "ptr_key", "id": "network", "body": {"container": "web"},
-                })
-            request.assert_called_once()
-
-    def test_portainer_rejects_malformed_stack_files_and_invalid_stack_ids(self):
-        for response in (None, {}, {"StackFileContent": False}, {"StackFileContent": []}):
-            with self.subTest(response=response), patch.object(
-                manager, "_integration_request", return_value=response
-            ), self.assertRaisesRegex(RuntimeError, "invalid stack file"):
-                manager._integration_api({
-                    "provider": "portainer", "action": "file", "resource": "stacks",
-                    "endpoint_id": 2, "token": "ptr_key", "id": 7,
-                })
-        with patch.object(manager, "_integration_request") as request:
-            for identifier in (True, 0, "../7"):
-                with self.subTest(identifier=identifier), self.assertRaises(ValueError):
-                    manager._integration_api({
-                        "provider": "portainer", "action": "file", "resource": "stacks",
-                        "endpoint_id": 2, "token": "ptr_key", "id": identifier,
-                    })
-            request.assert_not_called()
-
-    def test_nginx_proxy_manager_authenticates_per_request_and_never_saves_password(self):
-        manager.update_settings({"integrations": {"npm_url": "http://127.0.0.1:81"}})
-        with patch.object(manager, "_integration_request", side_effect=[{"token": "temporary"}, [{"id": 8}]]) as request:
-            result = manager._integration_api({
-                "provider": "npm", "action": "list", "resource": "proxy-hosts",
-                "credentials": {"username": "admin@example.com", "password": "private-password"},
-            })
-        self.assertEqual(result["data"], [{"id": 8}])
-        self.assertEqual(request.call_args_list[0].args, ("http://127.0.0.1:81", "api/tokens"))
-        self.assertEqual(request.call_args_list[0].kwargs["payload"], {
-            "identity": "admin@example.com", "secret": "private-password",
-        })
-        self.assertEqual(request.call_args_list[1].args, ("http://127.0.0.1:81", "api/nginx/proxy-hosts"))
-        self.assertEqual(request.call_args_list[1].kwargs["token"], "temporary")
-        self.assertNotIn("private-password", Path(manager.DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
-
-    def test_integration_access_errors_explain_service_and_proxy_denials_without_secrets(self):
-        cases = (
-            (403, "api/endpoints", {}, ("Portainer", "owner has access"), False),
-            (403, "api/endpoints/2/docker/containers/json?all=true", {"CF-Ray": "request-id"},
-             ("Portainer", "passed through Cloudflare", "may have denied"), True),
-            (401, "api/tokens", {}, ("Nginx Proxy Manager", "NPM username/password"), False),
-            (403, "api/nginx/proxy-hosts", {"Server": "cloudflare"},
-             ("Nginx Proxy Manager", "passed through Cloudflare"), True),
-            (302, "api/endpoints", {"Location": "https://login.example/?secret=private-password"},
-             ("Portainer", "redirects are not followed"), False),
-        )
-        for status, path, headers, expected, cloudflare in cases:
-            with self.subTest(status=status, path=path, headers=headers):
-                error = urllib.error.HTTPError(
-                    "https://server.example/portainer/" + path, status, "Denied", headers,
-                    io.BytesIO(b'{"message":"ptr_private-key private-password"}'),
-                )
-                opener = Mock()
-                opener.open.side_effect = error
-                with patch.object(manager.urllib.request, "build_opener", return_value=opener):
-                    with self.assertRaises(RuntimeError) as raised:
-                        manager._integration_request(
-                            "https://server.example/service", path, method="POST",
-                            token="ptr_private-key", api_key=True, payload={"secret": "private-password"},
-                        )
-                message = str(raised.exception)
-                self.assertIn(f"HTTP {status}", message)
-                self.assertIn(f"POST https://server.example/service/{path}", message)
-                self.assertIn("do not share your browser", message)
-                self.assertEqual("passed through Cloudflare" in message, cloudflare)
-                for text in expected:
-                    self.assertIn(text, message)
-                self.assertNotIn("ptr_private-key", message)
-                self.assertNotIn("private-password", message)
-                self.assertNotIn("login.example", message)
-                opener.open.assert_called_once()
-
-    def test_integration_forbidden_cli_response_remains_structured_json(self):
-        manager.update_settings({"integrations": {"portainer_url": "https://server.example/portainer"}})
-        payload = {
-            "provider": "portainer", "action": "list", "resource": "endpoints", "token": "ptr_private-key",
-        }
-        error = urllib.error.HTTPError(
-            "https://server.example/portainer/api/endpoints", 403, "Forbidden", {}, None,
-        )
-        opener = Mock()
-        opener.open.side_effect = error
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with patch.object(manager.urllib.request, "build_opener", return_value=opener), patch(
-            "sys.stdin", io.StringIO(json.dumps(payload))
-        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = manager.main(["integration"])
-        self.assertEqual(code, 1)
-        result = json.loads(stdout.getvalue())
-        self.assertFalse(result["ok"])
-        self.assertIn("HTTP 403", result["error"])
-        self.assertIn("RuntimeError", stderr.getvalue())
-        self.assertNotIn("ptr_private-key", stdout.getvalue() + stderr.getvalue())
-
-    def test_nginx_proxy_manager_rejects_certificate_updates(self):
-        manager.update_settings({"integrations": {"npm_url": "http://127.0.0.1:81"}})
-        with self.assertRaisesRegex(ValueError, "does not support editing certificates"):
-            manager._integration_api({
-                "provider": "npm", "action": "update", "resource": "certificates", "id": 8,
-            })
-
     def test_environment_file_normalizes_supported_dotenv_values(self):
         normalized = manager._parse_environment_file(
             "# Runtime secrets\n"
@@ -1139,19 +809,6 @@ class AppManagerTests(unittest.TestCase):
         self.assertTrue(env_path.is_file())
         if os.name != "nt":
             self.assertEqual(env_path.stat().st_mode & 0o777, 0o640)
-
-    def test_docker_environment_sidecar_is_unquoted_and_root_private(self):
-        app = self.add_app("Docker App", framework="docker")["app"]
-        with patch.object(manager, "ensure_app_user", return_value=app["service_user"]), patch.object(
-            manager, "_account_ids", return_value=(1001, 1001)
-        ), patch.object(manager.os, "chown", create=True), patch.object(
-            manager, "_validate_environment_file_permissions"
-        ):
-            manager.save_environment_app(app["id"], 'API_KEY="secret value"\n')
-        docker_env = manager._docker_environment_file_path(app["id"])
-        self.assertEqual(docker_env.read_text(encoding="utf-8"), "API_KEY=secret value\n")
-        if os.name != "nt":
-            self.assertEqual(docker_env.stat().st_mode & 0o777, 0o600)
 
     def test_environment_file_rejects_symlink_before_read_or_write(self):
         app = self.add_app()["app"]
@@ -1527,21 +1184,21 @@ class AppManagerTests(unittest.TestCase):
 
     def test_application_views_filter_frameworks_consistently(self):
         website = self.add_app("Website", slug="website", framework="static")["app"]
-        container = self.add_app("Container", slug="container", framework="docker")["app"]
-        for app, deployment_id in ((website, "20261108220923-abcdef12"), (container, "20261109220923-abcdef12")):
+        server = self.add_app("Server", slug="server", framework="node")["app"]
+        for app, deployment_id in ((website, "20261108220923-abcdef12"), (server, "20261109220923-abcdef12")):
             with manager._registry_transaction() as registry:
                 stored = manager._find_app(registry, app["id"])
                 stored["deployments"] = [{"id": deployment_id, "date": deployment_id[:4] + "-" + deployment_id[4:6] + "-" + deployment_id[6:8], "status": "deployed"}]
 
-        self.assertEqual([app["id"] for app in manager.list_apps(framework="docker")["apps"]], ["container"])
-        self.assertEqual([app["id"] for app in manager.list_apps(exclude_framework="docker")["apps"]], ["website"])
-        self.assertEqual(manager.overview(framework="docker")["total_apps"], 1)
-        self.assertEqual(manager.overview(exclude_framework="docker")["total_apps"], 1)
-        self.assertEqual([item["app_id"] for item in manager.get_deployments(framework="docker")["deployments"]], ["container"])
-        self.assertEqual([item["app_id"] for item in manager.get_deployments(exclude_framework="docker")["deployments"]], ["website"])
+        self.assertEqual([app["id"] for app in manager.list_apps(framework="node")["apps"]], ["server"])
+        self.assertEqual([app["id"] for app in manager.list_apps(exclude_framework="node")["apps"]], ["website"])
+        self.assertEqual(manager.overview(framework="node")["total_apps"], 1)
+        self.assertEqual(manager.overview(exclude_framework="node")["total_apps"], 1)
+        self.assertEqual([item["app_id"] for item in manager.get_deployments(framework="node")["deployments"]], ["server"])
+        self.assertEqual([item["app_id"] for item in manager.get_deployments(exclude_framework="node")["deployments"]], ["website"])
 
-        arguments = manager._build_parser().parse_args(["list", "--framework", "docker"])
-        self.assertEqual(arguments.framework, "docker")
+        arguments = manager._build_parser().parse_args(["list", "--framework", "node"])
+        self.assertEqual(arguments.framework, "node")
         self.assertIsNone(arguments.exclude_framework)
 
     def test_deployment_log_pruning_keeps_only_the_current_attempt(self):
@@ -3008,6 +2665,170 @@ class AppManagerTests(unittest.TestCase):
             self.assertEqual(runner.call_count, 1)
 
 
+class ReactAdapterTests(unittest.TestCase):
+    def project(self, tool="vite", script=None, nested=False):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        repo = root / "repo"
+        project = repo / "frontend" if nested else repo
+        project.mkdir(parents=True)
+        package = {
+            "dependencies": {"react": "^19", "react-dom": "^19"},
+            "devDependencies": {tool: "^7" if tool == "vite" else "5"},
+            "scripts": {"build": script or f"{tool} build"},
+        }
+        (project / "package.json").write_text(json.dumps(package), encoding="utf-8")
+        (project / "src").mkdir()
+        (project / "src" / "main.jsx").write_text("export default () => <h1>React</h1>;", encoding="utf-8")
+        (project / "index.html").write_text('<script type="module" src="/src/main.jsx"></script>', encoding="utf-8")
+        return repo, project, root / "release"
+
+    def test_react_builds_production_output_with_each_package_manager_and_scopes_assets(self):
+        for tool, manager, lockfile, lock in (
+            ("vite", "npm", None, None),
+            ("vite", "pnpm", "pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ("react-scripts", "yarn", "yarn.lock", "# yarn lockfile v1\n"),
+            ("react-scripts", "bun", "bun.lock", "{}\n"),
+        ):
+            with self.subTest(tool=tool, manager=manager):
+                repo, project, release = self.project(tool, script="tsc -b && vite build" if tool == "vite" else None)
+                if lockfile:
+                    (project / lockfile).write_text(lock, encoding="utf-8")
+                commands = []
+                output_name = "dist" if tool == "vite" else "build"
+                original_html = (project / "index.html").read_text()
+
+                def runner(command, cwd, timeout):
+                    commands.append(command)
+                    self.assertEqual((cwd / "index.html").read_text(), original_html)
+                    if command[:3] == [manager, "run", "build"]:
+                        output = cwd / output_name
+                        (output / "assets").mkdir(parents=True)
+                        (output / "assets" / "app.js").write_text("console.log('React');", encoding="utf-8")
+                        (output / "index.html").write_text('<script src="/assets/app.js"></script>', encoding="utf-8")
+                        (output / "manifest.webmanifest").write_text('{"start_url":"/"}', encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                result = get_adapter("react").build({"route": "/shop/"}, repo, release, runner=runner, timeout=19)
+                self.assertFalse(result["runtime_required"])
+                self.assertEqual(result["start_command"], [])
+                self.assertEqual(result["static_root"], output_name)
+                output = release / "app" / output_name
+                self.assertIn('src="/shop/assets/app.js"', (output / "index.html").read_text())
+                self.assertEqual(json.loads((output / "manifest.webmanifest").read_text())["start_url"], "/shop/")
+                self.assertEqual((project / "index.html").read_text(), original_html)
+                self.assertFalse((project / output_name).exists())
+                self.assertEqual(len(commands), 2)
+                if tool == "vite":
+                    self.assertEqual(commands[-1], [manager, "run", "build", *(["--"] if manager == "npm" else []),
+                                                   "--base", "/shop/", "--outDir", "dist"])
+                else:
+                    self.assertEqual(commands[-1], [manager, "run", "build"])
+
+    def test_nested_react_workspaces_share_the_root_lockfile_and_leave_source_unchanged(self):
+        repo, project, release = self.project(nested=True)
+        (repo / "package.json").write_text('{"private":true,"workspaces":["frontend"]}', encoding="utf-8")
+        (repo / "package-lock.json").write_text('{"lockfileVersion":3,"packages":{}}', encoding="utf-8")
+        config = {"app_directory": "frontend", "output_directory": "public-site"}
+        self.assertEqual(detect_framework(repo, config), "react")
+        report = inspect_project(repo, "react", config)
+        self.assertFalse(report["errors"])
+        self.assertEqual(report["project_directory"], str(project))
+        self.assertEqual(report["tools"]["node"], "20.19.0")
+        commands = []
+
+        def runner(command, cwd, timeout):
+            commands.append(command)
+            if command == ["pnpm", "import"]:
+                (cwd / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\nimporters: {}\n", encoding="utf-8")
+            if command[:3] == ["pnpm", "run", "build"]:
+                output = cwd / "public-site"
+                output.mkdir()
+                (output / "index.html").write_text("React", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        result = get_adapter("react").build({"route": "/", "build_config": config, "_managed_pnpm": True},
+                                           repo, release, runner=runner)
+        self.assertEqual(result["static_root"], "frontend/public-site")
+        self.assertEqual(commands[0], ["pnpm", "import"])
+        self.assertEqual(commands[1], ["pnpm", "--dir", str(release / "app"), "install", "--frozen-lockfile", "--prod=false"])
+        self.assertEqual(commands[2], ["pnpm", "run", "build", "--base", "/", "--outDir", "public-site"])
+        self.assertFalse((repo / ".npmrc").exists())
+        self.assertFalse((repo / "pnpm-workspace.yaml").exists())
+        self.assertTrue((repo / "package-lock.json").is_file())
+
+    def test_react_preflight_rejects_missing_or_custom_build_scripts_without_running_them(self):
+        for script in ("", "node custom.js", "vite build && node postbuild.js", ["vite", "build"]):
+            with self.subTest(script=script):
+                repo, project, release = self.project()
+                package = json.loads((project / "package.json").read_text())
+                package["scripts"]["build"] = script
+                (project / "package.json").write_text(json.dumps(package), encoding="utf-8")
+                self.assertTrue(inspect_project(repo, "react", {})["errors"])
+                runner = Mock()
+                with self.assertRaises(ValueError):
+                    get_adapter("react").build({}, repo, release, runner=runner)
+                runner.assert_not_called()
+
+    def test_react_detection_preserves_explicit_runtime_and_nextjs_priority(self):
+        repo, project, _ = self.project()
+        config = {"start_command": ["node", "server.js"]}
+        self.assertEqual(detect_framework(repo, config), "node")
+        package = json.loads((project / "package.json").read_text())
+        package["dependencies"]["next"] = "^15"
+        (project / "package.json").write_text(json.dumps(package), encoding="utf-8")
+        self.assertEqual(detect_framework(repo, config), "nextjs")
+
+    def test_react_build_does_not_accept_missing_or_stale_output_as_success(self):
+        for output_state in ("missing", "no-index", "stale", "failed"):
+            with self.subTest(output_state=output_state):
+                repo, project, release = self.project()
+                if output_state == "stale":
+                    (project / "dist").mkdir()
+                    (project / "dist" / "index.html").write_text("stale", encoding="utf-8")
+
+                def runner(command, cwd, timeout):
+                    if command[:3] == ["npm", "run", "build"]:
+                        if output_state == "no-index":
+                            (cwd / "dist").mkdir()
+                        if output_state == "failed":
+                            return subprocess.CompletedProcess(command, 1, stdout="", stderr="compile failed")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                with self.assertRaisesRegex((ValueError, RuntimeError), {
+                    "missing": "output directory", "no-index": "regular index.html",
+                    "stale": "already exists", "failed": "compile failed",
+                }[output_state]):
+                    get_adapter("react").build({}, repo, release, runner=runner)
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX symlink support")
+    def test_react_build_rejects_symlinked_output_and_links_outside_static_root(self):
+        for link_kind in ("output", "asset", "index"):
+            with self.subTest(link_kind=link_kind):
+                repo, _, release = self.project()
+                outside = repo.parent / "outside"
+                outside.mkdir()
+                (outside / "index.html").write_text("private", encoding="utf-8")
+
+                def runner(command, cwd, timeout):
+                    if command[:3] == ["npm", "run", "build"]:
+                        output = cwd / "dist"
+                        if link_kind == "output":
+                            output.symlink_to(outside, target_is_directory=True)
+                        else:
+                            output.mkdir()
+                            if link_kind == "index":
+                                (output / "index.html").symlink_to(outside / "index.html")
+                            else:
+                                (output / "index.html").write_text("React", encoding="utf-8")
+                                (output / "private").symlink_to(outside, target_is_directory=True)
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                with self.assertRaises(RuntimeError):
+                    get_adapter("react").build({}, repo, release, runner=runner)
+
+
 class NextJSDependencyInstallationTests(unittest.TestCase):
     def build_project(
         self,
@@ -3766,197 +3587,6 @@ class NextJSDependencyInstallationTests(unittest.TestCase):
 
 
 class FrameworkAdapterTests(unittest.TestCase):
-    def test_docker_adapter_builds_a_scoped_image_and_loopback_container(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            source.mkdir()
-            release = root / "release"
-            release.mkdir()
-            (source / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
-            runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
-            app = {
-                "id": "docker-demo",
-                "port": 8123,
-                "route": "/demo/",
-                "docker_tag": "0123456789abcdef",
-                "docker_environment_file": "/var/lib/cockpit/app-manager/environment/docker-demo.docker.env",
-                "resource_limits": {
-                    "memory_mb": 768, "cpu_percent": 150, "tasks_max": 96,
-                    "build_memory_mb": 768, "build_cpu_percent": 150, "build_tasks_max": 128,
-                },
-                "build_config": {"container_port": 4321},
-            }
-            result = get_adapter("docker").build(app, source, release, runner=runner)
-            self.assertEqual(runner.call_args.args[0][:5], [
-                "docker", "build", "--pull", "--tag", "cockpit-app-manager-docker-demo:0123456789abcdef",
-            ])
-            self.assertIn("768m", runner.call_args.args[0])
-            self.assertIn("150000", runner.call_args.args[0])
-            self.assertIn("APP_BASE_PATH=/demo", runner.call_args.args[0])
-            self.assertIn("PORT=4321", runner.call_args.args[0])
-            self.assertIn("--publish", result["start_command"])
-            self.assertIn("127.0.0.1:8123:4321", result["start_command"])
-            self.assertIn("--cap-drop=ALL", result["start_command"])
-            self.assertNotIn("--cap-add=NET_BIND_SERVICE", result["start_command"])
-            self.assertIn("--security-opt=no-new-privileges", result["start_command"])
-            self.assertEqual(result["image"], "cockpit-app-manager-docker-demo:0123456789abcdef")
-            self.assertFalse((source / "Dockerfile").is_symlink())
-            low_release = root / "low-release"
-            low_release.mkdir()
-            low_port_result = get_adapter("docker").build(
-                {**app, "docker_tag": "fedcba9876543210", "build_config": {"container_port": 80}},
-                source,
-                low_release,
-                runner=runner,
-            )
-            self.assertIn("--cap-add=NET_BIND_SERVICE", low_port_result["start_command"])
-
-    def test_docker_configuration_rejects_traversal_and_shell_start_commands(self):
-        valid = {
-            "name": "Docker Demo",
-            "repo_url": "https://github.com/example/docker-demo.git",
-            "branch": "main",
-            "framework": "docker",
-        }
-        for build_config in (
-            {"dockerfile": "../Dockerfile"},
-            {"dockerfile": "subdir/../Dockerfile"},
-            {"app_directory": "../app"},
-            {"container_port": True},
-            {"start_command": ["sh", "-c", "dangerous"]},
-            {"docker_mode": "compose", "compose_file": "../compose.yaml"},
-            {"docker_mode": "compose", "compose_service": "web/server"},
-        ):
-            with self.subTest(build_config=build_config), self.assertRaises(ValueError):
-                manager.validate_app_payload({**valid, "build_config": build_config})
-
-    def test_compose_adapter_builds_managed_project_and_limits_published_service(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            source.mkdir()
-            release = root / "release"
-            release.mkdir()
-            (source / "compose.yaml").write_text("services:\n  web:\n    build: .\n", encoding="utf-8")
-            (source / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
-            environment_file = root / "docker.env"
-            environment_file.write_text("API_KEY=private\n", encoding="utf-8")
-            project_dir = release / "app"
-            base_config = {
-                "services": {
-                    "web": {
-                        "build": {"context": str(project_dir), "dockerfile": "Dockerfile"},
-                        "deploy": {"resources": {"limits": {"pids": 128}}},
-                    },
-                    "db": {"image": "postgres:16"},
-                },
-                "volumes": {"database": {}},
-            }
-            managed_config = {
-                **base_config,
-                "services": {
-                    **base_config["services"],
-                    "web": {
-                        **base_config["services"]["web"],
-                        "ports": [{"target": 4321, "published": "8123", "host_ip": "127.0.0.1"}],
-                        "env_file": [str(environment_file)],
-                        "pids_limit": 96,
-                        "deploy": {"resources": {"limits": {"pids": 96}}},
-                        "cap_drop": ["ALL"],
-                        "security_opt": ["no-new-privileges:true"],
-                    },
-                    "db": {"image": "postgres:16", "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"]},
-                },
-                "volumes": {"database": {"name": "cockpit-app-manager-compose-demo_database"}},
-            }
-            runner = Mock(side_effect=[
-                subprocess.CompletedProcess([], 0, stdout=json.dumps(base_config), stderr=""),
-                subprocess.CompletedProcess([], 0, stdout=json.dumps(managed_config), stderr=""),
-                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
-            ])
-            result = get_adapter("docker").build(
-                {
-                    "id": "compose-demo",
-                    "port": 8123,
-                    "route": "/demo/",
-                    "docker_tag": "0123456789abcdef",
-                    "docker_environment_file": str(environment_file),
-                    "build_config": {
-                        "docker_mode": "compose",
-                        "compose_file": "compose.yaml",
-                        "compose_service": "web",
-                        "container_port": 4321,
-                    },
-                    "resource_limits": {"memory_mb": 768, "cpu_percent": 150, "tasks_max": 96},
-                },
-                source,
-                release,
-                runner=runner,
-            )
-            self.assertEqual(runner.call_count, 3)
-            self.assertIn("cockpit-app-manager-compose-demo", result["start_command"])
-            self.assertIn("--no-build", result["start_command"])
-            override_contents = (release / ".app-manager-compose.override.json").read_text(encoding="utf-8")
-            self.assertIn("127.0.0.1", override_contents)
-            self.assertIn("8123", override_contents)
-            override_service = json.loads(override_contents)["services"]["web"]
-            self.assertEqual(override_service["pids_limit"], 96)
-            self.assertEqual(override_service["deploy"]["resources"]["limits"]["pids"], 96)
-            self.assertEqual(override_service["environment"]["APP_BASE_PATH"], "/demo")
-            self.assertIn('"cap_drop": [\n        "ALL"', override_contents)
-            self.assertIn("no-new-privileges:true", override_contents)
-            self.assertNotIn("--volumes", result["stop_command"])
-            self.assertEqual(
-                result["images"],
-                ["cockpit-app-manager-compose-demo-web-4b5e57f6:0123456789abcdef"],
-            )
-
-    def test_compose_validation_rejects_host_ports_and_bind_mounts(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary)
-            for service in (
-                {"ports": [{"target": 80, "published": "8080"}]},
-                {"volumes": [{"type": "bind", "source": "/etc", "target": "/host"}]},
-            ):
-                with self.subTest(service=service), self.assertRaises(ValueError):
-                    adapters._validate_compose_config(
-                        {"services": {"web": service}},
-                        project,
-                        "web",
-                        "cockpit-app-manager-demo",
-                    )
-
-    def test_compose_detection_preserves_explicit_legacy_dockerfile_mode(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary)
-            (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
-            (project / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
-            self.assertEqual(adapters.docker_deployment_mode({}, project), "compose")
-            self.assertEqual(
-                adapters.docker_deployment_mode({"dockerfile": "deploy/Dockerfile"}, project),
-                "dockerfile",
-            )
-
-    def test_docker_project_inspection_checks_dockerfile_and_warns_about_trust(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            report = inspect_project(root, "docker", {})
-            self.assertTrue(any("Dockerfile not found" in error for error in report["errors"]))
-            (root / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
-            report = inspect_project(root, "docker", {})
-            self.assertFalse(report["errors"])
-            self.assertTrue(any("trusted repositories" in warning for warning in report["warnings"]))
-            self.assertEqual(report["tools"], {"docker": None})
-
-    def test_compose_project_inspection_accepts_a_compose_manifest(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "compose.yaml").write_text("services:\n  web:\n    image: nginx\n", encoding="utf-8")
-            report = inspect_project(root, "docker", {})
-            self.assertFalse(report["errors"])
-            self.assertTrue(any("selected service" in warning for warning in report["warnings"]))
-
     def test_managed_node_converts_to_pnpm_before_vite_build(self):
         from backend.adapters import NodeAdapter
         with tempfile.TemporaryDirectory() as temporary:
@@ -4585,7 +4215,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertNotIn("CAP_NET_BIND_SERVICE", service)
 
         self.assertNotIn("AmbientCapabilities=", service)
-        for framework in ("nextjs", "node", "go", "python", "docker"):
+        for framework in ("nextjs", "node", "go", "python"):
             with self.subTest(framework=framework):
                 custom_route_service = manager._render_service(
                     {**app, "framework": framework, "route": "/public-site/"},
@@ -4601,33 +4231,6 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         read_write_paths = next(line for line in service.splitlines() if line.startswith("ReadWritePaths="))
         self.assertNotIn(manager._systemd_quote(str(paths["current"] / "app")), read_write_paths)
         self.assertNotIn(manager._systemd_quote(str(paths["releases"])), read_write_paths)
-
-    def test_docker_service_runs_daemon_client_as_root_with_managed_container_stop(self):
-        app = {"id": "docker-demo", "service_user": "app-docker-demo", "port": 8123, "framework": "docker"}
-        config = manager._default_config()
-        service = manager._render_service(
-            app, ["docker", "run", "--rm", "--name", "cockpit-app-manager-docker-demo-primary", "image"],
-            config,
-        )
-        self.assertIn("User=root\nGroup=root\n", service)
-        self.assertIn("ExecStop=/usr/bin/docker stop --time 10 cockpit-app-manager-docker-demo-primary", service)
-        self.assertIn(
-            f"Environment={manager._systemd_quote('DOCKER_CONFIG=' + str(Path(manager.DEFAULT_STATE_ROOT) / 'docker-cli'))}",
-            service,
-        )
-        self.assertIn(
-            manager._systemd_quote(str(Path(manager.DEFAULT_STATE_ROOT) / "docker-cli")),
-            next(line for line in service.splitlines() if line.startswith("ReadWritePaths=")),
-        )
-        compose_service = manager._render_service(
-            {**app, "docker_stop_command": ["docker", "compose", "down", "--volumes"]},
-            ["docker", "compose", "up"],
-            config,
-        )
-        self.assertIn('ExecStop="docker" "compose" "down" "--volumes"', compose_service)
-        self.assertNotIn(f"EnvironmentFile=-{manager._app_paths('docker-demo', config)['environment']}", service)
-        self.assertIn("NoNewPrivileges=true", service)
-        self.assertIn("CapabilityBoundingSet=\n", service)
 
     def test_environment_file_directive_is_unquoted_and_escapes_systemd_specifiers(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(
@@ -4971,7 +4574,7 @@ class InfrastructureConfigurationTests(unittest.TestCase):
         self.assertTrue((cockpit_dir / "app-manager.js").is_file())
         frontend = (cockpit_dir / "app-manager.js").read_text(encoding="utf-8")
         self.assertIn("Application path prefix", frontend)
-        self.assertIn("Create NPM route", frontend)
+        self.assertNotIn("Create NPM route", frontend)
         self.assertIn("function renderAppList()", frontend)
         self.assertIn('data-action="deployment-log"', frontend)
         self.assertNotIn("process.close()", frontend)
@@ -5117,6 +4720,33 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertFalse(config.exists())
             self.assertTrue((state_root / "apps.json").exists())
             self.assertTrue((production_root / "demo").exists())
+
+    def test_destructive_uninstall_preserves_unsupported_docker_registrations_and_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry_path = self._write_registry(root, "demo")
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            app = registry["apps"][0]
+            app["framework"] = "docker"
+            registry_path.write_text(json.dumps(registry), encoding="utf-8")
+            before = registry_path.read_bytes()
+            production = Path(app["production_path"])
+            production.mkdir(parents=True)
+            (production / "keep.txt").write_text("keep", encoding="utf-8")
+            unit = root / "etc" / "systemd" / "system" / "cockpit-app-demo.service"
+            unit.parent.mkdir(parents=True)
+            contents = "# Managed by Cockpit App Manager\nDescription=Cockpit App Manager - demo\nUser=root\n"
+            unit.write_text(contents, encoding="utf-8")
+
+            result = self._run_uninstall(root, "--remove-managed-data", "--yes")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Preserving unsupported Docker application", result.stderr)
+            self.assertEqual(registry_path.read_bytes(), before)
+            self.assertEqual(unit.read_text(encoding="utf-8"), contents)
+            self.assertEqual((production / "keep.txt").read_text(encoding="utf-8"), "keep")
+            self.assertFalse((root / "userdel.log").exists())
+            self.assertFalse((root / "systemctl.log").exists())
 
     def test_default_uninstall_removes_only_verified_docker_manager_files(self):
         with tempfile.TemporaryDirectory() as tmp:

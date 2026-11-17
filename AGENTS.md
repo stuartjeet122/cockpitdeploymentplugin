@@ -5,7 +5,7 @@
 This repository is a native Cockpit plugin for hosting multiple web apps on an Ubuntu Server host without disrupting the existing site infrastructure. The app is split into three layers:
 
 - Cockpit UI assets in `cockpit/` that load under the Cockpit navigation menu as `App Manager`.
-- Python backend logic in `backend/app_manager.py` that implements validation, registry management, deployment, system service control, and allowlisted Portainer/Nginx Proxy Manager API requests.
+- Python backend logic in `backend/app_manager.py` that implements validation, registry management, native deployment, system service control, and external manager address settings.
 - Framework-specific deployment behavior in `backend/adapters.py` for Next.js, Go, Node.js, Python, and static HTML projects.
 
 The backend is designed to run as a privileged Cockpit helper. It stores state under `/var/lib/cockpit/app-manager` and exposes a JSON-only CLI that the Cockpit UI shells out to.
@@ -15,14 +15,14 @@ The backend is designed to run as a privileged Cockpit helper. It stores state u
 The project supports the following frameworks and fallback detection rules:
 
 - `nextjs` — detected via `next.config.*` or a `next` dependency in `package.json`.
+- `react` — detected via React plus Vite or `react-scripts` dependencies; builds a static frontend with no runtime service. Optional `build_config.app_directory` selects the project and `build_config.output_directory` selects its build output (`dist` for Vite, `build` for Create React App). Static serving and SPA fallback remain administrator-managed.
 - `go` — detected via `go.mod`.
-- `node` — detected via `package.json` when not a Next.js app.
+- `node` — detected via `package.json` when not a Next.js or supported React frontend.
 - `python` — detected via `requirements.txt` or `pyproject.toml`.
 - `static` — detected via `index.html`.
-- `docker` — detected via a root-level `Dockerfile` or Compose manifest (`compose.yaml`, `compose.yml`, `docker-compose.yaml`, or `docker-compose.yml`); select it explicitly for custom paths.
 - `auto` — uses the framework detector before deployment.
 
-Dockerfile deployments use `build_config.dockerfile`, `build_config.app_directory`, and `build_config.container_port`; the Dockerfile's `CMD` or `ENTRYPOINT` starts the app. Compose deployments use `build_config.compose_file`, `build_config.compose_service`, `build_config.app_directory`, and `build_config.container_port`. Compose projects are managed as one app-scoped project: only the selected web service is published on host loopback, while other services remain internal. Host ports, host filesystem mounts, external volumes/networks, host namespaces, and privileged container settings are rejected. Compose updates restart the project in place to preserve app-scoped named volumes; they are not zero-downtime. For other frameworks, if detection is uncertain or the app uses a nonstandard startup pattern, supply a matching `build_config.start_command` rather than silently guessing.
+If detection is uncertain or the app uses a nonstandard startup pattern, supply a matching `build_config.start_command` rather than silently guessing. Docker/Compose deployments are unsupported. Existing Docker registrations remain visible but read-only, with all actions disabled and auto-deploy skipped; never stop or delete their containers, services, data, or registry entries automatically.
 
 ## Backend development conventions
 
@@ -31,7 +31,7 @@ Dockerfile deployments use `build_config.dockerfile`, `build_config.app_director
 - All registry and config writes must be atomic JSON writes.
 - Registry and config reads must validate structure to handle corrupted files safely.
 - Use subprocess argument arrays (`subprocess.run([...])`) and enforce timeouts for all command execution.
-- Git and non-Docker application build commands must run as the dedicated unprivileged service account. Docker image builds and Compose project operations use the host Docker daemon; never give app accounts access to its root-equivalent socket, and deploy only trusted Dockerfiles or Compose projects.
+- Git and application build commands must run as the dedicated unprivileged service account.
 - Never read or mutate the legacy registry at `/home/stuserver/data/websites.json`.
 - Never accept arbitrary shell commands, arbitrary file paths, or unsafe Git URLs.
 - Handle missing apps, duplicate registrations, and port conflicts explicitly.
@@ -41,21 +41,18 @@ Dockerfile deployments use `build_config.dockerfile`, `build_config.app_director
 - The Cockpit UI is plain HTML/JavaScript in `cockpit/`.
 - The plugin must remain a native Cockpit integration, not a standalone site.
 - UI actions should call the backend with structured JSON input and render backend responses cleanly.
-- Treat the application path as build/runtime configuration only. The Infrastructure workspace may manage explicitly selected Portainer and Nginx Proxy Manager resources via their REST APIs; deployments themselves must not create domains or modify host web-server routing.
+- Treat the application path as build/runtime configuration only. Portainer and Nginx Proxy Manager tabs only open external browser links configured in Settings; do not embed their interfaces, proxy APIs, collect credentials, create domains, or modify host web-server routing.
 
 ## Security requirements
 
 - Do not store passwords, tokens, or credentials in plain-text registry files.
-- Infrastructure API credentials are session-only, passed to the backend over stdin, and must not be persisted in registry/configuration files or included in command arguments.
-- Infrastructure API requests must use explicit provider/resource/action allowlists, bounded responses, timeouts, verified TLS, and no redirect following; never expose an arbitrary privileged URL proxy.
+- External manager settings accept only HTTP(S) URLs or root-relative browser paths without credentials, queries, fragments, control characters, backslashes, or protocol-relative URLs. Leave unconfigured links blank.
 - Accept only HTTPS or SSH Git remotes; reject dangerous or malformed URLs.
 - Prevent path traversal and symlink escape via `validate_allowed_path()` and path-boundary checks.
 - Reserve ports from 8100–8999 and never reuse port 8080 or an active listening port.
 - Validate branch names and Git repo URLs before cloning or pulling.
 - Refuse to overwrite local Git changes. Only fast-forward clean repositories when safe.
 - Keep app runtime files under managed directories and restrict file ownership to dedicated service accounts.
-- Docker runtime ports must publish to host loopback only; containers drop Linux capabilities, use `no-new-privileges`, and receive configured resource limits.
-- Compose projects must not publish host ports or mount host paths; external volumes/networks and host namespace or privileged-container settings are rejected.
 
 ## Deployment architecture
 
@@ -65,8 +62,7 @@ Dockerfile deployments use `build_config.dockerfile`, `build_config.app_director
 - Retain only the current release and the latest deployment record for each app; an in-progress deployment is separately abortable.
 - A systemd timer checks configured repository branches every five minutes and deploys new commits using the same safe fast-forward workflow.
 - Each app gets its own service account, systemd unit, logs, config directory, and loopback-bound runtime port.
-- Dynamic non-Docker apps run on `127.0.0.1` only, never on a public interface.
-- Docker containers bind their internal service to `0.0.0.0` and are published only on the assigned `127.0.0.1` host port; a root-owned systemd unit invokes Docker without sharing the daemon socket with the app account.
+- Dynamic apps run on `127.0.0.1` only, never on a public interface.
 - Static apps should be deployed as files with no unnecessary runtime process. Serving and virtual-host routing are configured separately by the host administrator.
 
 ## Directory structure

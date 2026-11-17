@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
-from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.parse import unquote, urlsplit
 
 try:
     import fcntl
@@ -48,9 +48,9 @@ except ImportError:  # pragma: no cover - Windows has no POSIX group database
     grp = None
 
 try:
-    from .adapters import DOCKER_COMPOSE_FILES, detect_framework, docker_deployment_mode, get_adapter, inspect_project, validate_docker_build_config, validate_go_package, python_command, python_interpreter
+    from .adapters import detect_framework, get_adapter, inspect_project, validate_go_package, validate_react_build_config, python_command, python_interpreter
 except ImportError:  # pragma: no cover - direct execution after installation
-    from adapters import DOCKER_COMPOSE_FILES, detect_framework, docker_deployment_mode, get_adapter, inspect_project, validate_docker_build_config, validate_go_package, python_command, python_interpreter
+    from adapters import detect_framework, get_adapter, inspect_project, validate_go_package, validate_react_build_config, python_command, python_interpreter
 
 APP_NAME = "app-manager"
 DEFAULT_STATE_ROOT = "/var/lib/cockpit/app-manager"
@@ -60,7 +60,6 @@ DEFAULT_PRODUCTION_ROOT = "/opt/webapps"
 DEFAULT_SOURCE_ROOT = f"{DEFAULT_STATE_ROOT}/sources"
 DEFAULT_LOG_ROOT = "/var/log/cockpit-app-manager"
 DEFAULT_PLUGIN_VERSION_PATH = f"{DEFAULT_STATE_ROOT}/plugin-version.json"
-DEFAULT_PORTAINER_API_URL = "http://127.0.0.1:9000"
 PLUGIN_REPOSITORY_URL = "https://github.com/stuartjeet122/cockpitdeploymentplugin.git"
 PLUGIN_REPOSITORY_BRANCH = "main"
 PLUGIN_UPDATE_USER = "nobody"
@@ -74,7 +73,7 @@ APP_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 APP_ROUTE_SEGMENT_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
-FRAMEWORKS = {"auto", "nextjs", "go", "node", "python", "static", "docker"}
+FRAMEWORKS = {"auto", "nextjs", "react", "go", "node", "python", "static"}
 RESOURCE_DEFAULTS = {
     "memory_mb": 1024, "cpu_percent": 100, "tasks_max": 256,
     "build_memory_mb": 2048, "build_cpu_percent": 100, "build_tasks_max": 512,
@@ -112,44 +111,38 @@ def _default_config() -> Dict[str, Any]:
         "max_concurrent_builds": 1,
         "log_root": DEFAULT_LOG_ROOT,
         "service_template": "/etc/cockpit/app-manager/templates/app.service.tpl",
-        "integrations": {"portainer_url": DEFAULT_PORTAINER_API_URL, "npm_url": ""},
+        "integrations": {"portainer_url": "", "npm_url": ""},
     }
 
 
 def _validate_integration_url(value: Any, label: str) -> str:
-    if not isinstance(value, str) or "\0" in value or len(value) > 2048:
-        raise ValueError(f"{label} URL must be a valid HTTP(S) URL")
-    value = value.strip().rstrip("/")
+    if (
+        not isinstance(value, str)
+        or len(value) > 2048
+        or "\\" in value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise ValueError(f"{label} URL must be an HTTP(S) URL or a root-relative path")
+    value = value.strip()
     if not value:
         return ""
     parsed = urlsplit(value)
+    relative = value.startswith("/") and not value.startswith("//")
     if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
+        not (relative or parsed.scheme in {"http", "https"} and parsed.hostname)
+        or relative and parsed.netloc
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
+        or "?" in value
+        or "#" in value
     ):
-        raise ValueError(f"{label} URL must use HTTP(S) and must not contain credentials, a query, or a fragment")
+        raise ValueError(f"{label} URL must use HTTP(S) or a root-relative path without credentials, a query, or a fragment")
     try:
         port = parsed.port
     except ValueError as exc:
         raise ValueError(f"{label} URL has an invalid port") from exc
     if port == 0:
         raise ValueError(f"{label} URL has an invalid port")
-    return value
-
-
-def _portainer_api_url(value: Any) -> str:
-    value = _validate_integration_url(value, "Portainer")
-    parsed = urlsplit(value)
-    if parsed.path in {"/manage-docker", "/portainer"} and (
-        (parsed.hostname == "stuserver.online" and parsed.port in {None, 443} and parsed.scheme == "https")
-        or (parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == 9000 and parsed.scheme == "http")
-    ):
-        # These are browser proxy prefixes, not part of the local Portainer API.
-        return DEFAULT_PORTAINER_API_URL
     return value
 
 
@@ -238,7 +231,7 @@ def get_config() -> Dict[str, Any]:
     if not isinstance(integrations, dict) or set(integrations) - {"portainer_url", "npm_url"}:
         raise ValueError("integrations must contain only Portainer and Nginx Proxy Manager URLs")
     config["integrations"] = {
-        "portainer_url": _portainer_api_url(integrations.get("portainer_url", DEFAULT_PORTAINER_API_URL)),
+        "portainer_url": _validate_integration_url(integrations.get("portainer_url", ""), "Portainer"),
         "npm_url": _validate_integration_url(integrations.get("npm_url", ""), "Nginx Proxy Manager"),
     }
     config["release_retention"] = 1
@@ -542,8 +535,8 @@ def validate_app_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     _validate_app_directory_setting(build_config.get("app_directory"))
     validate_go_package(build_config.get("go_package"))
     python_interpreter(build_config)
-    if framework == "docker":
-        validate_docker_build_config(build_config)
+    if framework == "react":
+        validate_react_build_config(build_config)
     if "start_command" in build_config:
         command = build_config["start_command"]
         if not isinstance(command, list) or not command or not all(
@@ -1366,7 +1359,9 @@ def _routed_health_path(app: Dict[str, Any]) -> str:
 def _is_static_app(app: Dict[str, Any]) -> bool:
     if app.get("static_export") is True:
         return True
-    return app.get("framework") == "static" and not app.get("build_config", {}).get("start_command")
+    return app.get("framework") == "react" or (
+        app.get("framework") == "static" and not app.get("build_config", {}).get("start_command")
+    )
 
 
 def _static_root_relative_path(value: Any) -> Path:
@@ -1444,12 +1439,7 @@ def _wait_for_health(app: Dict[str, Any], timeout_seconds: int) -> bool:
 
 
 def _startup_failure(app: Dict[str, Any], config: Dict[str, Any], executable: Optional[Path] = None) -> str:
-    binding = (
-        f"the container must listen on HOST=0.0.0.0 and PORT={app.get('build_config', {}).get('container_port', 3000)}; "
-        "Docker publishes it only on host loopback"
-        if app.get("framework") == "docker"
-        else f"the runtime must listen on HOST=127.0.0.1 and PORT={app['port']}"
-    )
+    binding = f"the runtime must listen on HOST=127.0.0.1 and PORT={app['port']}"
     message = (
         f"Application did not pass its health check before the timeout: {app_health_url(app)}. "
         f"{binding}, and the health-check path must return HTTP 2xx. "
@@ -1519,6 +1509,10 @@ def _assert_loopback_binding(app: Dict[str, Any], timeout: int) -> None:
 
 def app_metadata(app: Dict[str, Any]) -> Dict[str, Any]:
     metadata = dict(app)
+    if app.get("framework") == "docker":
+        metadata["unsupported"] = True
+        metadata["status"] = "unsupported"
+        return metadata
     source = Path(app.get("source_path", ""))
     if source.is_dir():
         metadata["latest_commit"] = git_output(source, "rev-parse", "HEAD", username=app.get("service_user")) or metadata.get("latest_commit")
@@ -1588,106 +1582,6 @@ def _environment_file_path(
     if env_path.is_symlink() or (env_path.exists() and not env_path.is_file()):
         raise RuntimeError("Application environment file must be a regular file")
     return env_path
-
-
-def _docker_environment_file_path(app_id: str) -> Path:
-    return Path(DEFAULT_STATE_ROOT) / "environment" / f"{validate_app_id(app_id)}.docker.env"
-
-
-def _remove_docker_image(app_id: str, image: str) -> None:
-    if not isinstance(image, str) or not re.fullmatch(
-        rf"cockpit-app-manager-{re.escape(validate_app_id(app_id))}(?:-[a-z0-9][a-z0-9-]*)?:[0-9a-f]{{16}}",
-        image,
-    ):
-        raise ValueError("Refusing to remove an unmanaged Docker image")
-    result = run_command(["docker", "image", "rm", image], timeout=60)
-    _command_error(result, f"Removing Docker image {image}")
-
-
-def _docker_compose_down_command(app: Dict[str, Any], config: Dict[str, Any], remove_data: bool = False) -> Optional[List[str]]:
-    build_config = app.get("build_config", {})
-    if app.get("framework") != "docker" or docker_deployment_mode(build_config) != "compose":
-        return None
-    paths = _app_paths(app["id"], config)
-    if not paths["current"].exists() and not paths["current"].is_symlink():
-        return None
-    release = paths["current"].resolve(strict=True)
-    if not _path_is_within(release, paths["releases"]) or release == paths["releases"]:
-        raise RuntimeError("Compose release is outside the managed application directory")
-    app_dir = release / "app"
-    if build_config.get("app_directory"):
-        app_dir = app_dir.joinpath(*build_config["app_directory"].split("/"))
-    compose_file_name = build_config.get("compose_file")
-    if compose_file_name is None:
-        compose_file_name = next(
-            (name for name in DOCKER_COMPOSE_FILES if (app_dir / name).is_file()),
-            DOCKER_COMPOSE_FILES[0],
-        )
-    compose_file = app_dir / compose_file_name
-    override_file = release / ".app-manager-compose.override.json"
-    for path in (app_dir, compose_file, override_file):
-        if path.is_symlink() or not path.exists() or not _path_is_within(path.resolve(strict=True), release):
-            raise RuntimeError("Managed Compose files are missing or outside the active release")
-    command = [
-        "docker", "compose", "--project-name", f"cockpit-app-manager-{app['id']}",
-        "--project-directory", str(app_dir),
-        "--env-file", str(_docker_environment_file_path(app["id"])),
-        "-f", str(compose_file), "-f", str(override_file),
-        "down", "--timeout", "10", "--remove-orphans",
-    ]
-    if remove_data:
-        command.append("--volumes")
-    return command
-
-
-def _stop_docker_compose(app: Dict[str, Any], config: Dict[str, Any], remove_data: bool = False) -> None:
-    command = _docker_compose_down_command(app, config, remove_data)
-    if command is None:
-        return
-    docker_config = Path(DEFAULT_STATE_ROOT) / "docker-cli"
-    _assert_no_symlink_components(docker_config)
-    docker_config.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(str(docker_config), 0o700)
-    result = run_command(
-        command,
-        timeout=int(config["command_timeout_seconds"]),
-        env={
-            "HOME": "/root",
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "DOCKER_CONFIG": str(docker_config),
-        },
-    )
-    _command_error(result, "Stopping managed Docker Compose project")
-
-
-def _write_docker_environment_file(app_id: str) -> Path:
-    path = _docker_environment_file_path(app_id)
-    _assert_no_symlink_components(path.parent)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o711)
-    if hasattr(os, "chown"):
-        os.chown(str(path.parent), 0, 0)
-    os.chmod(str(path.parent), 0o711)
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise RuntimeError("Docker environment file must be a regular file")
-    values = _environment_values_app(app_id)
-    content = "".join(f"{key}={value}\n" for key, value in values.items())
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".docker-env.", dir=str(path.parent))
-    temporary_path = Path(temporary_name)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if hasattr(os, "chown"):
-            os.chown(str(temporary_path), 0, 0)
-        os.replace(str(temporary_path), str(path))
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            temporary_path.unlink()
-        raise
-    return path
 
 
 def _parse_environment_data(contents: str) -> Tuple[str, Dict[str, str]]:
@@ -1840,8 +1734,6 @@ def save_environment_app(app_id: str, contents: str) -> Dict[str, Any]:
                 os.chown(str(temporary_path), 0, gid)
             temporary_path.chmod(0o640)
             os.replace(str(temporary_path), str(path))
-            if app.get("framework") == "docker" or app.get("container_image"):
-                _write_docker_environment_file(app_id)
         except Exception:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -1870,17 +1762,9 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
         if not validate_git_url(app.get("repo_url")):
             raise ValueError(f"Application {app_id!r} has an invalid Git URL")
         validate_branch(app.get("branch"))
-        if app.get("framework") not in FRAMEWORKS:
+        legacy_docker = app.get("framework") == "docker"
+        if not legacy_docker and app.get("framework") not in FRAMEWORKS:
             raise ValueError(f"Application {app_id!r} has an unsupported framework")
-        compose_images = app.get("compose_images", [])
-        if not isinstance(compose_images, list) or not all(
-            isinstance(image, str) and re.fullmatch(
-                rf"cockpit-app-manager-{re.escape(app_id)}-[a-z0-9][a-z0-9-]*:[0-9a-f]{{16}}",
-                image,
-            )
-            for image in compose_images
-        ):
-            raise ValueError(f"Application {app_id!r} has invalid managed Compose images")
         port = app.get("port")
         if isinstance(port, bool) or not isinstance(port, int) or not PORT_START <= port <= PORT_END or port in RESERVED_PORTS:
             raise ValueError(f"Application {app_id!r} has an invalid port")
@@ -1894,7 +1778,7 @@ def _validate_registry(registry: Dict[str, Any]) -> None:
             seen_ports.add(candidate_port)
         if app.get("service_slot", "primary") not in {"primary", "secondary"}:
             raise ValueError("Invalid managed service slot in registry")
-        normalized_policy = validate_app_payload(app)
+        normalized_policy = validate_app_payload(dict(app, framework="auto") if legacy_docker else app)
         for key in ("auto_deploy", "deployment_window", "resource_limits", "required_environment", "runtime_requirements", "storage_directories", "deployment_mode", "python_services"):
             app[key] = normalized_policy[key]
         expected_paths = _app_paths(app_id, config)
@@ -1940,6 +1824,8 @@ def _find_app(registry: Dict[str, Any], app_id: str) -> Dict[str, Any]:
     app = next((item for item in registry["apps"] if item.get("id") == app_id), None)
     if app is None:
         raise ValueError(f"Application {app_id!r} not found")
+    if app.get("framework") == "docker":
+        raise ValueError("Docker/Compose applications are no longer supported; manage this application externally in Portainer")
     return app
 
 
@@ -2055,7 +1941,10 @@ def get_deployments(
     deployments = []
     for app in _filtered_registry_apps(framework, exclude_framework):
         latest = app.get("deployments", [])[-1:] if app.get("deployments") else []
-        deployments.extend(dict(item, app_id=app["id"]) for item in latest)
+        deployments.extend(
+            dict(item, app_id=app["id"], **({"unsupported": True} if app.get("framework") == "docker" else {}))
+            for item in latest
+        )
     return {"deployments": sorted(deployments, key=lambda item: item.get("date", ""), reverse=True)}
 
 
@@ -2355,7 +2244,7 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("integrations must contain only portainer_url and npm_url")
         current_integrations = config["integrations"]
         update["integrations"] = {
-            "portainer_url": _portainer_api_url(integrations.get("portainer_url", current_integrations["portainer_url"])),
+            "portainer_url": _validate_integration_url(integrations.get("portainer_url", current_integrations["portainer_url"]), "Portainer"),
             "npm_url": _validate_integration_url(integrations.get("npm_url", current_integrations["npm_url"]), "Nginx Proxy Manager"),
         }
     if "source_root" in update:
@@ -2403,408 +2292,6 @@ def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     with _file_lock(path.with_name(path.name + ".lock")):
         _atomic_json_write(path, merged)
     return {"ok": True, "config": get_config()}
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
-        return None
-
-
-def _integration_request(
-    base_url: str,
-    path: str,
-    *,
-    method: str = "GET",
-    token: Optional[str] = None,
-    api_key: bool = False,
-    payload: Optional[Dict[str, Any]] = None,
-    json_lines: bool = False,
-) -> Any:
-    url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"Accept": "application/json"}
-    if token:
-        headers["X-API-Key" if api_key else "Authorization"] = token if api_key else f"Bearer {token}"
-    data = None
-    if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
-    try:
-        with opener.open(request, timeout=120 if json_lines else 15) as response:
-            raw = response.read(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
-                raise ValueError("Integration API response exceeded the 2 MiB limit")
-            if not raw and not json_lines:
-                return None
-            text = raw.decode("utf-8", errors="replace")
-            if json_lines:
-                progress = None
-                for line in text.splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        progress = json.loads(line)
-                    except json.JSONDecodeError:
-                        raise RuntimeError("Docker returned invalid image-pull progress") from None
-                    if not isinstance(progress, dict):
-                        raise RuntimeError("Docker returned invalid image-pull progress")
-                    if progress.get("error") or progress.get("errorDetail"):
-                        raise RuntimeError("Docker image pull failed; check the image reference and registry permissions")
-                if not progress or not isinstance(progress.get("status"), str) or not progress["status"].startswith((
-                    "Status: Downloaded newer image for ", "Status: Image is up to date for ",
-                )):
-                    raise RuntimeError("Docker returned no image-pull completion status; check the image list before retrying")
-                return progress
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return text
-    except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403, 301, 302, 303, 307, 308}:
-            response_headers = exc.headers or {}
-            cloudflare = (
-                "cloudflare" in response_headers.get("Server", "").lower()
-                or bool(response_headers.get("CF-Ray"))
-                or bool(response_headers.get("CF-Mitigated"))
-            )
-            service = "Portainer" if path.startswith("api/endpoints") or path.startswith("api/stacks") else "Nginx Proxy Manager"
-            message = f"{service} API request failed with HTTP {exc.code} ({method} {base_url.rstrip('/')}/{path}). "
-            if cloudflare:
-                message += (
-                    "The response passed through Cloudflare; Cloudflare Access/WAF or the upstream service may have denied it. "
-                    "Check Cloudflare security events and the service's access logs. "
-                )
-            if exc.code in {301, 302, 303, 307, 308}:
-                message += "The API redirected instead of responding directly; redirects are not followed. "
-            elif service == "Portainer":
-                message += "Check that the API key is valid and its owner has access to the selected environment and action. "
-            else:
-                message += "Check the NPM username/password and the account's permissions. "
-            message += (
-                "Backend requests do not share your browser's Cockpit or Cloudflare Access login cookies. "
-                "Use the service's direct API URL reachable from the Ubuntu host, or configure authorized API access "
-                "through the existing proxy. Do not disable TLS verification or make the service public."
-            )
-            raise RuntimeError(message) from None
-        raise RuntimeError(f"Integration API request failed with HTTP {exc.code}") from None
-    except urllib.error.URLError as exc:
-        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
-            raise RuntimeError("Integration API request timed out; check the resource state before retrying") from None
-        raise RuntimeError(f"Could not reach integration API: {exc.reason}") from None
-    except (TimeoutError, socket.timeout):
-        raise RuntimeError("Integration API request timed out; check the resource state before retrying") from None
-
-
-def _positive_api_id(value: Any, label: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"A valid {label} ID is required")
-    if isinstance(value, int):
-        identifier = value
-    elif isinstance(value, str) and re.fullmatch(r"[0-9]{1,20}", value):
-        identifier = int(value)
-    else:
-        raise ValueError(f"A valid {label} ID is required")
-    if identifier < 1:
-        raise ValueError(f"A valid {label} ID is required")
-    return identifier
-
-
-_PORTAINER_RESOURCES = {
-    "endpoints", "containers", "stacks", "images", "volumes", "networks", "info",
-}
-_NPM_RESOURCES = {
-    "proxy-hosts", "redirection-hosts", "dead-hosts", "streams",
-    "certificates", "access-lists",
-}
-_PORTAINER_CONTAINER_ACTIONS = {"start", "stop", "restart", "pause", "unpause", "kill", "remove", "inspect", "logs"}
-
-
-def _docker_image_reference(value: Any) -> str:
-    if (
-        not isinstance(value, str) or len(value) > 256
-        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:-]*(?:@sha256:[0-9a-f]{64})?", value) or "://" in value
-    ):
-        raise ValueError("Enter an image reference such as nginx:alpine, not a URL")
-    return value
-
-
-def _docker_resource_name(value: Any) -> str:
-    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", value):
-        raise ValueError("Docker resource name must use 1-63 letters, digits, dots, underscores or hyphens")
-    return value
-
-
-def _docker_resource_identifier(value: Any) -> str:
-    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value):
-        raise ValueError("A valid Docker resource ID or name is required")
-    return value
-
-
-def _portainer_create_request(resource: str, body: Any) -> Tuple[str, Dict[str, Any]]:
-    allowed = {
-        "containers": {"name", "image", "host_port", "container_port", "restart_policy"},
-        "volumes": {"name"},
-        "networks": {"name", "internal"},
-    }
-    if not isinstance(body, dict) or set(body) - allowed[resource]:
-        raise ValueError("Docker creation requires an object containing only the supported fields")
-    name = _docker_resource_name(body.get("name"))
-    if resource == "volumes":
-        return "volumes/create", {"Name": name, "Driver": "local"}
-    if resource == "networks":
-        internal = body.get("internal", False)
-        if not isinstance(internal, bool):
-            raise ValueError("The internal network option must be a boolean")
-        return "networks/create", {"Name": name, "Driver": "bridge", "CheckDuplicate": True, "Internal": internal}
-    restart_policy = body.get("restart_policy", "no")
-    if not isinstance(restart_policy, str) or restart_policy not in {"no", "always", "unless-stopped", "on-failure"}:
-        raise ValueError("Unsupported Docker restart policy")
-    limits = _resource_limits({})
-    host_config: Dict[str, Any] = {
-        "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"],
-        "Memory": limits["memory_mb"] * 1024 * 1024,
-        "NanoCpus": limits["cpu_percent"] * 10000000, "PidsLimit": limits["tasks_max"],
-        "RestartPolicy": {"Name": restart_policy},
-    }
-    result: Dict[str, Any] = {"Image": _docker_image_reference(body.get("image")), "HostConfig": host_config}
-    host_port, container_port = body.get("host_port"), body.get("container_port")
-    if host_port is not None or container_port is not None:
-        if (
-            isinstance(host_port, bool) or not isinstance(host_port, int) or not PORT_START <= host_port <= PORT_END
-            or isinstance(container_port, bool) or not isinstance(container_port, int) or not 1 <= container_port <= 65535
-        ):
-            raise ValueError("Publishing requires a host port from 8100-8999 and a container port from 1-65535")
-        if host_port in get_listening_ports():
-            raise ValueError("The selected host port is already listening on this host")
-        port_key = f"{container_port}/tcp"
-        result["ExposedPorts"] = {port_key: {}}
-        host_config["PortBindings"] = {port_key: [{"HostIp": "127.0.0.1", "HostPort": str(host_port)}]}
-        if container_port < 1024:
-            host_config["CapAdd"] = ["NET_BIND_SERVICE"]
-    return f"containers/create?{urlencode({'name': name})}", result
-
-
-def _integration_api(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise ValueError("Integration request must be a JSON object")
-    provider = payload.get("provider")
-    action_name = payload.get("action")
-    resource = payload.get("resource")
-    config = get_config()
-    integrations = config["integrations"]
-
-    if provider == "portainer":
-        base_url = integrations["portainer_url"]
-        token = payload.get("token")
-        if not base_url:
-            raise ValueError("Configure the Portainer API URL in Settings first")
-        if (
-            not isinstance(token, str) or not token or token != token.strip()
-            or len(token) > 4096 or any(ord(character) < 33 or ord(character) > 126 for character in token)
-        ):
-            raise ValueError("Enter a valid Portainer API key or token")
-        api_key = token.startswith("ptr_")
-        endpoint_id: Optional[int] = None
-        if resource != "endpoints":
-            endpoint_id = _positive_api_id(payload.get("endpoint_id"), "Portainer environment")
-        if resource not in _PORTAINER_RESOURCES:
-            raise ValueError("Unsupported Portainer resource")
-        if action_name == "list":
-            if resource == "endpoints":
-                path = "api/endpoints"
-            elif resource == "stacks":
-                path = f"api/stacks?{urlencode({'endpointId': endpoint_id})}"
-            elif resource == "info":
-                path = f"api/endpoints/{endpoint_id}/docker/info"
-            elif resource == "containers":
-                path = f"api/endpoints/{endpoint_id}/docker/containers/json?all=true"
-            elif resource == "images":
-                path = f"api/endpoints/{endpoint_id}/docker/images/json"
-            elif resource == "volumes":
-                path = f"api/endpoints/{endpoint_id}/docker/volumes"
-            elif resource == "networks":
-                path = f"api/endpoints/{endpoint_id}/docker/networks"
-            else:
-                raise ValueError("Unsupported Portainer resource")
-            data = _integration_request(base_url, path, token=token, api_key=api_key)
-            return {"provider": provider, "resource": resource, "data": data}
-        if action_name == "create" and resource in {"containers", "volumes", "networks"}:
-            suffix, body = _portainer_create_request(resource, payload.get("body"))
-            data = _integration_request(
-                base_url, f"api/endpoints/{endpoint_id}/docker/{suffix}",
-                method="POST", payload=body, token=token, api_key=api_key,
-            )
-            result_key = "Name" if resource == "volumes" else "Id"
-            if not isinstance(data, dict) or not isinstance(data.get(result_key), str) or not data[result_key]:
-                raise RuntimeError("Docker returned an invalid create response; check the resource list before retrying")
-            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
-        if action_name == "pull" and resource == "images":
-            body = payload.get("body")
-            if not isinstance(body, dict) or set(body) != {"image"}:
-                raise ValueError("Image pulling requires only an image reference")
-            image = _docker_image_reference(body["image"])
-            data = _integration_request(
-                base_url, f"api/endpoints/{endpoint_id}/docker/images/create?{urlencode({'fromImage': image})}",
-                method="POST", token=token, api_key=api_key, json_lines=True,
-            )
-            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
-        if (
-            (action_name == "rename" and resource == "containers")
-            or (action_name == "tag" and resource == "images")
-            or (action_name in {"connect", "disconnect"} and resource == "networks")
-        ):
-            identifier = _docker_resource_identifier(payload.get("id"))
-            encoded_id = quote(identifier, safe="")
-            body = payload.get("body")
-            field = "name" if resource == "containers" else "repository" if resource == "images" else "container"
-            fields = {field, "tag"} if resource == "images" else {field}
-            if not isinstance(body, dict) or set(body) != fields:
-                raise ValueError("Docker changes require an object containing only the supported fields")
-            docker_body = None
-            if resource == "containers":
-                suffix = f"containers/{encoded_id}/rename?{urlencode({'name': _docker_resource_name(body['name'])})}"
-            elif resource == "images":
-                repository = _docker_image_reference(body["repository"])
-                tag = body["tag"]
-                if "@" in repository or ":" in repository.rsplit("/", 1)[-1]:
-                    raise ValueError("Enter the repository without a tag or digest; supply the tag separately")
-                if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
-                    raise ValueError("Image tag must use 1-128 letters, digits, dots, underscores or hyphens")
-                suffix = f"images/{encoded_id}/tag?{urlencode({'repo': repository, 'tag': tag})}"
-            else:
-                container = _docker_resource_identifier(body["container"])
-                network = _integration_request(
-                    base_url, f"api/endpoints/{endpoint_id}/docker/networks/{encoded_id}",
-                    token=token, api_key=api_key,
-                )
-                if not isinstance(network, dict):
-                    raise RuntimeError("Docker returned invalid network details; no network change was requested")
-                if network.get("Driver") != "bridge" or network.get("Scope") != "local":
-                    raise ValueError("Container connections can only be changed on local bridge networks")
-                suffix = f"networks/{encoded_id}/{action_name}"
-                docker_body = {"Container": container}
-                if action_name == "disconnect":
-                    docker_body["Force"] = False
-            data = _integration_request(
-                base_url, f"api/endpoints/{endpoint_id}/docker/{suffix}", method="POST",
-                payload=docker_body, token=token, api_key=api_key,
-            )
-            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
-        if (
-            (action_name == "inspect" and resource in {"images", "volumes", "networks", "stacks"})
-            or (action_name in {"stats", "changes"} and resource == "containers")
-            or (action_name == "history" and resource == "images")
-            or (action_name == "file" and resource == "stacks")
-        ):
-            identifier = payload.get("id")
-            if (
-                not isinstance(identifier, (str, int)) or isinstance(identifier, bool) or not str(identifier)
-                or len(str(identifier)) > 256 or "\0" in str(identifier) or str(identifier) in {".", ".."}
-            ):
-                raise ValueError("A valid Docker resource ID is required")
-            encoded_id = quote(str(identifier), safe="")
-            if resource == "stacks":
-                path = f"api/stacks/{_positive_api_id(identifier, 'Portainer stack')}"
-                if action_name == "file":
-                    path += "/file"
-            else:
-                suffix = (
-                    "/stats?stream=false" if action_name == "stats"
-                    else f"/{action_name}" if action_name in {"history", "changes"}
-                    else "/json" if resource == "images" else ""
-                )
-                path = f"api/endpoints/{endpoint_id}/docker/{resource}/{encoded_id}{suffix}"
-            data = _integration_request(base_url, path, token=token, api_key=api_key)
-            if action_name == "file":
-                if not isinstance(data, dict) or not isinstance(data.get("StackFileContent"), str):
-                    raise RuntimeError("Portainer returned an invalid stack file response")
-                data = data["StackFileContent"]
-            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
-        if resource == "containers" and action_name in _PORTAINER_CONTAINER_ACTIONS:
-            identifier = payload.get("id")
-            if not isinstance(identifier, str) or not identifier or len(identifier) > 256 or "\0" in identifier:
-                raise ValueError("A valid container ID is required")
-            encoded_id = quote(identifier, safe="")
-            if action_name == "remove":
-                suffix = "?force=true"
-                method = "DELETE"
-            elif action_name in {"inspect", "logs"}:
-                suffix = "json" if action_name == "inspect" else "logs?stdout=true&stderr=true&tail=200&timestamps=true"
-                method = "GET"
-            else:
-                suffix = action_name
-                method = "POST"
-            path = f"api/endpoints/{endpoint_id}/docker/containers/{encoded_id}"
-            path += suffix if suffix.startswith("?") else f"/{suffix}"
-            data = _integration_request(
-                base_url, path, method=method, token=token, api_key=api_key,
-            )
-            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
-        if action_name == "remove" and resource in {"images", "volumes", "networks", "stacks"}:
-            identifier = payload.get("id")
-            if not isinstance(identifier, (str, int)) or isinstance(identifier, bool) or not str(identifier) or len(str(identifier)) > 256:
-                raise ValueError("A valid resource ID is required")
-            encoded_id = quote(str(identifier), safe="")
-            if resource == "stacks":
-                stack_id = _positive_api_id(identifier, "Portainer stack")
-                path = f"api/stacks/{stack_id}?{urlencode({'endpointId': endpoint_id})}"
-            elif resource == "images":
-                path = f"api/endpoints/{endpoint_id}/docker/images/{encoded_id}?force=false"
-            elif resource == "volumes":
-                path = f"api/endpoints/{endpoint_id}/docker/volumes/{encoded_id}"
-            else:
-                path = f"api/endpoints/{endpoint_id}/docker/networks/{encoded_id}"
-            data = _integration_request(base_url, path, method="DELETE", token=token, api_key=api_key)
-            return {"provider": provider, "resource": resource, "action": action_name, "data": data}
-        raise ValueError("Unsupported Portainer action")
-
-    if provider == "npm":
-        base_url = integrations["npm_url"]
-        if not base_url:
-            raise ValueError("Configure the Nginx Proxy Manager API URL in Settings first")
-        if resource not in _NPM_RESOURCES:
-            raise ValueError("Unsupported Nginx Proxy Manager resource")
-        if resource == "certificates" and action_name == "update":
-            raise ValueError("Nginx Proxy Manager does not support editing certificates")
-        credentials = payload.get("credentials")
-        if not isinstance(credentials, dict):
-            raise ValueError("Enter your Nginx Proxy Manager credentials")
-        username, password = credentials.get("username"), credentials.get("password")
-        if (
-            not isinstance(username, str) or not username or len(username) > 320
-            or not isinstance(password, str) or not password or len(password) > 4096
-            or "\0" in username or "\0" in password
-        ):
-            raise ValueError("Enter a valid Nginx Proxy Manager username and password")
-        auth = _integration_request(
-            base_url, "api/tokens", method="POST",
-            payload={"identity": username, "secret": password},
-        )
-        token = auth.get("token") if isinstance(auth, dict) else None
-        if not isinstance(token, str) or not token:
-            raise RuntimeError("Nginx Proxy Manager did not return an API token")
-        path = f"api/nginx/{resource}"
-        if action_name == "list":
-            data = _integration_request(base_url, path, token=token)
-        elif action_name in {"create", "update"}:
-            body = payload.get("body")
-            if not isinstance(body, dict):
-                raise ValueError("A JSON object is required for this Nginx Proxy Manager change")
-            if action_name == "update":
-                path += f"/{_positive_api_id(payload.get('id'), 'Nginx Proxy Manager resource')}"
-            data = _integration_request(
-                base_url, path, method="POST" if action_name == "create" else "PUT",
-                token=token, payload=body,
-            )
-        elif action_name == "delete":
-            identifier = _positive_api_id(payload.get("id"), "Nginx Proxy Manager resource")
-            data = _integration_request(base_url, f"{path}/{identifier}", method="DELETE", token=token)
-        else:
-            raise ValueError("Unsupported Nginx Proxy Manager action")
-        return {"provider": provider, "resource": resource, "action": action_name, "data": data}
-
-    raise ValueError("Unsupported integration provider")
 
 
 def edit_app(app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2855,7 +2342,7 @@ def _verified_service_bytes(app: Dict[str, Any], service_path: Path) -> Optional
     if not service_path.exists():
         return None
     contents = service_path.read_bytes()
-    service_user = "root" if app.get("framework") == "docker" or app.get("container_image") else app["service_user"]
+    service_user = app["service_user"]
     required = {"# Managed by Cockpit App Manager", f"Description=Cockpit App Manager - {app['id']}", f"User={service_user}"}
     if not required.issubset(set(contents.decode("utf-8").splitlines())):
         raise RuntimeError("Refusing to modify an unverified managed service unit")
@@ -2923,7 +2410,6 @@ def _render_service(
         paths["config"],
         paths["logs"],
         *(paths["storage"] / name for name in app.get("storage_directories", ["data"])),
-        *((Path(DEFAULT_STATE_ROOT) / "docker-cli",) if app.get("framework") == "docker" else ()),
     )
     read_write_paths = " ".join(_systemd_quote(str(path)) for path in writable_paths)
     exec_start = " ".join(_systemd_quote(part) for part in start_command)
@@ -2957,26 +2443,6 @@ def _render_service(
         f"Environment={_systemd_quote('APP_STORAGE_' + name.upper().replace('-', '_') + '=' + str(paths['storage'] / name))}\n"
         for name in app.get("storage_directories", ["data"])
     )
-    docker_service = app.get("framework") == "docker"
-    service_user = "root" if docker_service else app["service_user"]
-    service_group = "root" if docker_service else app["service_user"]
-    environment_file = "" if docker_service else f"EnvironmentFile=-{str(paths['environment']).replace('%', '%%')}\n"
-    docker_config_environment = (
-        f"Environment={_systemd_quote('DOCKER_CONFIG=' + str(Path(DEFAULT_STATE_ROOT) / 'docker-cli'))}\n"
-        if docker_service else ""
-    )
-    docker_stop = ""
-    if docker_service:
-        configured_stop = app.get("docker_stop_command")
-        if configured_stop:
-            if not isinstance(configured_stop, list) or not configured_stop or not all(
-                isinstance(part, str) and part and "\0" not in part for part in configured_stop
-            ):
-                raise ValueError("Managed Docker stop command is invalid")
-            docker_stop = "ExecStop=" + " ".join(_systemd_quote(part) for part in configured_stop) + "\n"
-        else:
-            container_name = f"cockpit-app-manager-{app['id']}-{app.get('service_slot', 'primary')}"
-            docker_stop = f"ExecStop=/usr/bin/docker stop --time 10 {container_name}\n"
     return (
         "[Unit]\n"
         "# Managed by Cockpit App Manager\n"
@@ -2984,13 +2450,11 @@ def _render_service(
         "After=network.target\n\n"
         "[Service]\n"
         "Type=simple\n"
-        f"User={service_user}\n"
-        f"Group={service_group}\n"
+        f"User={app['service_user']}\n"
+        f"Group={app['service_user']}\n"
         f"WorkingDirectory={working_directory}\n"
         f"ExecStart={exec_start}\n"
-        f"{docker_stop}"
-        f"{environment_file}"
-        f"{docker_config_environment}"
+        f"EnvironmentFile=-{str(paths['environment']).replace('%', '%%')}\n"
         f"Environment={_systemd_quote('PORT=' + str(app['port']))}\n"
         f"Environment={_systemd_quote('HOST=127.0.0.1')}\n"
         f"{node_environment}"
@@ -3049,8 +2513,6 @@ def _write_service(
     config: Dict[str, Any],
     working_directory: Optional[Path] = None,
 ) -> Path:
-    if app.get("framework") == "docker":
-        _write_docker_environment_file(app["id"])
     service = _render_service(app, start_command, config, working_directory, release_dir if "service_slot" in app or app.get("python_services") else None)
     service_path = _service_path(app)
     _verified_service_bytes(app, service_path)
@@ -3571,8 +3033,9 @@ def approve_deployment_app(app_id: str, commit: str) -> Dict[str, Any]:
 
 def auto_deploy_apps(*, retry_now: bool = False) -> Dict[str, Any]:
     _require_root()
-    app_ids = [app["id"] for app in get_registry()["apps"]]
-    outcomes = []
+    apps = get_registry()["apps"]
+    app_ids = [app["id"] for app in apps if app.get("framework") != "docker"]
+    outcomes = [{"app_id": app["id"], "status": "unsupported"} for app in apps if app.get("framework") == "docker"]
     errors = []
     for app_id in app_ids:
         try:
@@ -3848,30 +3311,6 @@ def _build_slot(cancel_file: Path, on_wait: Optional[Callable[[], None]] = None)
         time.sleep(0.1)
 
 
-def _docker_engine_status() -> Dict[str, Any]:
-    docker = shutil.which("docker")
-    if not docker:
-        return {
-            "ok": True, "installed": False, "daemon_active": False,
-            "engine_version": None, "compose_available": False, "compose_version": None,
-        }
-    client = run_command([docker, "--version"], timeout=10)
-    engine = run_command([docker, "version", "--format", "{{.Server.Version}}"], timeout=15)
-    compose = run_command([docker, "compose", "version", "--short"], timeout=15)
-    service = run_command(
-        ["systemctl", "show", "docker.service", "--property=ActiveState", "--value"],
-        timeout=10,
-    )
-    return {
-        "ok": True,
-        "installed": client.returncode == 0,
-        "daemon_active": service.returncode == 0 and (service.stdout or "").strip() == "active",
-        "engine_version": (engine.stdout or "").strip() if engine.returncode == 0 else None,
-        "compose_available": compose.returncode == 0,
-        "compose_version": (compose.stdout or "").strip() if compose.returncode == 0 else None,
-    }
-
-
 def _host_preflight(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     checks = []
     environment = _environment_values_app(app["id"])
@@ -3885,18 +3324,6 @@ def _host_preflight(app: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, An
         free = shutil.disk_usage(path).free
         checks.append({"name": key, "passed": free >= config.get("min_free_disk_mb", 512) * 1024 * 1024,
                        "message": f"{free // (1024 * 1024)} MiB free; minimum {config.get('min_free_disk_mb', 512)} MiB"})
-    if app.get("framework") == "docker":
-        docker = _docker_engine_status()
-        passed = docker["installed"] and docker["daemon_active"] and bool(docker["engine_version"])
-        checks.append({
-            "name": "Docker Engine and Compose",
-            "passed": passed,
-            "message": (
-                f"Engine {docker['engine_version'] or 'unavailable'}; "
-                f"Compose {docker['compose_version'] or 'unavailable'}; "
-                f"daemon {'active' if docker['daemon_active'] else 'inactive'}"
-            ),
-        })
     return {"checks": checks, "errors": [check["message"] for check in checks if not check["passed"]], "warnings": []}
 
 
@@ -3907,10 +3334,6 @@ def _deployment_preflight(app: Dict[str, Any], source: Path, username: str, conf
     report["warnings"].extend(project["warnings"])
     report["framework"] = app["framework"]
     report["project_directory"] = project["project_directory"]
-    if app["framework"] == "docker":
-        report["passed"] = not report["errors"]
-        report["checked_at"] = now_iso()
-        return report
     for tool, minimum in {**project["tools"], **app.get("runtime_requirements", {})}.items():
         executable = python_interpreter(app.get("build_config", {})) if tool == "python3" and app["framework"] == "python" else tool
         label = f"{tool} ({executable})" if executable != tool else tool
@@ -4097,8 +3520,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
         previous_worker_active = False
         native_activation = False
         native_recovered = False
-        docker_image = None
-        docker_images: List[str] = []
         try:
             deployment_log = _deployment_log_path(app_id, release_id, create=True)
             _prune_deployment_logs(app_id, release_id)
@@ -4143,14 +3564,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             if framework == "auto":
                 framework = detect_framework(source_path, app_snapshot.get("build_config", {}))
             app_snapshot["framework"] = framework
-            compose_deployment = False
-            if framework == "docker":
-                app_snapshot["build_config"] = dict(app_snapshot.get("build_config", {}))
-                compose_mode = docker_deployment_mode(app_snapshot["build_config"], source_path)
-                app_snapshot["build_config"]["docker_mode"] = compose_mode
-                compose_deployment = compose_mode == "compose"
-                app_snapshot["docker_tag"] = hashlib.sha256(release_id.encode("utf-8")).hexdigest()[:16]
-                app_snapshot["docker_environment_file"] = str(_write_docker_environment_file(app_id))
             _append_deployment_log(deployment_log, f"Detected framework: {framework}")
             adapter = get_adapter(framework)
             release_dir = paths["releases"] / release_id
@@ -4169,8 +3582,8 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             _append_deployment_log(deployment_log, f"Source revision: {commit or 'unavailable'}")
             service_path = _service_path(app_snapshot)
             previous_service_content = _verified_service_bytes(app_snapshot, service_path)
-            expects_runtime = framework != "static" or bool(app_snapshot.get("build_config", {}).get("start_command"))
-            if not native and not compose_deployment and expects_runtime and current_release is not None and previous_service_content is not None and previous_app.get("status") == "running":
+            expects_runtime = framework not in {"static", "react"} or bool(app_snapshot.get("build_config", {}).get("start_command"))
+            if not native and expects_runtime and current_release is not None and previous_service_content is not None and previous_app.get("status") == "running":
                 staged = True
                 old_service_retired = False
                 with _registry_transaction() as registry:
@@ -4187,7 +3600,10 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 app_snapshot.get("route"),
                 app_id,
             ).rstrip("/")
-            if framework in {"nextjs", "node"}:
+            if framework == "react":
+                build_environment["PUBLIC_URL"] = build_environment["APP_BASE_PATH"] or "/"
+                build_environment["BUILD_PATH"] = app_snapshot.get("build_config", {}).get("output_directory", "build")
+            if framework in {"nextjs", "node", "react"}:
                 build_environment["CI"] = "true"
                 build_environment["npm_config_registry"] = "http://127.0.0.1:4873/"
                 build_environment["npm_config_enable_pre_post_scripts"] = "true"
@@ -4198,26 +3614,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             _, release_group = _account_ids(username)
 
             def build_runner(args, cwd, timeout, preserve_stdout=False):
-                if framework == "docker":
-                    docker_config = Path(DEFAULT_STATE_ROOT) / "docker-cli"
-                    _assert_no_symlink_components(docker_config)
-                    docker_config.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    os.chmod(str(docker_config), 0o700)
-                    is_compose_config = "config" in args
-                    return run_command(
-                        args,
-                        cwd,
-                        timeout,
-                        env={
-                            "HOME": "/root",
-                            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                            "DOCKER_CONFIG": str(docker_config),
-                        },
-                        live_log_path=None if is_compose_config else deployment_log,
-                        redact_values=list(_environment_values_app(app_id).values()),
-                        cancel_file=cancel_file,
-                        preserve_stdout=preserve_stdout,
-                    )
                 return _run_as_user(
                     username,
                     args,
@@ -4231,7 +3627,7 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 )
 
             build_result = _build_release(
-                dict(app_snapshot, _managed_pnpm=True) if framework in {"nextjs", "node"} else app_snapshot,
+                dict(app_snapshot, _managed_pnpm=True) if framework in {"nextjs", "node", "react"} else app_snapshot,
                 source_path,
                 release_dir,
                 adapter,
@@ -4247,11 +3643,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             )
             _append_deployment_log(deployment_log, "Build completed; activating the release")
             _raise_if_deployment_cancelled(cancel_file)
-            if framework == "docker":
-                if build_result.get("image"):
-                    app_snapshot["container_image"] = build_result["image"]
-                    docker_image = build_result["image"]
-                docker_images = build_result.get("images", [])
             runtime_required = build_result.get("runtime_required", True)
             static_root = build_result.get("static_root")
             static_export = bool(static_root)
@@ -4266,10 +3657,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             record["static_export"] = static_export
             _seal_release(release_dir, release_group, public=hosting_framework == "static")
             command = _release_command_path(build_result["start_command"], release_dir, paths["current"])
-            if build_result.get("stop_command"):
-                app_snapshot["docker_stop_command"] = _release_command_path(
-                    build_result["stop_command"], release_dir, paths["current"]
-                )
             working_directory = None
             build_working_directory = build_result.get("working_directory")
             if build_working_directory is not None:
@@ -4337,8 +3724,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
             with _registry_transaction() as registry:
                 app = _find_app(registry, app_id)
                 app["framework"] = framework
-                if framework == "docker":
-                    app["build_config"] = app_snapshot["build_config"]
                 app["static_export"] = static_export
                 if static_export:
                     app["static_root"] = static_root
@@ -4347,14 +3732,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 app["status"] = "running"
                 app["last_deploy"] = record["date"]
                 app["deployed_commit"] = commit or None
-                if build_result.get("image"):
-                    app["container_image"] = build_result["image"]
-                else:
-                    app.pop("container_image", None)
-                if docker_images:
-                    app["compose_images"] = docker_images
-                else:
-                    app.pop("compose_images", None)
                 app.pop("pending_update", None)
                 app["port"] = app_snapshot["port"]
                 if staged:
@@ -4440,17 +3817,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                     if release_dir.is_dir() and not release_dir.is_symlink():
                         shutil.rmtree(release_dir)
                         record["release_available"] = False
-            if docker_image and docker_image != previous_app.get("container_image") and not rollback_error:
-                try:
-                    _remove_docker_image(app_id, docker_image)
-                except (OSError, RuntimeError, ValueError) as cleanup_exc:
-                    record["error"] = f"{record['error']}; failed Docker image cleanup: {cleanup_exc}"
-            if not rollback_error:
-                for image in docker_images:
-                    try:
-                        _remove_docker_image(app_id, image)
-                    except (OSError, RuntimeError, ValueError) as cleanup_exc:
-                        record["error"] = f"{record['error']}; failed Docker image cleanup: {cleanup_exc}"
             with _registry_transaction() as registry:
                 app = _find_app(registry, app_id)
                 stored_record = next(item for item in app["deployments"] if item.get("id") == release_id)
@@ -4484,18 +3850,6 @@ def deploy_app(app_id: str, deployment_id: Optional[str] = None, approved_commit
                 _prune_releases(app)
         except (OSError, RuntimeError) as exc:
             cleanup_errors.append("Previous release cleanup: " + str(exc))
-        previous_image = previous_app.get("container_image")
-        if old_service_retired and previous_image and previous_image != docker_image:
-            try:
-                _remove_docker_image(app_id, previous_image)
-            except (OSError, RuntimeError, ValueError) as exc:
-                cleanup_errors.append("Previous Docker image cleanup: " + str(exc))
-        for image in previous_app.get("compose_images", []):
-            if image not in docker_images:
-                try:
-                    _remove_docker_image(app_id, image)
-                except (OSError, RuntimeError, ValueError) as exc:
-                    cleanup_errors.append("Previous Docker Compose image cleanup: " + str(exc))
         if cleanup_errors:
             record["cleanup_error"] = "; ".join(cleanup_errors)
             _append_deployment_log(
@@ -4914,16 +4268,6 @@ def remove_app(app_id: str) -> Dict[str, Any]:
                 _systemctl("disable", "--now", service_path.name)
                 service_path.unlink()
                 _systemctl("daemon-reload")
-        _stop_docker_compose(app, config, remove_data=True)
-        if app.get("container_image"):
-            _remove_docker_image(app_id, app["container_image"])
-        for image in app.get("compose_images", []):
-            _remove_docker_image(app_id, image)
-        docker_environment = _docker_environment_file_path(app_id)
-        if docker_environment.is_symlink():
-            raise RuntimeError("Docker environment file must not be a symlink")
-        with contextlib.suppress(FileNotFoundError):
-            docker_environment.unlink()
         _remove_app_managed_files(paths, app_id)
         _remove_app_account(app, private_gid)
         with _registry_transaction() as registry:
@@ -5009,7 +4353,6 @@ def _build_parser() -> argparse.ArgumentParser:
     env_get.add_argument("app_id")
     env_save = commands.add_parser("env-save")
     env_save.add_argument("app_id")
-    commands.add_parser("integration")
     rollback = commands.add_parser("rollback")
     rollback.add_argument("app_id")
     rollback.add_argument("release_id", nargs="?")
@@ -5079,11 +4422,6 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         if len(contents.encode("utf-8")) > MAX_ENV_FILE_BYTES:
             raise ValueError(f"Environment file must be smaller than {MAX_ENV_FILE_BYTES} bytes")
         return save_environment_app(args.app_id, contents)
-    if args.command == "integration":
-        raw = sys.stdin.read(2 * 1024 * 1024 + 1)
-        if len(raw.encode("utf-8")) > 2 * 1024 * 1024:
-            raise ValueError("Integration request must be smaller than 2 MiB")
-        return _integration_api(parse_payload(raw))
     operations = {
         "deploy": deploy_app,
         "pull": pull_app,

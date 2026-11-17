@@ -358,18 +358,70 @@ async function settle(window) {
   for (let turn = 0; turn < 4; turn += 1) await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
-test("applications are the initial view and deployed apps offer separate NPM routing", async () => {
+test("applications are the initial view without embedded proxy routing actions", async () => {
   const ui = await loadUi();
   try {
     assert.equal(ui.document.querySelector('[data-tab="websites"]').getAttribute("aria-selected"), "true");
     assert.equal(ui.document.querySelectorAll(".am-app-card").length, 2);
     assert.equal(ui.document.querySelectorAll(".am-app-route a").length, 0);
-    assert.match(ui.document.querySelector("#appsTableContainer").textContent, /Create NPM route/);
+    assert.equal(ui.document.querySelector('[data-action="route"]'), null);
     assert.equal(ui.document.querySelector('[data-action="start"][data-id="docs"]'), null);
   } finally { ui.dom.window.close(); }
 });
 
-test("Infrastructure API URLs are saved separately from authentication secrets", async () => {
+test("external managers have separate native tabs with safe links and no API or credential UI", async () => {
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "/manage-docker/", npm_url: "https://proxy.example:9443/admin/" } } },
+  }, undefined, "https://server.example:9090/cockpit/@host/app-manager/index.html");
+  try {
+    assert.equal(ui.document.querySelector('[data-tab="infrastructure"]'), null);
+    for (const [provider, destination] of [
+      ["portainer", "https://server.example:9090/manage-docker/"],
+      ["npm", "https://proxy.example:9443/admin/"],
+    ]) {
+      const tab = ui.document.querySelector(`[data-tab="${provider}"]`);
+      tab.click();
+      assert.equal(tab.getAttribute("aria-selected"), "true");
+      const panel = ui.document.getElementById(provider);
+      assert.equal(panel.hidden, false);
+      assert.equal(panel.getAttribute("aria-labelledby"), tab.id);
+      const link = panel.querySelector("a");
+      assert.equal(link.href, destination);
+      assert.equal(link.target, "_blank");
+      assert.equal(link.rel, "noopener noreferrer");
+      assert.match(link.textContent, /new tab/);
+      assert.equal(panel.querySelector("iframe, form, input, textarea, select"), null);
+    }
+    const portainerTab = ui.document.querySelector("#tab-portainer");
+    portainerTab.focus();
+    portainerTab.dispatchEvent(new ui.window.KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    assert.equal(ui.document.activeElement.id, "tab-npm");
+    assert.equal(ui.document.querySelector("#tab-npm").getAttribute("aria-selected"), "true");
+    assert.equal(ui.document.querySelector("#portainer").hidden, true);
+    assert.equal(ui.calls.some((record) => record.command === "integration"), false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("unconfigured manager tabs explain setup without default loopback links", async () => {
+  const ui = await loadUi();
+  try {
+    for (const provider of ["portainer", "npm"]) {
+      ui.document.querySelector(`#tab-${provider}`).click();
+      const panel = ui.document.querySelector(`#${provider}Panel`);
+      assert.equal(panel.querySelector("a"), null);
+      assert.match(panel.textContent, /not configured/);
+      panel.querySelector("[data-go-settings]").click();
+      assert.equal(ui.document.querySelector("#tab-settings").getAttribute("aria-selected"), "true");
+    }
+    const form = ui.document.querySelector("#integrationSettingsForm");
+    assert.equal(form.elements.portainer_url.value, "");
+    assert.equal(form.elements.npm_url.value, "");
+    assert.doesNotMatch(form.textContent, /127\.0\.0\.1/);
+    assert.equal(ui.calls.some((record) => record.command === "integration"), false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("manager settings save browser URLs, preserve root-relative paths, and permit clearing", async () => {
   let integrations = { portainer_url: "", npm_url: "" };
   const ui = await loadUi({
     settings: (record) => {
@@ -378,621 +430,164 @@ test("Infrastructure API URLs are saved separately from authentication secrets",
     },
   });
   try {
-    ui.document.querySelector('[data-tab="settings"]').click();
-    const form = ui.document.querySelector("#integrationSettingsForm");
-    form.elements.portainer_url.value = "https://portainer.example:9443";
-    form.elements.npm_url.value = "http://127.0.0.1:81";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    const saved = ui.calls.filter((record) => record.command === "settings" && record.values.length)
-      .map((record) => JSON.parse(record.values[0])).pop();
-    assert.deepEqual(saved, { integrations: {
-      portainer_url: "https://portainer.example:9443", npm_url: "http://127.0.0.1:81",
-    } });
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    assert.match(ui.document.querySelector("#integrationPanel").textContent, /Portainer/);
-    assert.match(ui.document.querySelector("#integrationPanel").textContent, /Nginx Proxy Manager/);
-  } finally { ui.dom.window.close(); }
-});
-
-test("Portainer API stays local while NPM routes reuse Cockpit's origin", async () => {
-  let integrations = {
-    portainer_url: "http://127.0.0.1:9000",
-    npm_url: "https://server.example:9090/nginx",
-  };
-  const ui = await loadUi({
-    settings: (record) => {
-      if (record.values.length) integrations = JSON.parse(record.values[0]).integrations;
-      return { config: { integrations } };
-    },
-  }, undefined, "https://server.example:9090/cockpit/@host/app-manager/index.html");
-  try {
-    ui.document.querySelector('[data-tab="settings"]').click();
-    let form = ui.document.querySelector("#integrationSettingsForm");
-    assert.equal(form.elements.portainer_url.value, "http://127.0.0.1:9000");
-    assert.equal(form.elements.npm_url.value, "/nginx");
-    assert.match(ui.document.querySelector("#integrationAddressHint").textContent, /https:\/\/server.example:9090/);
-    form.elements.portainer_url.value = "/manage-docker/";
-    assert.equal(form.checkValidity(), false);
-    form.elements.portainer_url.value = "http://127.0.0.1:9000";
-    form.elements.npm_url.value = "/services/proxy/";
-    assert.equal(form.checkValidity(), true);
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    assert.deepEqual(integrations, {
-      portainer_url: "http://127.0.0.1:9000",
-      npm_url: "https://server.example:9090/services/proxy/",
-    });
-    form = ui.document.querySelector("#integrationSettingsForm");
-    assert.equal(form.elements.portainer_url.value, "http://127.0.0.1:9000");
-    assert.equal(form.elements.npm_url.value, "/services/proxy/");
-    form.elements.portainer_url.value = "";
-    form.elements.npm_url.value = "http://127.0.0.1:81";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    assert.deepEqual(integrations, { portainer_url: "", npm_url: "http://127.0.0.1:81" });
-  } finally { ui.dom.window.close(); }
-});
-
-test("Portainer browser navigation keeps its public route separate from the loopback API", async () => {
-  const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-    integration: (record) => {
-      const request = JSON.parse(record.input);
-      return { data: request.resource === "endpoints" ? [{ Id: 2, Name: "local" }] : [] };
-    },
-  }, undefined, "https://stuserver.online/cockpit/app-manager/index.html");
-  try {
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    const link = ui.document.querySelector('#integrationPanel a[href="/manage-docker/"]');
-    assert.equal(link.href, "https://stuserver.online/manage-docker/");
-    const form = ui.document.querySelector('[data-integration-connect="portainer"]');
-    form.elements.token.value = "ptr_local-key";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    const requests = ui.calls.filter((record) => record.command === "integration");
-    assert.equal(requests.length, 2);
-    assert.ok(requests.every((record) => record.values.length === 0));
-    assert.ok(requests.every((record) => JSON.parse(record.input).token === "ptr_local-key"));
-    assert.ok(requests.every((record) => !record.input.includes("stuserver.online")));
-    assert.equal(ui.document.querySelector('#integrationPanel a[href="/manage-docker/"]').href, link.href);
-  } finally { ui.dom.window.close(); }
-});
-
-test("Infrastructure connects to Portainer with a session-only API key and controls containers", async () => {
-  const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "https://portainer.example", npm_url: "" } } },
-    integration: (record) => {
-      const request = JSON.parse(record.input);
-      if (request.resource === "endpoints") return { provider: "portainer", data: [{ Id: 2, Name: "local", Status: "Up" }] };
-      if (request.action === "list") return { provider: "portainer", data: [{
-        Id: "container-1", Names: ["/web"], Image: "example/web:latest", State: "running",
-        Status: "Up 3 hours", Ports: [],
-      }] };
-      return { provider: "portainer", action: request.action, data: null };
-    },
-  });
-  try {
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    const form = ui.document.querySelector('[data-integration-connect="portainer"]');
-    assert.equal(form.elements.username.value, "Portainer API key: https://portainer.example");
-    assert.equal(form.elements.username.autocomplete, "username");
-    assert.equal(form.elements.token.autocomplete, "current-password");
-    form.elements.token.value = "ptr_session-only-secret";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    const requests = ui.calls.filter((record) => record.command === "integration");
-    assert.equal(requests.length, 2);
-    assert.ok(requests.every((record) => record.values.length === 0));
-    assert.ok(requests.every((record) => JSON.parse(record.input).token === "ptr_session-only-secret"));
-    assert.match(ui.document.querySelector("#integrationPanel").textContent, /web/);
-    assert.equal(ui.document.querySelector('#integrationPanel input[type="password"]'), null);
-    ui.document.querySelector('[data-resource-action="stop"]').click();
-    await settle(ui.window);
-    const stopRequest = ui.calls.filter((record) => record.command === "integration")
-      .map((record) => JSON.parse(record.input)).find((request) => request.action === "stop");
-    assert.equal(stopRequest.id, "container-1");
-    assert.equal(stopRequest.endpoint_id, "2");
-  } finally { ui.dom.window.close(); }
-});
-
-test("Infrastructure shows access-denial guidance and clears a rejected API key", async () => {
-  const message = "Portainer API request failed with HTTP 403. Check the API key owner's environment permissions.";
-  const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "https://portainer.example", npm_url: "" } } },
-    integration: { ok: false, error: message },
-  });
-  try {
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    const form = ui.document.querySelector('[data-integration-connect="portainer"]');
-    form.elements.token.value = "ptr_rejected-key";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    assert.equal(ui.document.querySelector("#appManagerError").textContent, message);
-    assert.equal(ui.document.querySelector("#appManagerError").classList.contains("hidden"), false);
-    assert.equal(ui.document.querySelector('[data-integration-connect="portainer"]').elements.token.value, "");
-    assert.equal(ui.window.localStorage.length, 0);
-    assert.equal(ui.window.sessionStorage.length, 0);
-    assert.equal(ui.document.body.textContent.includes("ptr_rejected-key"), false);
-  } finally { ui.dom.window.close(); }
-});
-
-for (const resource of ["containers", "images", "volumes", "networks"]) {
-  test(`native Docker ${resource} form submits structured creation data once`, async () => {
-    const ui = await loadUi({
-      settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-      integration: (record) => {
-        const request = JSON.parse(record.input);
-        if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
-        if (request.action === "list") return { data: [] };
-        return { data: { Id: "created", Name: "native-data", Warnings: ["Review this resource"] } };
-      },
-    });
-    try {
-      ui.document.querySelector('[data-tab="infrastructure"]').click();
-      const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
-      connect.elements.token.value = "ptr_local-key";
-      connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      await settle(ui.window);
-      if (resource !== "containers") {
-        const select = ui.document.querySelector("[data-integration-resource]");
-        select.value = resource;
-        select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
-        await settle(ui.window);
-      }
-      const form = ui.document.querySelector("[data-portainer-create]");
-      if (resource !== "images") form.elements.name.value = "native-resource";
-      if (resource === "images" || resource === "containers") form.elements.image.value = "nginx:alpine";
-      if (resource === "containers") {
-        form.elements.host_port.value = "8123";
-        form.elements.container_port.value = "80";
-        form.elements.restart_policy.value = "unless-stopped";
-      }
-      if (resource === "networks") form.elements.internal.checked = true;
-      assert.equal(form.checkValidity(), true);
-      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      await settle(ui.window);
-      const calls = ui.calls.filter((record) => record.command === "integration"
-        && ["create", "pull"].includes(JSON.parse(record.input).action));
-      assert.equal(calls.length, 1);
-      assert.equal(calls[0].values.length, 0);
-      const request = JSON.parse(calls[0].input);
-      assert.equal(request.resource, resource);
-      assert.equal(request.endpoint_id, "2");
-      assert.equal(request.token, "ptr_local-key");
-      const expected = resource === "images" ? { image: "nginx:alpine" }
-        : resource === "containers" ? {
-          name: "native-resource", image: "nginx:alpine", host_port: 8123, container_port: 80, restart_policy: "unless-stopped",
-        } : resource === "networks" ? { name: "native-resource", internal: true } : { name: "native-resource" };
-      assert.deepEqual(request.body, expected);
-      assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Review this resource/);
-      assert.equal(ui.document.querySelector("#appManagerError").classList.contains("hidden"), true);
-    } finally { ui.dom.window.close(); }
-  });
-}
-
-test("native Docker inspection, stats, changes, history and stack files open escaped read-only results", async () => {
-  const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-    integration: (record) => {
-      const request = JSON.parse(record.input);
-      if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
-      if (request.action === "list") return { data: request.resource === "volumes"
-        ? { Volumes: [{ Name: "native-data", Driver: "local" }] }
-        : [{ Id: "container", Names: ["/web"], State: "running" }] };
-      return { data: request.action === "file"
-        ? "services:\n  web:\n    image: nginx\n# <img src=x onerror=alert(1)>"
-        : { details: "<img src=x onerror=alert(1)>", memory_stats: { usage: 512 } } };
-    },
-  });
-  try {
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
-    connect.elements.token.value = "ptr_local-key";
-    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    for (const [resource, action, title] of [
-      ["containers", "stats", "Container stats"], ["containers", "changes", "Container filesystem changes"],
-      ["images", "history", "Image history"], ["stacks", "file", "Stack Compose file"],
-      ["volumes", "inspect", "Resource details"],
+    for (const addresses of [
+      { portainer_url: "https://portainer.example:9443/", npm_url: "/nginx/" },
+      { portainer_url: "/manage-docker/", npm_url: "http://proxy.example:81/" },
+      { portainer_url: "", npm_url: "" },
     ]) {
-      const select = ui.document.querySelector("[data-integration-resource]");
-      if (select.value !== resource) {
-        select.value = resource;
-        select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
-        await settle(ui.window);
-      }
-      ui.document.querySelector(`[data-resource-action="${action}"]`).click();
+      const form = ui.document.querySelector("#integrationSettingsForm");
+      for (const [key, value] of Object.entries(addresses)) form.elements[key].value = value;
+      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
       await settle(ui.window);
-      const dialog = ui.document.querySelector("#appManagerDialog");
-      assert.ok(dialog.textContent.includes(title));
-      assert.equal(dialog.querySelector("img"), null);
-      assert.match(dialog.querySelector("pre").textContent, /<img src=x onerror=alert\(1\)>/);
-      if (action === "file") assert.match(dialog.querySelector("pre").textContent, /^services:\n  web:/);
-      const request = ui.calls.filter((record) => record.command === "integration")
-        .map((record) => JSON.parse(record.input)).find((request) => request.action === action);
-      assert.equal(request.resource, resource);
-      assert.equal(request.id, resource === "volumes" ? "native-data" : "container");
-      assert.equal(request.endpoint_id, "2");
-      assert.doesNotMatch(ui.document.querySelector("#appManagerNotice").textContent, /resource updated/i);
-      dialog.close();
+      assert.deepEqual(integrations, addresses);
+      for (const [key, value] of Object.entries(addresses)) {
+        assert.equal(ui.document.querySelector("#integrationSettingsForm").elements[key].value, value);
+      }
+    }
+    assert.equal(ui.document.querySelector("#portainerPanel a, #npmPanel a"), null);
+    assert.equal(ui.calls.filter((record) => record.command === "settings" && record.values.length).length, 3);
+    assert.equal(ui.calls.some((record) => record.command === "integration"), false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("unsafe manager addresses are neither rendered as links nor saved", async () => {
+  const unsafe = [
+    "//evil.example/path", "/\\evil.example", "https://good.example\\@evil.example",
+    "https://user:secret@example.com", "https://@example.com", "javascript:alert(1)",
+    "data:text/html,test", "ftp://example.com", "relative/path", "https://", "https:////evil.example",
+    "https://exa\u0001mple.com", "/path\u007f", "/path\u0085",
+    "/nginx/?view=hosts", "/nginx/#list", "/nginx/?", "/nginx/#",
+    "https://proxy.example/?view=hosts", "https://proxy.example/#list",
+    "https://proxy.example/?", "https://proxy.example/#",
+    "https:example.com", "https:/example.com", "https:///example.com",
+    "https://example.com:invalid", "https://[invalid]/", "https://exa mple.com/",
+  ];
+  const ui = await loadUi({
+    settings: { config: { integrations: { portainer_url: "/nginx/?view=hosts", npm_url: "https://proxy.example/#list" } } },
+  });
+  try {
+    assert.equal(ui.document.querySelector("#portainerPanel a, #npmPanel a"), null);
+    assert.match(ui.document.querySelector("#npmPanel").textContent, /URL is invalid/);
+    const form = ui.document.querySelector("#integrationSettingsForm");
+    form.elements.portainer_url.value = "";
+    form.elements.npm_url.value = "";
+    for (const key of ["portainer_url", "npm_url"]) {
+      for (const address of unsafe) {
+        form.elements[key].value = address;
+        form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+        await settle(ui.window);
+        assert.equal(ui.calls.filter((record) => record.command === "settings" && record.values.length).length, 0, address);
+        assert.match(ui.document.querySelector("#appManagerError").textContent, /HTTP\(S\) browser URL/);
+      }
+      form.elements[key].value = "";
     }
   } finally { ui.dom.window.close(); }
 });
 
-for (const [resource, action, fields] of [
-  ["containers", "rename", { name: "new-web" }],
-  ["images", "tag", { repository: "registry.example:5000/org/web", tag: "release-1" }],
-  ["networks", "connect", { container: "web" }],
-  ["networks", "disconnect", { container: "web" }],
-]) {
-  test(`native Docker ${action} submits one structured request and refreshes`, async () => {
-    const confirmations = [];
-    const ui = await loadUi({
-      settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-      integration: (record) => {
-        const request = JSON.parse(record.input);
-        if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
-        if (request.action === "list") return { data: [{
-          Id: "resource-id", Names: ["/web"], State: "running", Driver: "bridge", Scope: "local",
-        }] };
-        return { data: null };
-      },
-    }, (window) => { window.confirm = (message) => { confirmations.push(message); return true; }; });
-    try {
-      ui.document.querySelector('[data-tab="infrastructure"]').click();
-      const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
-      connect.elements.token.value = "ptr_local-key";
-      connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      await settle(ui.window);
-      if (resource !== "containers") {
-        const select = ui.document.querySelector("[data-integration-resource]");
-        select.value = resource;
-        select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
-        await settle(ui.window);
-      }
-      const form = ui.document.querySelector("[data-portainer-change]");
-      for (const [name, value] of Object.entries(fields)) form.elements[name].value = value;
-      if (resource === "networks") form.elements.action.value = action;
-      assert.equal(form.checkValidity(), true);
-      const previousCalls = ui.calls.length;
-      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      await settle(ui.window);
-      const calls = ui.calls.slice(previousCalls).filter((record) => record.command === "integration");
-      assert.equal(calls.length, 2);
-      const request = JSON.parse(calls[0].input);
-      assert.deepEqual(request, {
-        provider: "portainer", action, resource, endpoint_id: "2", id: "resource-id", body: fields, token: "ptr_local-key",
-      });
-      assert.equal(calls[0].values.length, 0);
-      assert.equal(JSON.parse(calls[1].input).action, "list");
-      assert.equal(confirmations.length, ["rename", "disconnect"].includes(action) ? 1 : 0);
-      assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Docker resource updated/);
-      assert.equal(ui.document.querySelector("#appManagerError").classList.contains("hidden"), true);
-    } finally { ui.dom.window.close(); }
-  });
-}
-
-for (const action of ["rename", "disconnect"]) {
-  test(`cancelling Docker ${action} sends no request`, async () => {
-    const ui = await loadUi({
-      settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-      integration: (record) => ({ data: JSON.parse(record.input).resource === "endpoints"
-        ? [{ Id: 2, Name: "local" }] : [{ Id: "resource-id", Driver: "bridge", Scope: "local" }] }),
-    }, (window) => { window.confirm = () => false; });
-    try {
-      ui.document.querySelector('[data-tab="infrastructure"]').click();
-      const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
-      connect.elements.token.value = "ptr_local-key";
-      connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      await settle(ui.window);
-      if (action === "disconnect") {
-        const select = ui.document.querySelector("[data-integration-resource]");
-        select.value = "networks";
-        select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
-        await settle(ui.window);
-      }
-      const form = ui.document.querySelector("[data-portainer-change]");
-      if (action === "rename") form.elements.name.value = "new-web";
-      else {
-        form.elements.container.value = "web";
-        form.elements.action.value = action;
-      }
-      const previousCalls = ui.calls.length;
-      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      await settle(ui.window);
-      assert.equal(ui.calls.length, previousCalls);
-      assert.equal(ui.document.querySelector("[data-portainer-change]"), form);
-    } finally { ui.dom.window.close(); }
-  });
-}
-
-test("native Docker hides network membership controls for non-local bridges", async () => {
+test("Docker registrations stay visible but have no actions, history controls, or polling", async () => {
+  const apps = [
+    { ...fixtureApps[0], id: "legacy", name: "Legacy Docker", framework: "docker", unsupported: true, status: "unsupported" },
+    { ...fixtureApps[0], id: "fallback", name: "Legacy fallback", framework: "docker" },
+    fixtureApps[0],
+  ];
   const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-    integration: (record) => ({ data: JSON.parse(record.input).resource === "endpoints"
-      ? [{ Id: 2, Name: "local" }] : [
-        { Id: "host", Driver: "host", Scope: "local" }, { Id: "overlay", Driver: "overlay", Scope: "swarm" },
-        { Id: "custom", Driver: "macvlan", Scope: "local" }, { Id: "bridge", Driver: "bridge", Scope: "swarm" },
-      ] }),
+    list: { apps },
+    deployments: { deployments: [
+      { app_id: "legacy", id: "legacy-deploy", status: "deploying", unsupported: true },
+      { app_id: "orphan", id: "orphan-deploy", status: "deploying", unsupported: true },
+    ] },
   });
   try {
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
-    connect.elements.token.value = "ptr_local-key";
-    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    const cards = ui.document.querySelectorAll('[data-framework="docker"]');
+    assert.equal(cards.length, 2);
+    for (const card of cards) {
+      assert.match(card.textContent, /Unsupported/);
+      assert.match(card.textContent, /No containers, services, or files are changed/);
+      assert.equal(card.querySelector("button, [data-action], input, select, textarea"), null);
+    }
+    assert.equal(ui.document.querySelector("#deploymentHistory [data-action]"), null);
+    ui.document.querySelector("#refreshButton").click();
     await settle(ui.window);
-    const select = ui.document.querySelector("[data-integration-resource]");
-    select.value = "networks";
-    select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
-    await settle(ui.window);
-    assert.equal(ui.document.querySelector("[data-portainer-change]"), null);
-    assert.equal(ui.document.querySelectorAll('[data-resource-action="inspect"]').length, 4);
-  } finally { ui.dom.window.close(); }
-});
-
-for (const refreshFailure of [false, true]) {
-  test(`native Docker rename preserves the form on ${refreshFailure ? "refresh" : "API"} failure`, async () => {
-    let renamed = false;
-    const ui = await loadUi({
-      settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-      integration: (record) => {
-        const request = JSON.parse(record.input);
-        if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
-        if (request.action === "rename") {
-          if (!refreshFailure) return { ok: false, error: "API denied rename" };
-          renamed = true;
-          return { data: null };
-        }
-        return renamed ? { ok: false, error: "API temporarily unavailable" } : { data: [{ Id: "container" }] };
-      },
-    }, (window) => { window.confirm = () => true; });
-    try {
-      ui.document.querySelector('[data-tab="infrastructure"]').click();
-      const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
-      connect.elements.token.value = "ptr_local-key";
-      connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    for (const appId of ["legacy", "orphan"]) {
+      ui.document.querySelector("#deploymentHistory").insertAdjacentHTML("beforeend",
+        `<button data-action="deployment-log" data-id="${appId}" data-deployment-id="${appId}-deploy">Stale log action</button>`);
+      ui.document.querySelector(`#deploymentHistory [data-id="${appId}"]`).click();
+      const dialog = ui.document.querySelector("#appManagerDialog");
+      dialog.insertAdjacentHTML("beforeend",
+        `<button data-action="abort-deployment" data-app-id="${appId}" data-deployment-id="${appId}-deploy">Stale abort action</button>`);
+      dialog.querySelector(`[data-app-id="${appId}"]`).click();
       await settle(ui.window);
-      const form = ui.document.querySelector("[data-portainer-change]");
-      form.elements.name.value = "new-web";
-      form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-      await settle(ui.window);
-      assert.match(ui.document.querySelector("#appManagerError").textContent, refreshFailure
-        ? /rename succeeded, but refreshing failed/ : /API denied rename/);
-      assert.equal(ui.document.querySelector("[data-portainer-change]"), form);
-      assert.equal(form.elements.name.value, "new-web");
-      assert.equal(form.elements.name.disabled, false);
-      assert.equal(ui.document.querySelector("#appManagerNotice").classList.contains("hidden"), true);
-      assert.equal(ui.calls.filter((record) => record.command === "integration"
-        && JSON.parse(record.input).action === "rename").length, 1);
-    } finally { ui.dom.window.close(); }
-  });
-}
-
-test("native image pull failures keep the form and do not announce success", async () => {
-  const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-    integration: (record) => {
-      const request = JSON.parse(record.input);
-      if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
-      if (request.action === "pull") return { ok: false, error: "Docker image pull failed; check registry permissions" };
-      return { data: [] };
-    },
-  });
-  try {
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
-    connect.elements.token.value = "ptr_local-key";
-    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    const select = ui.document.querySelector("[data-integration-resource]");
-    select.value = "images";
-    select.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
-    await settle(ui.window);
-    const form = ui.document.querySelector("[data-portainer-create]");
-    form.elements.image.value = "private/image:tag";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    assert.match(ui.document.querySelector("#appManagerError").textContent, /registry permissions/);
-    assert.equal(ui.document.querySelector("[data-portainer-create]"), form);
-    assert.equal(form.elements.image.value, "private/image:tag");
-    assert.equal(ui.document.querySelector("#appManagerNotice").classList.contains("hidden"), true);
-    assert.equal(ui.document.querySelector('[data-resource-action="start"]'), null);
-  } finally { ui.dom.window.close(); }
-});
-
-test("native Docker creation reports when creation succeeded but refreshing failed", async () => {
-  let created = false;
-  const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "http://127.0.0.1:9000", npm_url: "" } } },
-    integration: (record) => {
-      const request = JSON.parse(record.input);
-      if (request.resource === "endpoints") return { data: [{ Id: 2, Name: "local" }] };
-      if (request.action === "create") {
-        created = true;
-        return { data: { Id: "created" } };
-      }
-      return created ? { ok: false, error: "API temporarily unavailable" } : { data: [] };
-    },
-  });
-  try {
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    const connect = ui.document.querySelector('[data-integration-connect="portainer"]');
-    connect.elements.token.value = "ptr_local-key";
-    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    const form = ui.document.querySelector("[data-portainer-create]");
-    form.elements.name.value = "native-resource";
-    form.elements.image.value = "nginx:alpine";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    assert.match(ui.document.querySelector("#appManagerError").textContent, /creation succeeded, but refreshing failed/);
-    assert.equal(ui.calls.filter((record) => record.command === "integration"
-      && JSON.parse(record.input).action === "create").length, 1);
-    assert.equal(ui.document.querySelector("#appManagerNotice").classList.contains("hidden"), true);
-  } finally { ui.dom.window.close(); }
-});
-
-test("Infrastructure edits Nginx Proxy Manager hosts through its resource API", async () => {
-  const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "", npm_url: "http://127.0.0.1:81" } } },
-    integration: (record) => {
-      const request = JSON.parse(record.input);
-      if (request.action === "list") return { provider: "npm", data: [{
-        id: 8, domain_names: ["app.example.com"], forward_host: "127.0.0.1",
-        forward_port: 8100, enabled: true,
-      }] };
-      return { provider: "npm", action: request.action, data: { id: 8 } };
-    },
-  });
-  try {
-    ui.document.querySelector('[data-tab="infrastructure"]').click();
-    ui.document.querySelector('[data-integration-provider="npm"]').click();
-    const form = ui.document.querySelector('[data-integration-connect="npm"]');
-    form.elements.username.value = "admin@example.com";
-    form.elements.password.value = "session-only-password";
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    const connected = ui.calls.filter((record) => record.command === "integration")[0];
-    assert.equal(connected.values.length, 0);
-    assert.equal(JSON.parse(connected.input).credentials.password, "session-only-password");
-    const editor = ui.document.querySelector('[data-npm-update]');
-    const body = JSON.parse(editor.elements.body.value);
-    body.forward_port = 8111;
-    editor.elements.body.value = JSON.stringify(body);
-    editor.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-    const update = ui.calls.filter((record) => record.command === "integration")
-      .map((record) => JSON.parse(record.input)).find((request) => request.action === "update");
-    assert.equal(update.resource, "proxy-hosts");
-    assert.equal(update.id, "8");
-    assert.equal(update.body.forward_port, 8111);
-    assert.equal(update.credentials.password, "session-only-password");
-  } finally { ui.dom.window.close(); }
-});
-
-test("deployed applications open a quick NPM route form with their managed port", async () => {
-  const ui = await loadUi({
-    settings: { config: { integrations: { portainer_url: "", npm_url: "http://127.0.0.1:81" } } },
-    integration: (record) => {
-      const request = JSON.parse(record.input);
-      if (request.action === "list") return { provider: "npm", data: [] };
-      return { provider: "npm", action: request.action, data: { id: 12 } };
-    },
-  });
-  try {
-    ui.document.querySelector('#appsTableContainer [data-action="route"][data-id="portal"]').click();
-    assert.equal(ui.document.querySelector('[data-tab="infrastructure"]').getAttribute("aria-selected"), "true");
-    const connect = ui.document.querySelector('[data-integration-connect="npm"]');
-    connect.elements.username.value = "admin@example.com";
-    connect.elements.password.value = "session-only-password";
-    connect.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-
-    const route = ui.document.querySelector("[data-npm-route]");
-    assert.ok(route);
-    assert.equal(route.elements.app_id.value, "portal");
-    assert.equal(route.elements.forward_port.value, "8100");
-    route.elements.domain_names.value = "app.example.com, www.example.com";
-    route.elements.forward_host.value = "127.0.0.1";
-    route.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
-    await settle(ui.window);
-
-    const created = ui.calls.filter((record) => record.command === "integration")
-      .map((record) => JSON.parse(record.input)).find((request) => request.action === "create");
-    assert.equal(created.resource, "proxy-hosts");
-    assert.deepEqual(created.body.domain_names, ["app.example.com", "www.example.com"]);
-    assert.equal(created.body.forward_host, "127.0.0.1");
-    assert.equal(created.body.forward_port, 8100);
-    assert.equal(created.body.forward_scheme, "http");
-    assert.equal(created.body.allow_websocket_upgrade, true);
-  } finally { ui.dom.window.close(); }
-});
-
-test("App Manager includes Docker applications without a separate Docker Manager plugin", async () => {
-  const ui = await loadUi();
-  try {
+    }
+    assert.equal(ui.calls.some((record) => record.command === "deployment-logs"), false);
+    assert.ok(ui.calls.every((record) => ["overview", "list", "deployments", "settings"].includes(record.command)));
     ui.document.querySelector("[data-open-add]").click();
-    assert.ok(ui.document.querySelector('#appFramework option[value="docker"]'));
-    assert.deepEqual(ui.calls.find((record) => record.command === "list").values, []);
-    assert.equal(fs.existsSync(path.join(root, "cockpit/docker-manager")), false);
-    assert.equal(fs.existsSync(path.join(root, "cockpit/nginx-manager")), false);
+    assert.equal(ui.document.querySelector('#appFramework option[value="docker"]'), null);
+    assert.equal(ui.document.querySelector("#dockerSetupFields, #composeSetupFields"), null);
+    ui.document.querySelector("#appManagerDialog").close();
+    ui.document.querySelector('[data-action="edit"][data-id="portal"]').click();
+    assert.equal(ui.document.querySelector('select[name="framework"] option[value="docker"]'), null);
   } finally { ui.dom.window.close(); }
 });
 
-test("App Manager registers Dockerfile apps through the regular application flow", async () => {
-  let savedApps = [];
-  const ui = await loadUi({
-    list: () => ({ apps: savedApps }),
-    add: (record) => {
-      const payload = JSON.parse(record.values[0]);
-      savedApps = [{ ...payload, id: payload.slug, status: "stopped", deployments: [] }];
-      return { app: savedApps[0] };
-    },
-  });
+test("App Manager registers React projects with production output settings and no start command", async () => {
+  let attempts = 0;
+  const ui = await loadUi({ add: (record) => ++attempts === 1
+    ? { ok: false, error: "Temporary registration failure" }
+    : { app: { ...JSON.parse(record.values[0]), id: "react-shop" } } });
   try {
     ui.document.querySelector("[data-open-add]").click();
     const form = ui.document.querySelector(".am-dialog-form");
-    form.elements.repo_url.value = "https://github.com/example/docker-shop.git";
-    form.elements.name.value = "Docker Shop";
+    form.elements.repo_url.value = "https://github.com/example/react-shop.git";
+    form.elements.name.value = "React Shop";
     form.elements.name.dispatchEvent(new ui.window.Event("input"));
     ui.document.querySelector("#setupNext").click();
-    form.elements.framework.value = "docker";
+    form.elements.framework.value = "react";
     form.elements.framework.dispatchEvent(new ui.window.Event("change"));
-    form.elements.dockerfile.value = "deploy/Dockerfile";
-    form.elements.container_port.value = "8081";
-    form.elements.environment.value = 'DATABASE_URL="private-value"';
+    assert.equal(ui.document.querySelector("#reactSetupFields").hidden, false);
+    assert.equal(form.elements.start_command.disabled, true);
+    form.elements.app_directory.value = "frontend";
+    form.elements.output_directory.value = "public-site";
+    form.elements.environment.value = 'VITE_API_BASE="https://api.example"';
     form.elements.deploy_now.checked = false;
     ui.document.querySelector("#setupNext").click();
+    assert.match(ui.document.querySelector("#setupReview").textContent, /React/);
     form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
     await settle(ui.window);
+    assert.equal(form.elements.start_command.disabled, true);
+    assert.match(ui.document.querySelector(".am-dialog-error").textContent, /Temporary registration failure/);
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.equal(attempts, 2);
     const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
-    assert.equal(payload.framework, "docker");
-    assert.deepEqual(payload.build_config, { docker_mode: "dockerfile", dockerfile: "deploy/Dockerfile", container_port: 8081 });
-    const environmentSave = ui.calls.find((record) => record.command === "env-save");
-    assert.equal(environmentSave.input, 'DATABASE_URL="private-value"\n');
+    assert.equal(payload.framework, "react");
+    assert.deepEqual(payload.build_config, { app_directory: "frontend", output_directory: "public-site" });
+    assert.equal(ui.calls.find((record) => record.command === "env-save").input, 'VITE_API_BASE="https://api.example"\n');
     assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
   } finally { ui.dom.window.close(); }
 });
 
-test("App Manager accepts Docker Compose deployment settings", async () => {
-  let savedApps = [];
-  const ui = await loadUi({
-    list: () => ({ apps: savedApps }),
-    add: (record) => {
-      const payload = JSON.parse(record.values[0]);
-      savedApps = [{ ...payload, id: payload.slug, status: "running", port: 8100, deployments: [] }];
-      return { app: savedApps[0] };
-    },
-  });
+test("React and exported frontends display static content without runtime or NPM proxy controls", async () => {
+  const apps = [
+    { ...fixtureApps[0], id: "react", name: "React Shop", framework: "react", static_export: true, static_root: "frontend/dist" },
+    { ...fixtureApps[0], id: "export", static_export: true, static_root: "out" },
+    { ...fixtureApps[0], id: "server", framework: "node" },
+  ];
+  const ui = await loadUi({ list: { apps }, health: { healthy: true, url: null } });
   try {
-    ui.document.querySelector("[data-open-add]").click();
-    const form = ui.document.querySelector(".am-dialog-form");
-    form.elements.repo_url.value = "https://github.com/example/compose-shop.git";
-    form.elements.name.value = "Compose Shop";
-    form.elements.name.dispatchEvent(new ui.window.Event("input"));
-    ui.document.querySelector("#setupNext").click();
-    form.elements.framework.value = "docker";
-    form.elements.framework.dispatchEvent(new ui.window.Event("change"));
-    form.elements.docker_mode.value = "compose";
-    form.elements.docker_mode.dispatchEvent(new ui.window.Event("change"));
-    form.elements.compose_file.value = "deploy/compose.yaml";
-    form.elements.compose_service.value = "frontend";
-    form.elements.container_port.value = "8080";
-    form.elements.deploy_now.checked = false;
-    ui.document.querySelector("#setupNext").click();
-    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    for (const id of ["react", "export"]) {
+      const card = ui.document.querySelector(`[data-action="deploy"][data-id="${id}"]`).closest("article");
+      assert.match(card.textContent, /Static files: current\/app\//);
+      assert.equal(card.querySelector('[data-action="route"]'), null);
+      for (const action of ["start", "stop", "restart"]) assert.equal(card.querySelector(`[data-action="${action}"]`), null);
+    }
+    assert.equal(ui.document.querySelector('[data-action="route"][data-id="server"]'), null);
+    ui.document.querySelector('[data-action="health"][data-id="react"]').click();
     await settle(ui.window);
-    const payload = JSON.parse(ui.calls.find((record) => record.command === "add").values[0]);
-    assert.deepEqual(payload.build_config, {
-      docker_mode: "compose", compose_file: "deploy/compose.yaml",
-      compose_service: "frontend", container_port: 8080,
-    });
-    assert.equal(payload.framework, "docker");
-    assert.equal(payload.build_config.compose_service, "frontend");
-    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+    assert.match(ui.document.querySelector("#appManagerNotice").textContent, /Static release is available/);
+    ui.document.querySelector('[data-action="edit"][data-id="react"]').click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    assert.equal(form.elements.framework.value, "react");
+    assert.ok(form.querySelector('option[value="react"]'));
   } finally { ui.dom.window.close(); }
 });
 

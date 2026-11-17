@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import configparser
 import contextlib
-import hashlib
 import json
 import os
 import re
@@ -625,23 +624,27 @@ def _configure_next_public_route(project_dir: Path, group_id: Optional[int] = No
     _write_next_config(config_path, wrapper, group_id)
 
 
-def _validate_app_directory(repo_path: Path, configured: Any) -> Path:
+def _validate_app_directory(repo_path: Path, configured: Any, framework: str = "Next.js") -> Path:
     if not isinstance(configured, str) or not configured or "\\" in configured or "\0" in configured:
         raise ValueError("build_config.app_directory must be a non-empty relative POSIX path")
     parts = configured.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError("build_config.app_directory must not contain empty, '.' or '..' path components")
     directory = repo_path.joinpath(*parts)
+    try:
+        directory.resolve(strict=False).relative_to(repo_path.resolve(strict=True))
+    except ValueError as exc:
+        raise ValueError(f"Configured {framework} application directory escapes the repository") from exc
     current = repo_path
     for part in parts:
         current = current / part
         if current.is_symlink():
-            raise ValueError(f"Next.js application directory must not contain symlinks: {current}")
+            raise ValueError(f"{framework} application directory must not contain symlinks: {current}")
     if not directory.is_dir():
-        raise ValueError(f"Configured Next.js application directory does not exist: {directory}")
+        raise ValueError(f"Configured {framework} application directory does not exist: {directory}")
     package_path = directory / "package.json"
     if package_path.is_symlink() or not package_path.is_file():
-        raise ValueError(f"Configured Next.js application directory has no regular package.json: {package_path}")
+        raise ValueError(f"Configured {framework} application directory has no regular package.json: {package_path}")
     return directory
 
 
@@ -732,6 +735,10 @@ def _next_project_directories(repo_path: Path, build_config: Dict[str, Any]) -> 
         if package_path.is_symlink() or not package_path.is_file():
             raise FileNotFoundError(f"package.json not found for Next.js application in {app_dir}")
 
+    return app_dir, _js_workspace_root(app_dir, repo_path)
+
+
+def _js_workspace_root(app_dir: Path, repo_path: Path) -> Path:
     workspace_root = app_dir
     for ancestor in app_dir.parents:
         try:
@@ -741,7 +748,7 @@ def _next_project_directories(repo_path: Path, build_config: Dict[str, Any]) -> 
         if _is_npm_workspace(app_dir, ancestor):
             workspace_root = ancestor
             break
-    return app_dir, workspace_root
+    return workspace_root
 
 
 def _configured_start(app: Dict[str, Any], default: List[str]) -> List[str]:
@@ -771,425 +778,16 @@ class FrameworkAdapter(ABC):
         raise NotImplementedError
 
 
-DOCKER_COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
-
-
-def _validate_docker_relative_path(value: Any, field: str) -> None:
-    if (
-        not isinstance(value, str)
-        or not value
-        or "\\" in value
-        or "\0" in value
-        or any(part in {"", ".", ".."} for part in value.split("/"))
-    ):
-        raise ValueError(f"{field} must be a relative path without '.', '..', or empty components")
-
-
-def docker_deployment_mode(build_config: Dict[str, Any], repo_path: Optional[Path] = None) -> str:
-    mode = build_config.get("docker_mode")
-    if mode is not None:
-        if not isinstance(mode, str) or mode not in {"dockerfile", "compose"}:
-            raise ValueError("build_config.docker_mode must be 'dockerfile' or 'compose'")
-        return mode
-    if "dockerfile" in build_config:
-        return "dockerfile"
-    if "compose_file" in build_config:
-        return "compose"
-    if repo_path is not None and any((repo_path / filename).is_file() for filename in DOCKER_COMPOSE_FILES):
-        return "compose"
-    return "dockerfile"
-
-
-def validate_docker_build_config(build_config: Dict[str, Any], repo_path: Optional[Path] = None) -> None:
-    mode = docker_deployment_mode(build_config, repo_path)
-    if mode == "compose":
-        _validate_docker_relative_path(
-            build_config.get("compose_file", DOCKER_COMPOSE_FILES[0]),
-            "build_config.compose_file",
-        )
-        service = build_config.get("compose_service", "web")
-        if not isinstance(service, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", service):
-            raise ValueError("build_config.compose_service must be a lowercase Compose service name")
-    else:
-        _validate_docker_relative_path(
-            build_config.get("dockerfile", "Dockerfile"),
-            "build_config.dockerfile",
-        )
-    port = build_config.get("container_port", 3000)
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-        raise ValueError("build_config.container_port must be an integer from 1 to 65535")
-    app_directory = build_config.get("app_directory")
-    if app_directory is not None and (
-        not isinstance(app_directory, str)
-        or not app_directory
-        or "\\" in app_directory
-        or "\0" in app_directory
-        or any(part in {"", ".", ".."} for part in app_directory.split("/"))
-    ):
-        raise ValueError("build_config.app_directory must be a relative path without '.', '..', or empty components")
-    if "start_command" in build_config:
-        raise ValueError("Docker applications use their Dockerfile CMD/ENTRYPOINT or Compose command; start_command is not supported")
-
-
-def _validate_compose_config(
-    config: Any,
-    project_dir: Path,
-    web_service: str,
-    project_name: str,
-    allowed_env_files: Sequence[str] = (),
-    allowed_web_port: Optional[Dict[str, Any]] = None,
-    require_managed_security: bool = False,
-) -> Dict[str, Any]:
-    project_root = project_dir.resolve(strict=True)
-
-    def resolve_project_path(value: str, root: Path = project_root) -> Path:
-        candidate = Path(value)
-        if not candidate.is_absolute():
-            candidate = root / candidate
-        return candidate.resolve(strict=True)
-
-    if not isinstance(config, dict) or not isinstance(config.get("services"), dict) or not config["services"]:
-        raise ValueError("Compose configuration must define one or more services")
-    services = config["services"]
-    if web_service not in services:
-        raise ValueError(f"Compose service {web_service!r} was not found")
-    for service_name, service in services.items():
-        if not isinstance(service, dict):
-            raise ValueError(f"Compose service {service_name!r} must be an object")
-        ports = service.get("ports", [])
-        if ports:
-            managed_port = (
-                service_name == web_service
-                and len(ports) == 1
-                and isinstance(ports[0], dict)
-                and allowed_web_port is not None
-                and ports[0].get("host_ip") == "127.0.0.1"
-                and str(ports[0].get("published")) == str(allowed_web_port["published"])
-                and int(ports[0].get("target", 0)) == int(allowed_web_port["target"])
-                and ports[0].get("protocol", "tcp") == "tcp"
-                and ports[0].get("mode") in {None, "ingress"}
-            )
-            if not managed_port:
-                raise ValueError(f"Compose service {service_name!r} must not publish host ports; App Manager publishes only the selected service on loopback")
-        if service.get("container_name"):
-            raise ValueError(f"Compose service {service_name!r} must not set container_name")
-        if service.get("privileged") or service.get("devices") or service.get("device_cgroup_rules"):
-            raise ValueError(f"Compose service {service_name!r} requests privileged host capabilities")
-        if service.get("cap_add") and not (
-            require_managed_security
-            and service_name == web_service
-            and allowed_web_port is not None
-            and int(allowed_web_port["target"]) < 1024
-            and service.get("cap_add") == ["NET_BIND_SERVICE"]
-        ):
-            raise ValueError(f"Compose service {service_name!r} must not add container capabilities")
-        if service.get("security_opt") and not (
-            require_managed_security and "no-new-privileges:true" in service.get("security_opt", [])
-        ):
-            raise ValueError(f"Compose service {service_name!r} must not override container security options")
-        if require_managed_security and "ALL" not in service.get("cap_drop", []):
-            raise ValueError(f"Compose service {service_name!r} is missing the managed capability restrictions")
-        if any(service.get(key) == "host" for key in ("network_mode", "pid", "ipc", "uts", "userns_mode", "cgroup")):
-            raise ValueError(f"Compose service {service_name!r} must not use a host namespace")
-        if service.get("network_mode") or service.get("volumes_from"):
-            raise ValueError(f"Compose service {service_name!r} must not join an unmanaged network or container")
-        if service.get("profiles"):
-            raise ValueError(f"Compose service {service_name!r} must not require an opt-in profile")
-        for volume in service.get("volumes", []):
-            if not isinstance(volume, dict) or volume.get("type") == "bind":
-                raise ValueError(f"Compose service {service_name!r} must not mount host filesystem paths")
-            if volume.get("type") not in {"volume", "tmpfs"}:
-                raise ValueError(f"Compose service {service_name!r} uses an unsupported volume type")
-        build = service.get("build")
-        if build:
-            if not isinstance(build, dict):
-                raise ValueError(f"Compose build for service {service_name!r} must be an object")
-            if any(key in build for key in ("additional_contexts", "secrets", "ssh")):
-                raise ValueError(f"Compose build for service {service_name!r} requests external build access")
-            context = build.get("context")
-            if not isinstance(context, str):
-                raise ValueError(f"Compose build for service {service_name!r} has an invalid context")
-            context_path = resolve_project_path(context)
-            try:
-                context_path.relative_to(project_root)
-            except ValueError as exc:
-                raise ValueError(f"Compose build context for service {service_name!r} escapes the managed project") from exc
-            dockerfile = build.get("dockerfile")
-            if dockerfile:
-                dockerfile_path = resolve_project_path(dockerfile, context_path)
-                try:
-                    dockerfile_path.relative_to(context_path)
-                except ValueError as exc:
-                    raise ValueError(f"Compose Dockerfile for service {service_name!r} escapes its build context") from exc
-        env_files = service.get("env_file", [])
-        if isinstance(env_files, (str, dict)):
-            env_files = [env_files]
-        for env_file in env_files:
-            path = env_file.get("path") if isinstance(env_file, dict) else env_file
-            if not isinstance(path, str):
-                raise ValueError(f"Compose env_file for service {service_name!r} is invalid")
-            env_path = resolve_project_path(path)
-            if str(env_path) in allowed_env_files:
-                continue
-            try:
-                env_path.relative_to(project_root)
-            except ValueError as exc:
-                raise ValueError(f"Compose env_file for service {service_name!r} escapes the managed project") from exc
-    for section in ("volumes", "networks", "configs", "secrets"):
-        entries = config.get(section, {})
-        if not isinstance(entries, dict):
-            raise ValueError(f"Compose {section} must be an object")
-        for name, entry in entries.items():
-            if not isinstance(entry, dict):
-                raise ValueError(f"Compose {section[:-1]} {name!r} must be an object")
-            configured_name = entry.get("name")
-            if entry.get("external") or (
-                configured_name
-                and (
-                    not isinstance(configured_name, str)
-                    or not configured_name.startswith(project_name + "_")
-                )
-            ):
-                raise ValueError(f"Compose {section[:-1]} {name!r} must remain scoped to this application")
-            if section == "volumes" and (entry.get("driver") or entry.get("driver_opts")):
-                raise ValueError(f"Compose volume {name!r} must use Docker's app-scoped local volume storage")
-            if section == "networks" and (
-                (entry.get("driver") is not None and entry.get("driver") != "bridge") or entry.get("driver_opts")
-            ):
-                raise ValueError(f"Compose network {name!r} must use the app-scoped bridge network")
-            file_path = entry.get("file")
-            if file_path:
-                if not isinstance(file_path, str):
-                    raise ValueError(f"Compose {section[:-1]} {name!r} has an invalid file path")
-                resolved_file = resolve_project_path(file_path)
-                try:
-                    resolved_file.relative_to(project_root)
-                except ValueError as exc:
-                    raise ValueError(f"Compose {section[:-1]} {name!r} file escapes the managed project") from exc
-    return services
-
-
-class DockerAdapter(FrameworkAdapter):
-    name = "docker"
-
-    @staticmethod
-    def detect(repo_path: Path) -> bool:
-        return (repo_path / "Dockerfile").is_file() or any(
-            (repo_path / filename).is_file() for filename in DOCKER_COMPOSE_FILES
-        )
-
-    def build(
-        self,
-        app: Dict[str, Any],
-        repo_path: Path,
-        release_dir: Path,
-        *,
-        runner: Optional[CommandRunner] = None,
-        timeout: int = 900,
-        group_id: Optional[int] = None,
-        log: Optional[Callable[[str], None]] = None,
-    ) -> Dict[str, Any]:
-        build_config = app.get("build_config", {})
-        if not isinstance(build_config, dict):
-            raise ValueError("build_config must be a JSON object")
-        validate_docker_build_config(build_config, repo_path)
-        app_dir = _copy_source(repo_path, release_dir, group_id, app.get("route"))
-        context_dir = app_dir
-        configured_directory = build_config.get("app_directory")
-        if configured_directory:
-            current = app_dir
-            for part in configured_directory.split("/"):
-                current = current / part
-                if current.is_symlink():
-                    raise ValueError(f"Docker build context must not contain symlinks: {current}")
-            if not current.is_dir():
-                raise ValueError(f"Docker build context directory does not exist: {configured_directory}")
-            context_dir = current
-        if docker_deployment_mode(build_config, repo_path) == "compose":
-            compose_file_name = build_config.get("compose_file")
-            if compose_file_name is None:
-                compose_file_name = next(
-                    (filename for filename in DOCKER_COMPOSE_FILES if (context_dir / filename).is_file()),
-                    DOCKER_COMPOSE_FILES[0],
-                )
-            compose_file = context_dir / compose_file_name
-            current = context_dir
-            for part in compose_file_name.split("/"):
-                current = current / part
-                if current.is_symlink():
-                    raise ValueError(f"Compose file path must not contain symlinks: {current}")
-            if not compose_file.is_file():
-                raise FileNotFoundError(f"Compose file not found: {compose_file}")
-            service_name = build_config.get("compose_service", "web")
-            project = f"cockpit-app-manager-{app['id']}"
-            route = app.get("route", "/").rstrip("/")
-            port = build_config.get("container_port", 3000)
-            tag = app["docker_tag"]
-            compose_prefix = [
-                "docker", "compose", "--project-name", project,
-                "--project-directory", str(context_dir),
-                "--env-file", app["docker_environment_file"],
-                "-f", str(compose_file),
-            ]
-            config_command = [*compose_prefix, "config", "--format", "json"]
-            config_result = _run_build(
-                runner, config_command, context_dir, timeout, "Validating Docker Compose project",
-                preserve_stdout=True,
-            )
-            try:
-                compose_config = json.loads(config_result.stdout or "")
-            except (json.JSONDecodeError, TypeError) as exc:
-                raise RuntimeError(f"Docker Compose returned invalid normalized configuration: {exc}") from exc
-            services = _validate_compose_config(compose_config, context_dir, service_name, project)
-            managed_images = {}
-            for name, service in services.items():
-                if service.get("build"):
-                    image_service = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
-                    if not image_service:
-                        raise ValueError(f"Compose service name {name!r} cannot be used for a managed image tag")
-                    image_service += "-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
-                    managed_images[name] = f"cockpit-app-manager-{app['id']}-{image_service}:{tag}"
-            limits = app.get("resource_limits", {})
-            override_services = {
-                name: {
-                    "image": image,
-                    "cap_drop": ["ALL"],
-                    "security_opt": ["no-new-privileges:true"],
-                }
-                for name, image in managed_images.items()
-            }
-            for name in services:
-                override_services.setdefault(name, {}).update({
-                    "cap_drop": ["ALL"],
-                    "security_opt": ["no-new-privileges:true"],
-                })
-            override_services.setdefault(service_name, {}).update({
-                "ports": [{
-                    "target": port,
-                    "published": str(app["port"]),
-                    "protocol": "tcp",
-                    "host_ip": "127.0.0.1",
-                }],
-                "env_file": [app["docker_environment_file"]],
-                "environment": {
-                    "PORT": str(port),
-                    "HOST": "0.0.0.0",
-                    "APP_BASE_PATH": route,
-                },
-                "pids_limit": limits.get("tasks_max", 256),
-                "deploy": {
-                    "resources": {
-                        "limits": {
-                            "memory": f"{limits.get('memory_mb', 1024)}M",
-                            "cpus": str(limits.get("cpu_percent", 100) / 100),
-                            "pids": limits.get("tasks_max", 256),
-                        }
-                    }
-                },
-            })
-            if port < 1024:
-                override_services[service_name]["cap_add"] = ["NET_BIND_SERVICE"]
-            override_file = release_dir / ".app-manager-compose.override.json"
-            descriptor, temporary_name = tempfile.mkstemp(prefix=".compose-override.", dir=str(release_dir))
-            temporary_file = Path(temporary_name)
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(json.dumps({"services": override_services}, indent=2) + "\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(str(temporary_file), str(override_file))
-            except Exception:
-                with contextlib.suppress(FileNotFoundError):
-                    temporary_file.unlink()
-                raise
-            compose_files = [*compose_prefix, "-f", str(override_file)]
-            normalized_command = [*compose_files, "config", "--format", "json"]
-            normalized_result = _run_build(
-                runner, normalized_command, context_dir, timeout, "Validating managed Docker Compose configuration",
-                preserve_stdout=True,
-            )
-            try:
-                normalized = json.loads(normalized_result.stdout or "")
-            except (json.JSONDecodeError, TypeError) as exc:
-                raise RuntimeError(f"Docker Compose returned invalid managed configuration: {exc}") from exc
-            _validate_compose_config(
-                normalized, context_dir, service_name, project,
-                allowed_env_files=[str(Path(app["docker_environment_file"]).resolve(strict=True))],
-                allowed_web_port={"target": port, "published": app["port"]},
-                require_managed_security=True,
-            )
-            build_command = [*compose_files, "build", "--pull"]
-            if log is not None:
-                log(f"Building Docker Compose project {project}")
-            _run_build(runner, build_command, context_dir, timeout, "Building Docker Compose project")
-            start = [*compose_files, "up", "--no-build", "--remove-orphans"]
-            stop = [*compose_files, "down", "--timeout", "10", "--remove-orphans"]
-            return {
-                "status": "success",
-                "release_dir": str(release_dir),
-                "working_directory": str(context_dir),
-                "start_command": start,
-                "stop_command": stop,
-                "compose_project": project,
-                "images": list(managed_images.values()),
-                "container_port": port,
-            }
-        dockerfile = context_dir / build_config.get("dockerfile", "Dockerfile")
-        current = context_dir
-        for part in build_config.get("dockerfile", "Dockerfile").split("/"):
-            current = current / part
-            if current.is_symlink():
-                raise ValueError(f"Dockerfile path must not contain symlinks: {current}")
-        if not dockerfile.is_file():
-            raise FileNotFoundError(f"Dockerfile not found: {dockerfile}")
-        image = f"cockpit-app-manager-{app['id']}:{app['docker_tag']}"
-        build_limits = app.get("resource_limits", {})
-        route = app.get("route", "/").rstrip("/")
-        container_port = build_config.get("container_port", 3000)
-        command = [
-            "docker", "build", "--pull", "--tag", image,
-            "--memory", f"{build_limits.get('build_memory_mb', 2048)}m",
-            "--cpu-period", "100000",
-            "--cpu-quota", str(build_limits.get("build_cpu_percent", 100) * 1000),
-            "--build-arg", f"APP_BASE_PATH={route}",
-            "--build-arg", f"PORT={container_port}",
-            "--file", str(dockerfile), str(context_dir),
-        ]
-        if log is not None:
-            log(f"Building Docker image {image} from {dockerfile}")
-        _run_build(runner, command, context_dir, timeout, "Building Docker image")
-        container_name = f"cockpit-app-manager-{app['id']}-{app.get('service_slot', 'primary')}"
-        limits = app.get("resource_limits", {})
-        low_port_capability = ["--cap-add=NET_BIND_SERVICE"] if container_port < 1024 else []
-        start = [
-            "docker", "run", "--rm", "--name", container_name,
-            "--publish", f"127.0.0.1:{app['port']}:{container_port}",
-            "--env-file", app["docker_environment_file"],
-            "--env", f"PORT={container_port}",
-            "--env", "HOST=0.0.0.0",
-            "--env", f"APP_BASE_PATH={route}",
-            "--cap-drop=ALL",
-            *low_port_capability,
-            "--security-opt=no-new-privileges",
-            "--pids-limit", str(limits.get("tasks_max", 256)),
-            "--memory", f"{limits.get('memory_mb', 1024)}m",
-            "--cpus", str(limits.get("cpu_percent", 100) / 100),
-            image,
-        ]
-        return {
-            "status": "success",
-            "release_dir": str(release_dir),
-            "start_command": start,
-            "image": image,
-            "container_port": container_port,
-        }
-
-
 class NextJSAdapter(FrameworkAdapter):
     name = "nextjs"
 
     @staticmethod
     def detect(repo_path: Path, build_config: Optional[Dict[str, Any]] = None) -> bool:
+        configured = (build_config or {}).get("app_directory")
+        if configured is not None:
+            project = _validate_app_directory(repo_path, configured, "JavaScript")
+            if not _package_has_next(project / "package.json") and not _next_config_present(project):
+                return False
         try:
             _next_project_directories(repo_path, build_config or {})
         except FileNotFoundError:
@@ -1306,26 +904,7 @@ class NextJSAdapter(FrameworkAdapter):
         )
         if static_export:
             export_dir = project_dir / "out"
-            if export_dir.is_symlink() or not export_dir.is_dir():
-                raise RuntimeError(f"Next.js static export did not create an output directory: {export_dir}")
-            try:
-                export_root = export_dir.resolve(strict=True)
-                export_root.relative_to(app_dir.resolve(strict=True))
-            except ValueError as exc:
-                raise RuntimeError("Next.js static export output escapes the isolated release copy") from exc
-            for current, directories, filenames in os.walk(export_dir, followlinks=False):
-                for name in directories + filenames:
-                    path = Path(current) / name
-                    if path.is_symlink():
-                        try:
-                            path.resolve(strict=False).relative_to(export_root)
-                        except ValueError as exc:
-                            raise RuntimeError(
-                                f"Next.js static export symlink escapes its output directory: {path}"
-                            ) from exc
-            index_path = export_dir / "index.html"
-            if index_path.is_symlink() or not index_path.is_file():
-                raise RuntimeError(f"Next.js static export is missing a regular index.html: {index_path}")
+            _validate_static_output(export_dir, app_dir, "Next.js static export")
             return {
                 "status": "success",
                 "release_dir": str(release_dir),
@@ -1475,6 +1054,125 @@ class NodeAdapter(FrameworkAdapter):
         _install_js_production_dependencies(manager, app_dir, runner, timeout, "Node.js", log=log)
         start = _configured_start(app, [manager, "run", "start"])
         return {"status": "success", "release_dir": str(release_dir), "start_command": start}
+
+
+def validate_react_build_config(build_config: Dict[str, Any]) -> None:
+    if "start_command" in build_config:
+        raise ValueError("React deploys static files without a start command; select Node.js or Next.js for server-rendered apps")
+    output = build_config.get("output_directory")
+    if "output_directory" in build_config and (
+        not isinstance(output, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*", output)
+    ):
+        raise ValueError("build_config.output_directory must be a relative directory without traversal")
+
+
+def _react_project_settings(repo_path: Path, build_config: Dict[str, Any]) -> tuple[Path, Dict[str, Any], str]:
+    validate_react_build_config(build_config)
+    configured = build_config.get("app_directory")
+    project = _validate_app_directory(repo_path, configured, "React") if configured is not None else repo_path
+    package = json.loads(_readable_regular_file(project / "package.json", "React package.json").decode("utf-8"))
+    if not isinstance(package, dict) or not isinstance(package.get("scripts", {}), dict):
+        raise ValueError("React package.json must be an object with a scripts object")
+    dependencies = {}
+    for field in ("dependencies", "devDependencies"):
+        if not isinstance(package.get(field, {}), dict):
+            raise ValueError(f"React package.json {field} must be an object")
+        dependencies.update(package.get(field, {}))
+    if "react" not in dependencies or "next" in dependencies:
+        raise ValueError("React deployment requires a React frontend; select Next.js for Next.js projects")
+    script = package.get("scripts", {}).get("build")
+    if not isinstance(script, str) or not script.strip():
+        raise ValueError("React package.json must define a build script")
+    if "vite" in dependencies and re.search(r"(?:^|&&\s*)vite\s+build(?:\s+[^;&|<>]*)?$", script.strip()):
+        return project, package, "vite"
+    if "react-scripts" in dependencies and script.strip() == "react-scripts build":
+        return project, package, "react-scripts"
+    raise ValueError("React requires a standard vite build (optionally after tsc &&) or react-scripts build script")
+
+
+def _validate_static_output(output: Path, app_dir: Path, description: str) -> None:
+    if output.is_symlink() or not output.is_dir():
+        raise RuntimeError(f"{description} did not create an output directory: {output}")
+    try:
+        root = output.resolve(strict=True)
+        root.relative_to(app_dir.resolve(strict=True))
+    except ValueError as exc:
+        raise RuntimeError(f"{description} output escapes the isolated release copy") from exc
+    for current, directories, filenames in os.walk(output, followlinks=False):
+        for name in directories + filenames:
+            path = Path(current) / name
+            if path.is_symlink():
+                try:
+                    path.resolve(strict=False).relative_to(root)
+                except ValueError as exc:
+                    raise RuntimeError(f"{description} symlink escapes its output directory: {path}") from exc
+    index = output / "index.html"
+    if index.is_symlink() or not index.is_file():
+        raise RuntimeError(f"{description} is missing a regular index.html: {index}")
+
+
+class ReactAdapter(FrameworkAdapter):
+    name = "react"
+
+    @staticmethod
+    def detect(repo_path: Path, build_config: Optional[Dict[str, Any]] = None) -> bool:
+        if (build_config or {}).get("start_command"):
+            return False
+        configured = (build_config or {}).get("app_directory")
+        project = _validate_app_directory(repo_path, configured, "React") if configured is not None else repo_path
+        path = project / "package.json"
+        if not path.is_file():
+            return False
+        package = json.loads(_readable_regular_file(path, "React package.json").decode("utf-8"))
+        if not isinstance(package, dict):
+            raise ValueError("React package.json must be an object")
+        dependencies = {}
+        for field in ("dependencies", "devDependencies"):
+            if not isinstance(package.get(field, {}), dict):
+                raise ValueError(f"React package.json {field} must be an object")
+            dependencies.update(package.get(field, {}))
+        scripts = package.get("scripts", {})
+        if not isinstance(scripts, dict):
+            raise ValueError("React package.json scripts must be an object")
+        start = scripts.get("start")
+        if start and (
+            not isinstance(start, str)
+            or not re.fullmatch(r"(?:vite(?:\s+(?:dev|serve))?(?:\s+--[^;&|<>]*)?|react-scripts\s+start)", start.strip())
+        ):
+            return False
+        return "react" in dependencies and "next" not in dependencies and bool({"vite", "react-scripts"} & dependencies.keys())
+
+    def build(self, app: Dict[str, Any], repo_path: Path, release_dir: Path, *,
+              runner: Optional[CommandRunner] = None, timeout: int = 900,
+              group_id: Optional[int] = None, log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+        build_config = app.get("build_config", {})
+        source_project, _, tool = _react_project_settings(repo_path, build_config)
+        source_package_root = _js_workspace_root(source_project, repo_path)
+        app_dir = _copy_source(repo_path, release_dir, group_id)
+        project = app_dir / source_project.relative_to(repo_path)
+        package_root = app_dir / source_package_root.relative_to(repo_path)
+        output = project / build_config.get("output_directory", "dist" if tool == "vite" else "build")
+        if output.exists() or output.is_symlink():
+            raise ValueError("React output directory already exists before build; remove checked-in build artifacts or choose another output_directory")
+        manager, lockfile = _detect_js_package_manager(package_root)
+        if app.get("_managed_pnpm"):
+            lockfile = _convert_to_pnpm(package_root, manager, lockfile, runner, timeout, log, group_id)
+            manager = "pnpm"
+        _install_js_dependencies(manager, lockfile, project, runner, timeout, "React", package_root, log)
+        command = _js_build_command(manager)
+        if tool == "vite":
+            command.extend((["--"] if manager == "npm" else []) + [
+                "--base", app.get("route") or "/", "--outDir", output.relative_to(project).as_posix(),
+            ])
+        _run_build(runner, command, project, timeout, "Building React application")
+        _validate_static_output(output, app_dir, "React production build")
+        if app.get("route"):
+            _prefix_static_html_assets(output, app["route"])
+        return {
+            "status": "success", "release_dir": str(release_dir), "start_command": [],
+            "runtime_required": False, "static_root": output.relative_to(app_dir).as_posix(),
+        }
 
 
 def python_interpreter(build_config: Dict[str, Any]) -> str:
@@ -1689,12 +1387,11 @@ class StaticAdapter(FrameworkAdapter):
 
 
 def detect_framework(repo_path: Path, build_config: Optional[Dict[str, Any]] = None) -> str:
-    if DockerAdapter.detect(repo_path):
-        return DockerAdapter.name
     if NextJSAdapter.detect(repo_path, build_config):
         return NextJSAdapter.name
-    for adapter_cls in (GoAdapter, PythonAdapter, NodeAdapter, StaticAdapter):
-        if adapter_cls.detect(repo_path):
+    for adapter_cls in (GoAdapter, PythonAdapter, ReactAdapter, NodeAdapter, StaticAdapter):
+        detected = adapter_cls.detect(repo_path, build_config) if adapter_cls is ReactAdapter else adapter_cls.detect(repo_path)
+        if detected:
             return adapter_cls.name
     raise ValueError("Could not detect a supported framework in the Git repository")
 
@@ -1707,50 +1404,14 @@ def inspect_project(repo_path: Path, framework: str, build_config: Dict[str, Any
     explicit_start = bool(build_config.get("start_command"))
     try:
         _validate_copy_symlinks(repo_path)
-        if framework == "docker":
-            validate_docker_build_config(build_config, repo_path)
-            context_dir = repo_path / build_config["app_directory"] if build_config.get("app_directory") else repo_path
-            current = repo_path
-            for part in build_config["app_directory"].split("/") if build_config.get("app_directory") else []:
-                current = current / part
-                if current.is_symlink():
-                    raise ValueError(f"Docker build context must not contain symlinks: {current}")
-            if not context_dir.is_dir():
-                errors.append(f"Docker build context directory does not exist: {context_dir}")
-            elif docker_deployment_mode(build_config, repo_path) == "compose":
-                compose_file = build_config.get("compose_file")
-                if compose_file is None:
-                    compose_file = next(
-                        (filename for filename in DOCKER_COMPOSE_FILES if (context_dir / filename).is_file()),
-                        DOCKER_COMPOSE_FILES[0],
-                    )
-                current = context_dir
-                for part in compose_file.split("/"):
-                    current = current / part
-                    if current.is_symlink():
-                        raise ValueError(f"Compose file path must not contain symlinks: {current}")
-                if not (context_dir / compose_file).is_file():
-                    errors.append(f"Compose file not found: {context_dir / compose_file}")
-                warnings.append(
-                    "Compose starts all project services but publishes only the selected service on loopback; "
-                    "host ports, host filesystem mounts, external volumes and host namespaces are rejected"
-                )
-                warnings.append("Compose builds execute through the host Docker daemon; deploy only trusted repositories")
-            else:
-                dockerfile = build_config.get("dockerfile", "Dockerfile")
-                current = context_dir
-                for part in dockerfile.split("/"):
-                    current = current / part
-                    if current.is_symlink():
-                        raise ValueError(f"Dockerfile path must not contain symlinks: {current}")
-                if not (context_dir / dockerfile).is_file():
-                    errors.append(f"Dockerfile not found: {context_dir / dockerfile}")
-                warnings.append("Docker builds execute through the host Docker daemon; deploy only trusted repositories")
-            tools["docker"] = None
-        elif framework in {"node", "nextjs"}:
+        if framework in {"node", "nextjs", "react"}:
             package_root = repo_path
             if framework == "nextjs":
                 project, package_root = _next_project_directories(repo_path, build_config)
+            elif framework == "react":
+                project, _, _ = _react_project_settings(repo_path, build_config)
+                package_root = _js_workspace_root(project, repo_path)
+                warnings.append("React builds static files without a runtime; configure static serving and SPA fallback separately")
             package = json.loads(_readable_regular_file(project / "package.json", "package.json").decode("utf-8"))
             if not isinstance(package, dict) or not isinstance(package.get("scripts", {}), dict):
                 raise ValueError("package.json must contain a scripts object")
@@ -1775,6 +1436,11 @@ def inspect_project(repo_path: Path, framework: str, build_config: Dict[str, Any
                 if next_version and int(next_version.group(0)) >= 16:
                     tools["node"] = "20.9.0"
                 warnings.append("Existing Next.js basePath, trailingSlash and output settings are verified by Next.js before the build")
+            if framework == "react":
+                vite_version = re.search(r"[0-9]+", str(dependencies.get("vite", "")))
+                if vite_version and int(vite_version.group(0)) >= 7:
+                    tools["node"] = "20.19.0"
+                warnings.append("React public environment variables are compiled into the browser bundle; redeploy after changes")
             if not isinstance(package.get("engines", {}), dict):
                 errors.append("package.json engines must be an object")
             elif package.get("engines", {}).get("node"):
@@ -1825,8 +1491,8 @@ def inspect_project(repo_path: Path, framework: str, build_config: Dict[str, Any
 
 def get_adapter(name: str) -> FrameworkAdapter:
     registry = {
-        "docker": DockerAdapter,
         "nextjs": NextJSAdapter,
+        "react": ReactAdapter,
         "go": GoAdapter,
         "node": NodeAdapter,
         "python": PythonAdapter,

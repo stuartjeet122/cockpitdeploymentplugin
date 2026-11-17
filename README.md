@@ -1,6 +1,6 @@
 # Cockpit App Manager
 
-App Manager is the repository's Cockpit plugin for building and deploying web applications, including Dockerfile and Docker Compose projects. Its Infrastructure workspace also connects to separately installed Portainer and Nginx Proxy Manager (NPM) instances through their REST APIs. It does not install or upgrade either service.
+App Manager is the repository's Cockpit plugin for building and deploying native Next.js, React, Go, Node.js, Python, and static web applications. Separate Portainer and Nginx Proxy Manager (NPM) tabs open those external services using addresses configured in Settings. App Manager does not manage Docker or Nginx, or install or upgrade either service.
 
 The native Cockpit interface opens on Applications, with search, status filters, and a guided repository, configuration, and review flow. Environment variables can be saved before the first deployment; saved values are masked until explicitly revealed. App-scoped service controls, local health checks, logs, and deployment settings remain available without leaving Cockpit. Only the current release and latest deployment record are kept. Deployments run independently of the browser session, so the live log can be reopened after a refresh; an active deployment can be aborted from the log dialog.
 
@@ -68,7 +68,7 @@ validation still fails, repair and validate that application's lockfile in its
 source repository, not under `/opt/webapps/.../releases`. Do not replace frozen
 installs with a silent non-frozen fallback or delete the running release.
 
-The installer requires Ubuntu, root privileges, Python 3.9 or newer, systemd, Cockpit 318 or newer, Git with SSH signing support, `ssh-keygen`, `logrotate`, `runuser` and `setpriv` from `util-linux`, and `ss` from `iproute2`. Install the runtime and package manager needed by each application separately, including `python3-venv` for Python apps. Docker Engine and Compose are needed only for Docker deployments; provision them through your normal host administration or Cockpit Docker plugin. Preflight rejects missing App Manager host tools before installation. It checks backend imports both before and after installation and installs only App Manager under `/usr/share/cockpit/app-manager`. The backend and adapter module live under the dedicated root-owned, readable/traversable `/usr/libexec/cockpit/app-manager` directory, with state under `/var/lib/cockpit/app-manager`. Cockpit plugin/code directories are normalized to mode `0755`, and installed code/assets are readable by Cockpit; sensitive state remains root-only rather than being made globally writable. No CDN or Node.js runtime is needed by the plugin UI. It does not recursively change ownership of shared Cockpit directories or `/opt/webapps`, and it preserves existing registry/configuration data on repeat installation.
+The installer requires Ubuntu, root privileges, Python 3.9 or newer, systemd, Cockpit 318 or newer, Git with SSH signing support, `ssh-keygen`, `logrotate`, `runuser` and `setpriv` from `util-linux`, and `ss` from `iproute2`. Install the runtime and package manager needed by each application separately, including `python3-venv` for Python apps. Preflight rejects missing App Manager host tools before installation. It checks backend imports both before and after installation and installs only App Manager under `/usr/share/cockpit/app-manager`. The backend and adapter module live under the dedicated root-owned, readable/traversable `/usr/libexec/cockpit/app-manager` directory, with state under `/var/lib/cockpit/app-manager`. Cockpit plugin/code directories are normalized to mode `0755`, and installed code/assets are readable by Cockpit; sensitive state remains root-only rather than being made globally writable. No CDN or Node.js runtime is needed by the plugin UI. It does not recursively change ownership of shared Cockpit directories or `/opt/webapps`, and it preserves existing registry/configuration data on repeat installation.
 
 Application Git and build commands switch directly to the dedicated app UID and group using `setpriv`, without opening an interactive PAM session. The root timer helper retains `CAP_SETUID` through `AmbientCapabilities` because systemd 259's seccomp setup can otherwise remove it despite the bounding set. Before executing app commands, `setpriv` clears supplementary groups and inheritable/ambient capabilities; changing to the app UID drops permitted/effective capabilities. `no_new_privs` prevents privilege escalation, and the timer's systemd sandbox remains in effect. There is no root fallback if switching identity fails. After updating the plugin, existing automatic-deployment warnings clear on the next successful repository check; a previous failure's retry backoff can delay that check by up to one hour.
 
@@ -76,99 +76,68 @@ The UI requests Cockpit's required superuser mode when launching the backend. Th
 
 The backend stores its registry at `/var/lib/cockpit/app-manager/apps.json` and configuration at `/var/lib/cockpit/app-manager/config.json`. Registry/configuration JSON is atomically replaced and protected by file locks. App environment files are stored outside source and release trees at `/var/lib/cockpit/app-manager/environment/<app-id>.env`, owned by root and readable only by that application's service group. The UI lets you enter values during setup or import `.env`, `.env.*`, and `.txt` files with one assignment per line; the review shows names only. Values are applied by systemd when the application starts; restart or redeploy after editing.
 
-Each application has an application path prefix, such as `/shop/`, or `/` for a root-based virtual host. App Manager uses this value for build-time asset handling and the `APP_BASE_PATH` environment variable; deployment does not create domains or edit/reload Nginx configuration. Configure routing separately in the Infrastructure workspace through NPM, proxying dynamic apps to their displayed `127.0.0.1:<port>` address. Existing host and legacy App Manager Nginx configuration is left untouched by deployment, application removal, installation, and default uninstall.
+Each application has an application path prefix, such as `/shop/`, or `/` for a root-based virtual host. App Manager uses this value for build-time asset handling and the `APP_BASE_PATH` environment variable; deployment does not create domains or edit/reload Nginx configuration. Configure routing separately in NPM's own interface, proxying dynamic apps to their displayed `127.0.0.1:<port>` address. Existing host and legacy App Manager Nginx configuration is left untouched by deployment, application removal, installation, and default uninstall.
 
 Removing an application permanently deletes that application's managed source, releases, storage, logs, environment secrets, dedicated account, and service files. If a virtual host points to the app, remove or update that route separately in NPM before deleting the app. Export any data you need before confirming removal.
 
 ## First deployment
 
 1. Open **App Manager** in Cockpit and select **New application**. Supply the HTTPS or SSH repository URL, application name, and production branch. Configure private-repository access for the dedicated application account on the host; never embed credentials in a repository URL.
-2. Select the framework or automatic detection, a unique application ID, and an application path prefix such as `/shop/` or `/`. Set a health path that returns 2xx without authentication or redirects. Add the environment variables needed during build and runtime. App Manager accepts a relative Next.js app directory, Dockerfile/Compose settings, and explicit non-Docker start commands as JSON argument arrays.
+2. Select the framework or automatic detection, a unique application ID, and an application path prefix such as `/shop/` or `/`. Set a health path that returns 2xx without authentication or redirects for dynamic apps. Add the environment variables needed during build and runtime. App Manager accepts a relative Next.js/React app directory and explicit dynamic start commands as JSON argument arrays.
 3. Review the application path, source, and environment variable names. Leave **Deploy now** enabled to save and deploy, or disable it to register without starting a deployment. Follow the deployment log; errors leave the last working release active when recovery succeeds.
-4. Configure domains and routing separately in the Infrastructure workspace via NPM. Environment edits require a restart or redeployment to affect a running process. The deployment log can be copied or downloaded as a `.txt` file from its dialog. Local health checks use the configured path and do not test external reachability.
+4. Configure domains and routing separately in NPM, opened through the Nginx Proxy Manager tab. Environment edits require a restart or redeployment to affect a running process. The deployment log can be copied or downloaded as a `.txt` file from its dialog. Local health checks use the configured path and do not test external reachability.
 
-## Docker deployments
+## React deployments
 
-Select **Docker** in App Manager's framework selector to deploy a Dockerfile or Compose project. Dockerfile deployments accept a relative Dockerfile path and build directory. Compose deployments accept a relative Compose file, the web service name, and its internal listening port. Compose builds all project services and starts them under an app-scoped project name; only the selected web service is published on `127.0.0.1:<managed-port>`. Other services remain private on the Compose network. App Manager supplies `PORT`, `HOST=0.0.0.0`, `APP_BASE_PATH`, and saved environment values to the selected web service. Saved values are also available for Compose `${VARIABLE}` interpolation; only variables explicitly referenced by a service are passed to it. Do not reference secrets from Compose build arguments. App Manager resource limits apply to the selected service; configure limits for companion services in the Compose file. Compose named volumes persist across restarts and deployments and are deleted when the application is removed. Compose updates restart the project in place rather than using the Dockerfile deployment's parallel candidate, so a short interruption is possible.
+Select **React (Vite / Create React App)** in **New application**, or use **Auto detect** for a frontend declaring `react` and either `vite` or `react-scripts`. Next.js, Go, and Python detection take priority. An explicit start command or a nonstandard/production `start` script retains Node.js detection rather than silently dropping its server. For a nested React project, set **Project directory**, such as `frontend`; npm-style workspaces reuse their root package manager and lockfile.
 
-For host safety, Compose services may not publish their own host ports, mount host filesystem paths, use external volumes or networks, use host namespaces, or request privileged capabilities. App Manager drops all container capabilities and enables `no-new-privileges`; it grants only `NET_BIND_SERVICE` when the selected service listens on a privileged container port. App Manager manages the selected service's loopback port mapping; the Compose project can use internal service-to-service networking and app-scoped named volumes. Use Dockerfile `CMD`/`ENTRYPOINT` or Compose `command`; `start_command` is not used for Docker deployments.
+The project must define a production `build` script: `vite build`, `tsc -b && vite build`, a Vite build with additional arguments, or `react-scripts build`. App Manager uses the same unprivileged, isolated release build and managed pnpm/cache workflow as other JavaScript apps. It does not run `npm start`, `vite dev`, or a development server. Custom/server-rendered React startup belongs under **Node.js** or **Next.js**, not this static frontend option.
 
-Use the **Infrastructure** workspace for Portainer-backed container, stack, image, volume, and network visibility, plus common container lifecycle controls. App Manager does not install, update, or manage Docker Engine. Docker Engine's privileged daemon performs image builds and Compose project operations, so Dockerfiles and Compose projects are trusted code with host-daemon-level risk. Deploy only repositories you trust; do not put credentials in Docker build arguments or copy secrets into images.
+pnpm's existing dependency-script approval policy is unchanged. If installation reports an unapproved dependency such as `esbuild`, review it and declare the approved package in `pnpm.onlyBuiltDependencies` in the source `package.json` or the supported workspace policy, then redeploy.
 
-## Portainer and Nginx Proxy Manager APIs
+Vite receives `--base` from the application path and an explicit `--outDir`; Create React App receives managed `PUBLIC_URL` and `BUILD_PATH` environment values. These override saved values for React builds. Output defaults to `dist` for Vite or `build` for Create React App. Set **React output directory** (or `build_config.output_directory` in Edit configuration) to use another relative output directory. Generated output must not already be checked into the source at that path. Deployment requires a fresh regular `index.html` and rejects symlinks escaping the output directory.
 
-Older releases installed separate **Docker Manager** and **Nginx Manager** Cockpit entries. These pages call retired commands such as `nginx-overview` and are no longer supported. Re-run the installer from the updated checkout (or complete **Check for updates**), then sign out of Cockpit and sign back in to refresh its navigation and cached pages. The installer removes only verified legacy UI assets, preserving unrelated files, application data, Docker services, and Nginx configuration. Use **App Manager → Infrastructure** instead; configure the separately installed Portainer/NPM services as described below. Unrecognized or symlinked legacy plugins are left untouched with a warning for administrator review.
+Production files are activated at `/opt/webapps/<app-id>/current/app/<output-directory>/`, beneath the project directory if configured. The application card displays that content path instead of a runtime port. No systemd runtime, host web-server change, public domain, or proxy route is created. Configure your existing web server to serve this directory, and configure SPA history fallback to this application's `index.html` for client-side routes. An NPM proxy host alone cannot serve these files without a separately configured static upstream. For React Router under a prefix, configure its basename too, for example `basename={import.meta.env.BASE_URL}` in Vite.
 
-Set the Portainer and NPM base URLs in **Settings → Infrastructure APIs**, then open **Infrastructure** and connect. Use a Portainer API key (or compatible bearer token) and an NPM account. Credentials are sent to the privileged helper over stdin for each request and are held only in the current page's memory; re-enter them after a page reload or Cockpit session ends. Only the API base URLs are saved in App Manager configuration. Use HTTPS where available; the helper verifies TLS certificates and does not follow redirects. When using the default local HTTP endpoints, keep them bound to trusted host interfaces.
+Save public build-time values such as `VITE_*` or `REACT_APP_*` before deployment, and redeploy after changing them. They become visible in browser bundles: never expose API keys, database passwords, or other secrets. React health checks verify the deployed `index.html`, not external HTTP reachability or SPA routing.
 
-To remember a Portainer key, save the connection form's **Password manager account** and **API key** in your browser's password manager. Select that entry to fill the key on your next visit; the account name includes the configured Portainer URL to distinguish it from your Cockpit login or another Portainer instance. Browser/password-manager support and save prompts vary, so use the manager's manual save/fill controls if needed. App Manager does not persist the key in server files, local storage, or session storage. Delete or update the password-manager entry when revoking a key or changing the service URL. NPM's username/password fields also support normal password-manager autofill.
+## Portainer and Nginx Proxy Manager
 
-Portainer's backend API defaults to **`http://127.0.0.1:9000`** on the Ubuntu host. Do not append `/manage-docker`, `/portainer`, or `/api`: the authenticated environment request goes directly to `http://127.0.0.1:9000/api/endpoints` with the `X-API-Key` header. It does not go through Nginx or Cloudflare and does not use browser cookies. **Open Portainer** separately opens `/manage-docker/` in your browser. Keep Portainer's HTTP listener bound to loopback; do not expose port 9000 publicly.
+App Manager no longer includes Docker/Compose deployments, container management,
+or Nginx Proxy Manager API management. Use the separate **Portainer** and
+**Nginx Proxy Manager** tabs to open those services in a new browser tab.
+App Manager does not embed them, proxy their APIs, or collect their credentials.
 
-Existing `https://stuserver.online/manage-docker` and `https://stuserver.online/portainer` settings (including trailing slashes) are normalized to the local API address when loaded. The same browser prefixes on `http://127.0.0.1:9000` or `http://localhost:9000` are stripped. **Save API URLs** persists the corrected address; other explicitly configured service URLs and a blank (disabled) setting are preserved. Portainer requires a full backend API URL, not a browser-relative route.
+Set each browser-facing URL or path in **Settings**, for example
+`https://portainer.example/`, `/manage-docker/`, or `/nginx/`. Root-relative
+paths use the browser's current origin. HTTP(S) URLs and root-relative paths
+are accepted; credentials, protocol-relative URLs, queries, and fragments are
+rejected. Leave a field blank to disable its link. Only these addresses are
+saved, under `integrations.portainer_url` and `integrations.npm_url`.
+Existing configured addresses are preserved exactly, not rewritten to a local
+API endpoint. Review older settings: `127.0.0.1` refers to the browser's computer,
+not the Ubuntu server, and an API-only address may need replacing.
 
-Nginx Proxy Manager still accepts its actual route, for example `/nginx/`, or a full HTTP(S) API base URL reachable from the Ubuntu host. A route uses Cockpit's current scheme, hostname, and port; it must allow backend API requests without a browser login session. Same-address NPM URLs are displayed as routes when reopening Settings. Leave a field blank to remove its connection. Do not include `/api`; the backend appends the API paths. These settings do not create or change reverse-proxy routes.
+Existing Docker registrations remain visible as unsupported, with all actions
+disabled and automatic deployment skipped. Their containers, images, volumes,
+services, managed files, and registry entries are not stopped or deleted.
+Manage or migrate these applications externally. New Docker registrations and
+the old `integration` CLI command are rejected. A repository containing a
+Dockerfile can still be detected as a supported native framework; a
+Dockerfile/Compose-only repository is unsupported.
+Even `uninstall.sh --remove-managed-data` skips these unsupported applications
+and retains the registry; clean them up externally after migration.
 
-After updating the checkout on the Ubuntu host, install the native plugin and restart Cockpit (this disconnects existing Cockpit sessions, not managed applications):
+Older releases installed separate Docker Manager and Nginx Manager Cockpit
+entries. Re-run the installer from this checkout, then sign out of Cockpit and
+back in to refresh navigation. The installer retires only verified legacy UI
+assets, leaving unrelated files and host services/configuration untouched.
 
-```bash
-sudo bash ./scripts/install.sh
-sudo systemctl restart cockpit.socket cockpit.service
-```
-
-Verify the authenticated local endpoint on that host without putting the key in command arguments, shell history, or saved files:
-
-```bash
-python3 - <<'PY'
-import getpass
-import urllib.request
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-request = urllib.request.Request(
-    "http://127.0.0.1:9000/api/endpoints",
-    headers={"X-API-Key": getpass.getpass("Portainer API key: ")},
-)
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-with opener.open(request, timeout=15) as response:
-    print(f"HTTP {response.status}")
-PY
-```
-
-Expect `HTTP 200`. An unauthenticated `/api/status` success only proves reachability, not the key's authorization to `/api/endpoints`. No TLS verification is disabled; explicitly configured HTTPS service URLs continue to use normal certificate verification.
-
-### HTTP 401/403 or API redirects
-
-The error now identifies the service, HTTP method, and failing API endpoint without showing the API key or password. A Portainer key must be active and its owner must have permission for the requested environment/action. For NPM, verify the account credentials and permissions. If the response passed through Cloudflare, the error says so; this alone does not prove that Cloudflare generated the denial. Check Cloudflare Access/WAF events and upstream access logs.
-
-The privileged helper makes requests from the Ubuntu host, not from your browser. Signing in to Cockpit or Cloudflare Access in the browser does not authenticate these API requests. A shared-hostname route can therefore work in a browser but return HTTP 403 to the helper. Prefer the service's direct, private API URL reachable from the host (with trusted TLS for HTTPS), or have an administrator configure authorized machine/API access through the existing proxy. The plugin does not supply Cloudflare Access service-token credentials. Do not disable Access/WAF protections, disable TLS verification, expose a private service publicly, or change the existing root-site routing to work around a denial.
-
-The native Portainer-backed Docker controls currently support:
-
-| Resource | Native operations |
-| --- | --- |
-| Containers | List, inspect, logs, one-shot stats, filesystem changes, rename, start/stop/restart, pause/resume, kill, remove, and create stopped containers from existing images |
-| Images | List, inspect, history, add local tags, pull public images, and remove |
-| Volumes | List, inspect, create Docker-managed local volumes, and remove |
-| Networks | List, inspect, create bridge/internal bridge networks, connect/disconnect containers on local bridge networks, and remove |
-| Stacks | List, inspect, view the read-only Compose file, and remove |
-| Environments | List and select; view Docker Engine information |
-
-Creation forms use structured fields, not arbitrary Docker API JSON. New containers use the image's default command, drop all capabilities, enable `no-new-privileges`, and receive 1024 MiB memory, one CPU, and 256-task limits. Only `NET_BIND_SERVICE` is added when explicitly publishing a privileged internal port. Optional TCP publishing uses `127.0.0.1` and host ports 8100-8999. An active host listener is rejected locally; the selected Docker daemon also rejects port conflicts when starting a container. Containers are created stopped, do not become registered App Manager applications, and must be reviewed and started separately. There is no host-path mounting, arbitrary command override, privileged mode, or custom network/volume driver option in these forms.
-
-Image pulls have a 120-second socket timeout and the existing 2 MiB response limit. Docker's HTTP-200 streaming error records are treated as failures; incomplete progress is not reported as success. The pull form does not supply private-registry credentials. A timeout does not guarantee Docker stopped the pull: inspect or refresh the image list before retrying. Daemon warnings are displayed after successful creation.
-
-Container renaming and network disconnection require confirmation because name-based automation or connectivity can break. Network membership changes recheck that the selected network is a local bridge; host, overlay, and custom-driver networks are not supported. Disconnections never force removal. Image tagging creates a local reference only, without pushing or authenticating to a registry. Container filesystem changes show Docker's path/change-kind metadata, not file contents (kind 0 = modified, 1 = added, 2 = deleted). Stack Compose files and image history are read-only and can contain sensitive configuration; review them only in a trusted session.
-
-NPM supports listing, creating, editing, and deleting proxy hosts, redirection hosts, 404 hosts, streams, and access lists, plus listing/creating/deleting certificates. NPM's JSON editor exposes fields supported by the installed API; use the NPM interface for custom-certificate file uploads and user management. Actions are limited to these named API resources and methods; the UI does not expose an arbitrary URL/API proxy. Resource deletion is confirmed in the UI.
-
-These are native Docker-management controls, not full Portainer parity. Container exec/attach consoles, configuration editing/duplication/recreation, custom commands/environment/mount configuration, stack creation/editing, image build/export/push, private-registry authentication, users/teams/RBAC, templates, Swarm/Kubernetes, and enterprise features remain in Portainer's own interface. API credentials remain session-only; server-side API-key persistence is not implemented. Portainer's security headers are not weakened and its interface is not embedded.
-
-## Nginx routing
-
-Use **Create NPM route** on a deployed dynamic application's card, or open **Infrastructure → Nginx Proxy Manager → Proxy hosts → Create proxy route**. Select an App Manager application to fill its managed port, enter its domain and the upstream host that NPM can reach, and choose the upstream scheme and common proxy options. The quick form creates an HTTP-facing proxy host without a client TLS certificate; add/assign a certificate in NPM to enable HTTPS. Portainer-managed containers can use a service name when NPM and the container share a Docker network. App Manager-hosted apps bind to loopback, so a separate bridged NPM container cannot reach them unless an explicit host-level path is configured. Configure static apps in the external web server that serves their files. App Manager never edits Nginx configuration or reloads Nginx; existing Nginx sites and any legacy App Manager snippets are preserved.
+Configure domains, upstreams, certificates, and access rules directly in NPM.
+Native dynamic apps listen on their displayed `127.0.0.1:<port>` address; a
+bridged NPM container needs an administrator-configured path to that loopback
+upstream. Static files require a separately configured static web server.
+App Manager never changes existing Nginx or Cloudflare routing.
 
 ## Runtime Operations
 
@@ -178,7 +147,7 @@ Successful deployments delete the managed Git checkout at `sources/<app-id>`. La
 
 **Check health** records systemd state, local readiness, a check time, and failure details. Static deployments are checked for a deployed `index.html`; dynamic apps are probed on their loopback port. App Manager does not check public DNS, external routing, Cloudflare, or virtual-host reachability. Status observations older than ten minutes are not used to override saved lifecycle state.
 
-Per-app limits are editable before redeployment: runtime defaults are 1024 MiB memory, 100% CPU quota, and 256 tasks; build defaults are 2048 MiB, 100%, and 512 tasks. Non-Docker builds run in constrained transient systemd scopes while their commands remain unprivileged. Docker build steps receive Docker memory and CPU quotas, while the running container gets the configured memory, CPU, and task limits. Log rotation checks each application's stdout/stderr files for a 10 MiB threshold on timer runs and daily, retaining five compressed rotations. This is periodic rotation, not a strict instantaneous disk quota. Default uninstall retains rotation rules because running applications and their logs are retained.
+Per-app limits are editable before redeployment: runtime defaults are 1024 MiB memory, 100% CPU quota, and 256 tasks; build defaults are 2048 MiB, 100%, and 512 tasks. Builds run in constrained transient systemd scopes while their commands remain unprivileged. Log rotation checks each application's stdout/stderr files for a 10 MiB threshold on timer runs and daily, retaining five compressed rotations. This is periodic rotation, not a strict instantaneous disk quota. Default uninstall retains rotation rules because running applications and their logs are retained.
 
 ## Preflight and Build Capacity
 
@@ -271,13 +240,13 @@ Project conventions and deployment requirements are documented in `AGENTS.md` an
 - After a worker interruption, retrying `deployment-abort <app-id> <deployment-id>` can finalize an abortable record when the app lock is free and the exact worker unit is inactive or missing with no pending systemd job. Older records without worker-unit metadata can use the unit name derived from their app and deployment IDs only after reaching the running build phase; pending records remain excluded to avoid racing worker startup. Recovery only updates deployment metadata and logs; it does not stop runtime services, roll back activation, delete releases, or terminate orphaned build processes.
 - Ports are allocated from 8100–8999. Port 8080 is excluded. Registration holds the registry lock while checking existing allocations and listening sockets and recording the new port.
 - Git remotes must use HTTPS or SSH. Retained checkouts reject local changes and branch changes and only merge with `--ff-only`. Fresh checkouts must descend from the recorded deployed commit before activation.
-- Each app uses a dedicated system account named `app-<app-id>`. Git operations and non-Docker dependency/build commands run as that account. Docker image builds and Compose project operations are delegated to the host Docker daemon; Dockerfiles and Compose manifests must be trusted. The generated systemd service uses the app account except for Docker, where it invokes the daemon as root without granting the app account Docker socket access. Runtime startup must pass a local health check and an actual TCP listener check; public IPv4 or IPv6 bindings on the assigned port are rejected and stopped. App Manager does not activate or modify a web-server route.
+- Each app uses a dedicated system account named `app-<app-id>`. Git operations, dependency/build commands, and generated runtime services run as that account. Runtime startup must pass a local health check and an actual TCP listener check; public IPv4 or IPv6 bindings on the assigned port are rejected and stopped. App Manager does not activate or modify a web-server route.
 - Generated systemd services drop all capabilities and enable filesystem, device, kernel, namespace/personality, and privilege-escalation hardening. Release files are root-owned and read-only; static release content is readable by Nginx. Service writes are limited to that app's private home, config, log, and declared persistent-storage paths. App ports are unprivileged, so `CAP_NET_BIND_SERVICE` is not granted.
 - Sources, releases, application configuration, and logs use app-specific paths. Successful source checkouts are deleted. Environment secrets remain outside checkout/release trees in root-owned files with app-group-only read access. Only the latest deployment record and current release are retained after successful cleanup; failed service shutdown preserves files for administrator recovery rather than deleting a live release.
-- App deployments never read, write, test, reload, or restart host Nginx configuration. Domain and virtual-host resources can be managed separately through the Infrastructure workspace's NPM REST API. Existing host and legacy App Manager configuration is preserved; removing an app does not remove a referenced proxy route.
+- App deployments never read, write, test, reload, or restart host Nginx configuration. Manage domains and virtual hosts separately in NPM's own interface. Existing host and legacy App Manager configuration is preserved; removing an app does not remove a referenced proxy route.
 - Removing an app unregisters it and stops/removes its App Manager service and managed data. Remove any virtual-host references separately before deleting a deployed app.
 
-Applications must provide an appropriate start entry point. Framework adapters install/build dependencies and use a conventional start command; applications with nonstandard startup behavior must supply `build_config.start_command` as an array of executable arguments (not a shell string). Commands are not run through a shell: shell expansion, pipes, and command substitution are not available. Dynamic non-Docker apps must read the assigned `PORT` and bind to `127.0.0.1`; Docker apps listen on their configured container port and `0.0.0.0` inside the container while Docker publishes only to host loopback. Local health checks use the configured path and require a final 2xx response. Bounded redirects within the same scheme, host, and port are followed; redirects to other applications or external authentication providers are rejected. Local probes bypass environment proxies. A static health result verifies the deployed entry point exists, not external network reachability. No adapter can guarantee that an arbitrary repository, missing secret, incompatible runtime, or third-party dependency will deploy successfully.
+Applications must provide an appropriate start entry point. Framework adapters install/build dependencies and use a conventional start command; applications with nonstandard startup behavior must supply `build_config.start_command` as an array of executable arguments (not a shell string). Commands are not run through a shell: shell expansion, pipes, and command substitution are not available. Dynamic apps must read the assigned `PORT` and bind to `127.0.0.1`. Local health checks use the configured path and require a final 2xx response. Bounded redirects within the same scheme, host, and port are followed; redirects to other applications or external authentication providers are rejected. Local probes bypass environment proxies. A static health result verifies the deployed entry point exists, not external network reachability. No adapter can guarantee that an arbitrary repository, missing secret, incompatible runtime, or third-party dependency will deploy successfully.
 
 | Framework | Default startup contract |
 | --- | --- |
@@ -286,11 +255,10 @@ Applications must provide an appropriate start entry point. Framework adapters i
 | Go | A root `main` package, or one uniquely detected `main` package below the root. Set `build_config.go_package` (for example `./cmd/server`) when multiple executables exist. The executable must honor the supplied host and port environment. |
 | Python | A WSGI `app:app` entry, served by the release virtual environment's Gunicorn. ASGI apps, Django, and other module layouts require an explicit compatible start command and dependencies. |
 | Static | An `index.html` at the repository root, deployed without a runtime service. Configure external web-server routing separately. An explicit custom start command opts into a runtime service. |
-| Docker | A Dockerfile's `CMD`/`ENTRYPOINT` starts the web process, or Compose starts the project and publishes the selected service on loopback. Configure the internal listening port. |
 
 ### Startup, assets, and application path prefixes
 
-For non-Docker frameworks, managed environment values are passed to build commands and loaded by systemd for dynamic app runtimes. Docker runtime values are stored separately and passed to the container; Docker builds receive only the non-secret `APP_BASE_PATH` and `PORT` build arguments. Applications read their process environment rather than requiring a `.env` file beside the source. Save values in App Manager before deploying. A restart updates runtime-only values, but Next.js `NEXT_PUBLIC_*`, Vite `VITE_*`, and other compiled browser configuration require a new deployment. Only framework-approved public variables belong in browser bundles; never expose database passwords or API secrets or put secrets in Docker build arguments or image layers. Plain static HTML has neither a server-side process environment nor an automatic environment substitution step.
+Managed environment values are passed to build commands and loaded by systemd for dynamic app runtimes. Applications read their process environment rather than requiring a `.env` file beside the source. Save values in App Manager before deploying. A restart updates runtime-only values, but Next.js `NEXT_PUBLIC_*`, Vite `VITE_*`, and other compiled browser configuration require a new deployment. Only framework-approved public variables belong in browser bundles; never expose database passwords or API secrets. Plain static HTML has neither a server-side process environment nor an automatic environment substitution step.
 
 Every managed dynamic application receives its configured application path prefix without the trailing slash as `APP_BASE_PATH`. App Manager does not add `X-Forwarded-Prefix` or rewrite arbitrary Swagger/OpenAPI documents: their `servers` (OpenAPI) or `basePath` (Swagger 2) must match the path configured in the external reverse proxy. Configure the app to derive its base path from `APP_BASE_PATH`; this is necessary for Swagger “Try it out” requests as well as other generated API clients. Static sites have no runtime process to configure, so their Swagger documents and asset paths must already match the configured path.
 
@@ -308,7 +276,7 @@ Failed readiness checks include the expected local URL, assigned port, systemd e
 
 All framework adapters prepare HTML files and web manifests in the isolated release before compilation or dependency packaging, including Go-embedded HTML, Node assets, Python templates, and static sites. Root-relative `src`, `href`, `poster`, and `data` URLs are prefixed when the target exists inside the release or conventional `public`, `static`, `dist`, or `build` directories. A root `<base href="/">` is adjusted to the app route. Web manifests have their root-relative identity, scope, launch URL, and known local icons scoped to the app. Node builds are scanned again for generated HTML/manifests; a standard `vite build` script receives Vite's native `--base` argument. Source checkouts, external/CDN URLs, already-prefixed URLs, script bodies, and links to other applications are unchanged. Dependency and symlinked directories are excluded from preparation. Custom CSS URLs, `srcset`, arbitrary JavaScript-generated requests, and server-generated HTML still need application-level base-path handling using `APP_BASE_PATH` or safely configured `X-Forwarded-Prefix` support. A request for `/icons/logo.svg` targets the existing root site; use `/your-app/icons/logo.svg`. The plugin intentionally does not capture root-level asset paths or rewrite arbitrary application responses.
 
-The dashboard reports local runtime readiness only. A healthy local application does not guarantee external DNS, NPM routing, Cloudflare, or authentication behavior; validate those separately through the Infrastructure workspace without changing unrelated site configuration.
+The dashboard reports local runtime readiness only. A healthy local application does not guarantee external DNS, NPM routing, Cloudflare, or authentication behavior; validate those separately in the external services without changing unrelated site configuration.
 
 Next.js deployments detect `next.config.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, and `.cts` files and automatically apply `basePath: process.env.APP_BASE_PATH || ""` and `trailingSlash: true` in the isolated release copy, including when an existing config exports an object or a config function. Existing config contents are retained in a release-local backup and merged before the build; the source checkout is not modified. The resolved config is checked before building so the configured application path and generated assets stay aligned. `output: "export"` is supported: the generated `out/` directory is deployed without a runtime service and must be routed by the external web server. Non-export Next.js apps continue to run with `next start`. Dynamic Next.js local health URLs include the application path prefix.
 
@@ -350,7 +318,7 @@ pins target Python 3.11-3.13, not 3.14.
 Python apps can opt into a loopback Uvicorn API and one native Celery worker,
 shared persistent storage/environment, read-only models, bounded prerequisite
 checks, separate worker controls/limits/logs and per-app upload settings.
-Configure route authentication and access rules through NPM in the Infrastructure workspace.
+Configure route authentication and access rules in NPM's own interface.
 See the [native Python deployment runbook](docs/native-python.md) for configuration,
 administrator setup, failure recovery and the proposed drum API changes.
 The separate drum API repository is unchanged; compatibility requires those
@@ -371,13 +339,13 @@ npm run lint
 python -m unittest discover -s tests -q
 ```
 
-Python tests cover validation, framework detection, JSON/locking behavior, concurrent port allocation, health/metrics sampling, environment/runtime preflight, persistent storage, stale approval rejection, bounded/cancellable build slots, safe settings rejection, fast-forward Git updates, deployment recovery, static deployment, listener isolation, plugin update/restart failures, installer ownership boundaries, generated systemd hardening, and uninstall safety. Frontend tests exercise guided setup, Docker deployment registration, environment masking and stdin submission, registration retries, search/filter behavior, preflight/metrics reports, exact-commit approval, storage/runtime settings, duplicate deployment prevention, and update/restart feedback.
+Python tests cover validation, framework detection, JSON/locking behavior, concurrent port allocation, health/metrics sampling, environment/runtime preflight, persistent storage, stale approval rejection, bounded/cancellable build slots, safe settings rejection, fast-forward Git updates, deployment recovery, static deployment, listener isolation, plugin update/restart failures, installer ownership boundaries, generated systemd hardening, and uninstall safety. Frontend tests exercise guided setup, external manager links/settings, unsupported legacy Docker registrations, environment masking and stdin submission, registration retries, search/filter behavior, preflight/metrics reports, exact-commit approval, storage/runtime settings, duplicate deployment prevention, and update/restart feedback.
 
-POSIX shell and file-permission integration tests are skipped on Windows. Local unit tests and mocked browser tests are not a production deployment certification. Before production use, validate on a disposable Ubuntu host: Cockpit privilege escalation; account and systemd sandbox setup; Portainer and NPM API access; routing through NPM; one deployment per supported framework; health-failure recovery and cancellation; automatic deployments; and plugin updates reconnecting after the Cockpit restart. Confirm the existing root site and `stuserver-websites` service remain unchanged throughout.
+POSIX shell and file-permission integration tests are skipped on Windows. Local unit tests and mocked browser tests are not a production deployment certification. Before production use, validate on a disposable Ubuntu host: Cockpit privilege escalation; account and systemd sandbox setup; browser links to Portainer and NPM; routing through NPM; one deployment per supported framework; health-failure recovery and cancellation; automatic deployments; and plugin updates reconnecting after the Cockpit restart. Confirm the existing root site and `stuserver-websites` service remain unchanged throughout.
 
-GitHub Actions runs unit/UI checks and an explicitly gated Ubuntu VM integration job. The latter uses isolated managed roots, exercises all supported framework adapters and systemd services, candidate replacement/failure recovery, checkout cleanup, persistent-file survival, real systemd metrics, local health, and SSH tag verification. It checks that existing Nginx files and legacy service state remain unchanged. Repository downloads/history and the failure-health boundary are fixture-controlled; this does not certify remote credentials, real HTTPS/Cloudflare routing, Cockpit/polkit, approval with real remote changes, cross-process queue cancellation after host interruption, or a full plugin-update/reconnect cycle. Those remain disposable-host acceptance checks.
+GitHub Actions runs unit/UI checks and an explicitly gated Ubuntu VM integration job. The latter uses isolated managed roots, exercises static, Node.js, Go, Python, and Next.js deployments and systemd services, candidate replacement/failure recovery, checkout cleanup, persistent-file survival, real systemd metrics, local health, and SSH tag verification. It checks that existing Nginx files and legacy service state remain unchanged. React production builds and static activation have local unit/UI coverage; validate them on a disposable Ubuntu host before production use. Repository downloads/history and the failure-health boundary are fixture-controlled; this does not certify remote credentials, real HTTPS/Cloudflare routing, Cockpit/polkit, approval with real remote changes, cross-process queue cancellation after host interruption, or a full plugin-update/reconnect cycle. Those remain disposable-host acceptance checks.
 
-Run only on a fresh disposable Ubuntu VM with systemd, Git, Node/npm, Go, Python venv support, and Docker/Compose if Docker integration is enabled:
+Run only on a fresh disposable Ubuntu VM with systemd, Git, Node/npm, Go, and Python venv support:
 
 ```bash
 sudo env APP_MANAGER_DISPOSABLE_UBUNTU=1 python3 -m unittest discover -s tests -p test_ubuntu_integration.py -v

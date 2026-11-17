@@ -13,11 +13,6 @@
     sort: "recent",
     settings: {},
     logTarget: null,
-    integration: {
-      provider: "portainer",
-      portainer: { token: "", endpoints: [], endpointId: "", resource: "containers", data: null },
-      npm: { username: "", password: "", resource: "proxy-hosts", data: null, routeAppId: "" },
-    },
   };
   const byId = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -30,7 +25,13 @@
 
   const icon = (name) => `<i data-lucide="${name}" aria-hidden="true"></i>`;
   const renderIcons = () => globalThis.renderAppManagerIcons?.();
-  const frameworkName = (value) => ({ auto: "Auto detect", nextjs: "Next.js", node: "Node.js", go: "Go", python: "Python", static: "Static HTML", docker: "Docker" })[value] || value;
+  const frameworkName = (value) => ({ auto: "Auto detect", nextjs: "Next.js", react: "React", node: "Node.js", go: "Go", python: "Python", static: "Static HTML" })[value] || value;
+  const isStaticApp = (app) => app.static_export === true || app.framework === "react"
+    || (app.framework === "static" && !app.build_config?.start_command);
+  const isUnsupportedApp = (app) => app?.unsupported === true || app?.framework === "docker";
+  const isUnsupportedDeployment = (appId, deploymentId) => isUnsupportedApp(state.apps.find((app) => app.id === appId))
+    || state.deployments.some((deployment) => deployment.app_id === appId
+      && (!deploymentId || deployment.id === deploymentId) && deployment.unsupported === true);
   function formatDate(value) {
     const date = new Date(value);
     return value && !Number.isNaN(date.valueOf())
@@ -241,12 +242,19 @@
     }
 
     const cards = filtered.map((app) => {
+      if (isUnsupportedApp(app)) {
+        return `<article class="am-app-card" data-status="unsupported" data-framework="${escapeHtml(app.framework)}">
+          <header class="am-app-card__heading"><div class="am-app-title-wrap"><h3>${escapeHtml(app.name)}</h3>
+            <span class="am-app-framework">${escapeHtml(app.framework)}</span></div>
+            <span class="am-status-pill" data-status="unknown">Unsupported</span></header>
+          <div class="am-app-route">${icon("globe")}<code>${escapeHtml(app.route)}</code></div>
+          <p class="am-repository">${escapeHtml(app.repo_url)}</p>
+          <p>This legacy registration is read-only. All application actions and monitoring are disabled. No containers, services, or files are changed. Manage it separately in Portainer.</p>
+        </article>`;
+      }
       const deploying = app.status === "deploying";
-      const staticApp = app.framework === "static" && !app.build_config?.start_command;
+      const staticApp = isStaticApp(app);
       const appId = escapeHtml(app.id);
-      const routeAction = app.last_deploy && !staticApp
-        ? `<button type="button" class="am-route-state am-route-action" data-action="route" data-id="${appId}">Create NPM route</button>`
-        : `<span class="am-route-state">Routing is managed separately in NPM</span>`;
       const unavailable = deploying ? " disabled data-unavailable" : "";
       const runtimeUnavailable = deploying || !app.last_deploy ? " disabled data-unavailable" : "";
       const serviceControl = staticApp ? "" : observedStatus(app) === "running"
@@ -269,14 +277,13 @@
             </div>
             ${renderStatus(observedStatus(app))}
           </header>
-          <div class="am-app-route">${icon("globe")}<code>${escapeHtml(app.route)}</code>${routeAction}</div>
+          <div class="am-app-route">${icon("globe")}<code>${escapeHtml(app.route)}</code><span class="am-route-state">Routing is managed separately</span></div>
           <p class="am-repository" title="${escapeHtml(app.repo_url)}">${icon("git-branch")}<span>${escapeHtml(app.repo_url)}</span></p>
           <dl class="am-app-meta">
             <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
-            <div><dt>${app.framework === "static" && !app.build_config?.start_command ? "Content" : "Runtime"}</dt><dd>${app.framework === "static" && !app.build_config?.start_command ? "Static files" : `127.0.0.1:${escapeHtml(app.port)}`}</dd></div>
+            <div><dt>${staticApp ? "Content" : "Runtime"}</dt><dd>${staticApp ? escapeHtml(app.static_root ? `Static files: current/app/${app.static_root}` : "Static files") : `127.0.0.1:${escapeHtml(app.port)}`}</dd></div>
             <div class="am-meta-wide"><dt>Last deployed</dt><dd>${escapeHtml(formatDate(app.last_deploy))}${app.deployed_commit ? ` <code>${escapeHtml(app.deployed_commit.slice(0, 7))}</code>` : ""}</dd></div>
             <div><dt>Readiness</dt><dd data-health="${app.health ? (app.health.local_healthy ? "healthy" : "failed") : "unknown"}" title="${escapeHtml(app.health?.local_error || "")}">${app.health ? (app.health.local_healthy ? "Healthy" : "Failed") : "Not checked"}</dd></div>
-            <div><dt>Container port</dt><dd>${app.framework === "docker" ? escapeHtml(app.build_config?.container_port || "Configured in deployment") : "—"}</dd></div>
           </dl>
           <details class="am-runtime-details">
             <summary>${icon("activity")} Runtime details ${app.auto_deploy === false ? '<span class="am-runtime-policy">Auto-deploy paused</span>' : ""}${icon("plus")}</summary>
@@ -339,7 +346,7 @@
       return;
     }
     const rows = state.deployments.map((deployment) => {
-      const viewControl = deployment.id
+      const viewControl = deployment.id && !isUnsupportedDeployment(deployment.app_id, deployment.id)
         ? `<button type="button" class="am-button" data-action="deployment-log" data-id="${escapeHtml(deployment.app_id)}" data-deployment-id="${escapeHtml(deployment.id)}">View log</button>`
         : "";
       return `
@@ -367,500 +374,40 @@
     `;
   }
 
-  const integrationResources = {
-    portainer: [
-      ["containers", "Containers"], ["stacks", "Stacks"], ["images", "Images"],
-      ["volumes", "Volumes"], ["networks", "Networks"], ["info", "Engine info"],
-    ],
-    npm: [
-      ["proxy-hosts", "Proxy hosts"], ["redirection-hosts", "Redirection hosts"],
-      ["dead-hosts", "404 hosts"], ["streams", "Streams"],
-      ["certificates", "Certificates"], ["access-lists", "Access lists"],
-    ],
-  };
-
-  const integrationReadTitles = {
-    inspect: "Resource details", logs: "Container logs", stats: "Container stats",
-    changes: "Container filesystem changes", history: "Image history", file: "Stack Compose file",
-  };
-
-  function integrationCall(provider, action, resource, extra = {}) {
-    const connection = state.integration[provider];
-    const payload = { provider, action, resource, ...extra };
-    if (provider === "portainer") payload.token = connection.token;
-    else payload.credentials = { username: connection.username, password: connection.password };
-    return callBackendInput("integration", [], JSON.stringify(payload));
-  }
-
-  function integrationRows(data) {
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data?.data)) return data.data;
-    if (Array.isArray(data?.records)) return data.records;
-    if (Array.isArray(data?.Volumes)) return data.Volumes;
-    return [];
-  }
-
-  function integrationLabel(provider, resource, item) {
-    if (provider === "portainer") {
-      if (resource === "containers") return (item.Names || [item.Name || item.Id || "Container"]).join(", ").replace(/^\//, "");
-      if (resource === "images") return (item.RepoTags || [item.Id || "Image"]).join(", ");
-      return item.Name || item.name || item.Id || `${resource} resource`;
+  function managerUrl(value = "") {
+    if (typeof value !== "string" || /[\x00-\x1f\x7f-\x9f\\?#]/.test(value)) {
+      throw new Error("Use an HTTP(S) browser URL or root-relative path without credentials, queries, fragments, backslashes, or control characters.");
     }
-    return (item.domain_names || [item.name || item.display_name || `${resource} resource`]).join(", ");
-  }
-
-  function integrationColumns(provider, resource) {
-    if (provider === "npm") return [
-      ["enabled", "Enabled"], ["forward_host", "Forward host"], ["forward_port", "Port"],
-      ["ssl_forced", "HTTPS"], ["domain_names", "Domains"],
-    ];
-    return ({
-      containers: [["Image", "Image"], ["State", "State"], ["Status", "Status"], ["Ports", "Ports"]],
-      stacks: [["Status", "Status"], ["Type", "Type"], ["EndpointId", "Environment"]],
-      images: [["Size", "Size"], ["Created", "Created"]],
-      volumes: [["Driver", "Driver"], ["Scope", "Scope"], ["Mountpoint", "Mount path"]],
-      networks: [["Driver", "Driver"], ["Scope", "Scope"]],
-    })[resource] || [];
-  }
-
-  function integrationCell(value) {
-    if (Array.isArray(value)) return value.map((part) => typeof part === "object" ? JSON.stringify(part) : part).join(", ");
-    if (value && typeof value === "object") return JSON.stringify(value);
-    if (typeof value === "boolean") return value ? "Yes" : "No";
-    return value == null || value === "" ? "—" : String(value);
-  }
-
-  function renderNpmRouteCreator() {
-    const connection = state.integration.npm;
-    const apps = state.apps.filter((app) => app.last_deploy && app.port
-      && !(app.framework === "static" && !app.build_config?.start_command));
-    const selectedApp = apps.find((app) => String(app.id) === connection.routeAppId);
-    const options = apps.map((app) => `<option value="${escapeHtml(app.id)}" data-forward-port="${escapeHtml(app.port)}"${String(app.id) === connection.routeAppId ? " selected" : ""}>${escapeHtml(app.name)} · port ${escapeHtml(app.port)}</option>`).join("");
-    return `<details class="am-resource-editor am-route-creator"${connection.routeAppId ? " open" : ""}>
-      <summary>Create proxy route</summary>
-      <form data-npm-route>
-        <div class="am-form-grid">
-          <label>Domain name(s)<input name="domain_names" required placeholder="app.example.com" autocomplete="off"></label>
-          <label>Deployed App Manager app (optional)<select name="app_id" data-route-app>
-            <option value="" data-forward-port=""${connection.routeAppId ? "" : " selected"}>Choose an app to fill its port</option>${options}
-          </select></label>
-          <label>Forward host (reachable from NPM)<input name="forward_host" required placeholder="127.0.0.1, container name, or reachable IP" autocomplete="off"></label>
-          <label>Forward port<input name="forward_port" type="number" min="1" max="65535" step="1" value="${escapeHtml(selectedApp?.port || "")}" required></label>
-          <label>Forward scheme<select name="forward_scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></label>
-          <label class="am-checkbox"><input type="checkbox" name="allow_websocket_upgrade" checked><span>Allow WebSocket upgrades</span></label>
-          <label class="am-checkbox"><input type="checkbox" name="block_exploits" checked><span>Block common exploits</span></label>
-        </div>
-        <p class="am-field-hint">The selected app fills its managed port. The host must be reachable from NPM: 127.0.0.1 works only when NPM shares the host network. Portainer-managed containers can use a service name on a shared Docker network. App Manager-hosted apps bind to loopback, so a separate NPM container needs an explicit host-level network path.</p>
-        <button type="submit" class="am-button am-button--primary">Create proxy route</button>
-      </form>
-    </details>`;
-  }
-
-  function renderPortainerCreator(resource) {
-    if (!["containers", "images", "volumes", "networks"].includes(resource)) return "";
-    const pulling = resource === "images";
-    const title = pulling ? "Pull image" : `Create ${resource.slice(0, -1)}`;
-    const image = pulling || resource === "containers" ? `
-      <label>Image reference<input name="image" required maxlength="256" placeholder="nginx:alpine" autocomplete="off"></label>` : "";
-    const name = pulling ? "" : `
-      <label>Name<input name="name" required maxlength="63" pattern="[A-Za-z0-9][A-Za-z0-9_.\\-]{0,62}" autocomplete="off"></label>`;
-    const containerFields = resource === "containers" ? `
-      <label>Host loopback port (optional)<input name="host_port" type="number" min="8100" max="8999" step="1" placeholder="8100"></label>
-      <label>Container TCP port (required when publishing)<input name="container_port" type="number" min="1" max="65535" step="1" placeholder="80"></label>
-      <label>Restart policy<select name="restart_policy"><option value="no">Do not restart automatically</option><option value="unless-stopped">Unless stopped</option><option value="always">Always</option><option value="on-failure">On failure</option></select></label>` : "";
-    const internal = resource === "networks" ? `
-      <label class="am-checkbox"><input type="checkbox" name="internal"><span>Internal network (no external connectivity)</span></label>` : "";
-    const hint = ({
-      containers: "Use a trusted image already present in this environment; pull it first if needed. The container is created stopped with its image's default command, dropped capabilities, no-new-privileges, and limits of 1024 MiB, 1 CPU and 256 tasks. Optional TCP publishing binds only to 127.0.0.1. No host mounts or privileged settings are accepted. Start it separately after review.",
-      images: "Pull an image from a public registry. Private-registry credentials are not supported by this form. This can take several minutes. Review the image list before retrying a timeout.",
-      volumes: "Creates a Docker-managed local volume with no host path or driver options.",
-      networks: "Creates a bridge network. Host networking and custom drivers are not accepted.",
-    })[resource];
-    return `<details class="am-resource-editor">
-      <summary>${title}</summary>
-      <form data-portainer-create>
-        <div class="am-form-grid">${name}${image}${containerFields}${internal}</div>
-        <p class="am-field-hint">${hint}</p>
-        <button type="submit" class="am-button am-button--primary">${title}</button>
-      </form>
-    </details>`;
-  }
-
-  function renderIntegrationTable(provider, connection) {
-    const resource = connection.resource;
-    const rows = integrationRows(connection.data);
-    if (provider === "portainer" && resource === "info") {
-      return `<pre class="am-log-output">${escapeHtml(JSON.stringify(connection.data || {}, null, 2))}</pre>`;
+    const address = value.trim();
+    if (!address) return "";
+    if (address.startsWith("/") && !address.startsWith("//")) return address;
+    let url;
+    try { url = new URL(address); } catch (_error) { url = null; }
+    if (!/^https?:\/\/[^/?#]+/i.test(address) || !url?.hostname || url.username || url.password
+      || /^https?:\/\/[^/?#]*@/i.test(address)) {
+      throw new Error("Use an HTTP(S) browser URL or root-relative path without credentials.");
     }
-    const columns = integrationColumns(provider, resource);
-    const dockerCreator = provider === "portainer" ? renderPortainerCreator(resource) : "";
-    const createRoute = provider === "npm" && resource === "proxy-hosts" ? renderNpmRouteCreator() : "";
-    const createEditor = provider === "npm" && resource !== "proxy-hosts" ? `
-      <details class="am-resource-editor">
-        <summary>Create ${escapeHtml(integrationResources.npm.find(([key]) => key === resource)?.[1] || "resource")}</summary>
-        <form data-npm-create>
-          <label>API payload (JSON)<textarea name="body" rows="8" required spellcheck="false">{}</textarea></label>
-          <p class="am-field-hint">${resource === "certificates" ? "Use the fields supported by this NPM version. Custom certificate file uploads and user management remain in the NPM interface." : "Use the fields supported by this Nginx Proxy Manager resource. The list refreshes when the API confirms the change."}</p>
-          <button type="submit" class="am-button am-button--primary">Create resource</button>
-        </form>
-      </details>` : "";
-    if (!rows.length) {
-        return `${dockerCreator}${createRoute}${createEditor}<div class="am-empty-state am-integration-empty">
-        <span class="am-empty-state__icon" aria-hidden="true">${icon("boxes")}</span>
-        <h3>No ${escapeHtml(integrationResources[provider].find(([key]) => key === resource)?.[1].toLowerCase() || "resources")} found</h3>
-        <p>Refresh to check the connected service again.</p>
-      </div>`;
-    }
-    const header = columns.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join("");
-    const body = rows.map((item) => {
-      const id = item.Id ?? item.id ?? item.Name ?? item.name;
-      const cells = columns.map(([key]) => `<td>${escapeHtml(integrationCell(item[key]))}</td>`).join("");
-      let controls = "";
-      if (provider === "portainer" && resource === "containers") {
-        const running = String(item.State || "").toLowerCase() === "running";
-        const paused = String(item.State || "").toLowerCase() === "paused";
-        controls = `${running || paused ? `<button class="am-button am-button--quiet" type="button" data-resource-action="stop" data-id="${escapeHtml(id)}">Stop</button>` : `<button class="am-button am-button--quiet" type="button" data-resource-action="start" data-id="${escapeHtml(id)}">Start</button>`}
-          <button class="am-button am-button--quiet" type="button" data-resource-action="restart" data-id="${escapeHtml(id)}">Restart</button>
-          ${running ? `<button class="am-button am-button--quiet" type="button" data-resource-action="pause" data-id="${escapeHtml(id)}">Pause</button>` : paused ? `<button class="am-button am-button--quiet" type="button" data-resource-action="unpause" data-id="${escapeHtml(id)}">Resume</button>` : ""}
-          ${running || paused ? `<button class="am-button am-button--danger" type="button" data-resource-action="kill" data-id="${escapeHtml(id)}">Kill</button>` : ""}
-          <button class="am-button am-button--quiet" type="button" data-resource-action="logs" data-id="${escapeHtml(id)}">Logs</button>
-          <button class="am-button am-button--quiet" type="button" data-resource-action="inspect" data-id="${escapeHtml(id)}">Inspect</button>
-          <button class="am-button am-button--quiet" type="button" data-resource-action="stats" data-id="${escapeHtml(id)}">Stats</button>
-          <button class="am-button am-button--quiet" type="button" data-resource-action="changes" data-id="${escapeHtml(id)}">Filesystem changes</button>
-          <details class="am-row-editor"><summary>Rename</summary>
-            <form data-portainer-change="rename" data-id="${escapeHtml(id)}">
-              <label>New name<input name="name" required maxlength="63" pattern="[A-Za-z0-9][A-Za-z0-9_.\\-]{0,62}" autocomplete="off"></label>
-              <p class="am-field-hint">Renaming can break scripts, service automation, or links that use the old container name.</p>
-              <button type="submit" class="am-button am-button--primary">Rename container</button>
-            </form>
-          </details>
-          <button class="am-button am-button--danger" type="button" data-resource-action="remove" data-id="${escapeHtml(id)}">Remove</button>`;
-      } else if (provider === "portainer" && ["stacks", "images", "volumes", "networks"].includes(resource)) {
-        controls = `<button class="am-button am-button--quiet" type="button" data-resource-action="inspect" data-id="${escapeHtml(id)}">Inspect</button>
-          <button class="am-button am-button--danger" type="button" data-resource-action="remove" data-id="${escapeHtml(id)}">Remove</button>`;
-        if (resource === "images") {
-          controls += `<button class="am-button am-button--quiet" type="button" data-resource-action="history" data-id="${escapeHtml(id)}">History</button>
-            <details class="am-row-editor"><summary>Add tag</summary>
-              <form data-portainer-change="tag" data-id="${escapeHtml(id)}">
-                <label>Repository (without tag)<input name="repository" required maxlength="256" placeholder="myorg/web" autocomplete="off"></label>
-                <label>Tag<input name="tag" required maxlength="128" pattern="[A-Za-z0-9_][A-Za-z0-9_.\\-]{0,127}" value="latest" autocomplete="off"></label>
-                <p class="am-field-hint">Creates a local image tag; does not push to a registry.</p>
-                <button type="submit" class="am-button am-button--primary">Add image tag</button>
-              </form>
-            </details>`;
-        } else if (resource === "networks" && item.Driver === "bridge" && item.Scope === "local") {
-          controls += `<details class="am-row-editor"><summary>Connect/disconnect container</summary>
-            <form data-portainer-change="network" data-id="${escapeHtml(id)}">
-              <label>Container ID or name<input name="container" required maxlength="256" autocomplete="off"></label>
-              <label>Action<select name="action"><option value="connect">Connect</option><option value="disconnect">Disconnect</option></select></label>
-              <p class="am-field-hint">Changes connectivity on this bridge network only. Disconnecting can interrupt existing services. No host ports are published.</p>
-              <button type="submit" class="am-button am-button--primary">Apply connection change</button>
-            </form>
-          </details>`;
-        } else if (resource === "stacks") {
-          controls += `<button class="am-button am-button--quiet" type="button" data-resource-action="file" data-id="${escapeHtml(id)}">View Compose file</button>`;
-        }
-      } else if (provider === "npm") {
-        controls = `${resource === "certificates" ? "" : `<details class="am-row-editor"><summary>Edit JSON</summary>
-            <form data-npm-update data-id="${escapeHtml(id)}">
-              <label>API payload (JSON)<textarea name="body" rows="8" required spellcheck="false">${escapeHtml(JSON.stringify(item, null, 2))}</textarea></label>
-              <button type="submit" class="am-button am-button--primary">Save changes</button>
-            </form>
-          </details>`}
-          <button class="am-button am-button--danger" type="button" data-resource-action="delete" data-id="${escapeHtml(id)}">Delete</button>`;
+    return address;
+  }
+
+  function renderManagers() {
+    for (const [provider, name] of [["portainer", "Portainer"], ["npm", "Nginx Proxy Manager"]]) {
+      let address = "";
+      let message = `${name} is not configured. Set its browser URL in Settings, or leave it empty to keep it unconfigured.`;
+      try {
+        address = managerUrl(state.settings.integrations?.[`${provider}_url`]);
+      } catch (_error) {
+        message = `The configured ${name} URL is invalid. Update its browser URL in Settings.`;
       }
-      return `<tr>
-        <td><strong>${escapeHtml(integrationLabel(provider, resource, item))}</strong></td>${cells}
-        <td class="am-resource-actions">${controls || "—"}</td>
-      </tr>`;
-    }).join("");
-    return `${dockerCreator}${createRoute}${createEditor}<div class="am-deployment-table-wrap am-resource-table-wrap"><table class="table">
-      <thead><tr><th>Name</th>${header}<th>Actions</th></tr></thead><tbody>${body}</tbody>
-    </table></div>`;
-  }
-
-  function renderInfrastructure() {
-    const host = byId("integrationPanel");
-    if (!host) return;
-    const settings = state.settings.integrations || {};
-    const provider = state.integration.provider;
-    const current = state.integration[provider];
-    const isConnected = provider === "portainer" ? Boolean(current.token) : Boolean(current.username && current.password);
-    const configured = provider === "portainer" ? settings.portainer_url : settings.npm_url;
-    const serviceName = provider === "portainer" ? "Portainer" : "Nginx Proxy Manager";
-    const providerChoices = [
-      ["portainer", "Portainer", "boxes"],
-      ["npm", "Nginx Proxy Manager", "globe"],
-    ];
-    const serviceCards = providerChoices.map(([key, label, symbol]) => `
-      <button type="button" class="am-integration-choice${provider === key ? " is-active" : ""}" data-integration-provider="${key}" aria-pressed="${provider === key}">
-        <span class="am-integration-choice__icon">${icon(symbol)}</span>
-        <span><strong>${label}</strong><small>${key === "portainer" ? "Docker environments" : "Proxy hosts, certificates and access"}</small></span>
-        <span class="am-status-pill" data-status="${state.integration[key].data ? "running" : "unknown"}">${state.integration[key].data ? "Connected" : "Not connected"}</span>
-      </button>`).join("");
-    let panelContent = "";
-    if (!configured) {
-      panelContent = `<div class="am-integration-connect am-empty-state">
-        <span class="am-empty-state__icon">${icon("key-round")}</span>
-        <h3>Connect ${serviceName}</h3>
-        <p>Save its API URL in Settings to begin. API credentials are not saved.</p>
-        <button type="button" class="am-button am-button--primary" data-go-settings>Open Settings</button>
-      </div>`;
-    } else if (!isConnected) {
-      panelContent = provider === "portainer" ? `
-        <form id="portainerConnectionForm" class="am-integration-connect" data-integration-connect="portainer" autocomplete="on">
-          <span class="am-integration-eyebrow">PORTAINER API</span>
-          <h3>Connect to Docker</h3>
-          <p>Save this account and API key in your browser's password manager, then select that saved entry next time. App Manager itself keeps the key only for this page session, not in server files.</p>
-          <label>Password manager account<input name="username" type="text" autocomplete="username" value="${escapeHtml(`Portainer API key: ${configured}`)}" readonly></label>
-          <label>API key<input name="token" type="password" autocomplete="current-password" required maxlength="4096" placeholder="ptr_…"></label>
-          <button type="submit" class="am-button am-button--primary">Connect</button>
-        </form>` : `
-        <form class="am-integration-connect" data-integration-connect="npm">
-          <span class="am-integration-eyebrow">NGINX PROXY MANAGER API</span>
-          <h3>Connect to your proxy</h3>
-          <p>Sign in with a Nginx Proxy Manager account. Credentials stay in this page's memory and are cleared when you reload or close Cockpit.</p>
-          <div class="am-form-grid">
-            <label>Email or username<input name="username" type="text" autocomplete="username" required maxlength="320"></label>
-            <label>Password<input name="password" type="password" autocomplete="current-password" required maxlength="4096"></label>
-          </div>
-          <button type="submit" class="am-button am-button--primary">Connect</button>
-        </form>`;
-    } else {
-      const resourceOptions = integrationResources[provider].map(([value, label]) => `<option value="${value}"${current.resource === value ? " selected" : ""}>${label}</option>`).join("");
-      const endpoints = provider === "portainer" ? current.endpoints : [];
-      const environmentSelector = provider === "portainer" ? `
-        <label class="am-resource-select">Environment<select data-integration-endpoint>
-          ${endpoints.map((endpoint) => `<option value="${escapeHtml(endpoint.Id)}"${String(endpoint.Id) === String(current.endpointId) ? " selected" : ""}>${escapeHtml(endpoint.Name || `Environment ${endpoint.Id}`)} · ${escapeHtml(endpoint.Status || "unknown")}</option>`).join("")}
-        </select></label>` : "";
-      panelContent = `<div class="am-resource-toolbar">
-        ${environmentSelector}
-        <label class="am-resource-select">Resource<select data-integration-resource>${resourceOptions}</select></label>
-        <button type="button" class="am-button" data-resource-refresh>${icon("refresh-cw")} Refresh data</button>
-        <button type="button" class="am-button am-button--quiet" data-disconnect="${provider}">Disconnect</button>
-      </div>
-      <div id="integrationResourceContent">${renderIntegrationTable(provider, current)}</div>`;
+      byId(`${provider}Panel`).innerHTML = `
+        <div class="am-surface am-manager-landing">
+          <p>Manage ${provider === "portainer" ? "containers in Portainer" : "domains, certificates, and proxy routing in Nginx Proxy Manager"} using its own interface. App Manager does not embed it or access its API or credentials.</p>
+          ${address
+            ? `<p class="am-manager-address">${escapeHtml(address)}</p><a class="am-button am-button--primary" href="${escapeHtml(address)}" target="_blank" rel="noopener noreferrer">Open ${name} (new tab) ${icon("arrow-up-right")}</a>`
+            : `<p role="status">${escapeHtml(message)}</p><button type="button" class="am-button" data-go-settings>Open Settings</button>`}
+        </div>`;
     }
-    host.innerHTML = `<div class="am-infrastructure-grid">
-      <aside class="am-integration-sidebar" aria-label="Connected services">${serviceCards}
-        <div class="am-integration-safety">${icon("shield-check")} <span>API credentials are session-only. Destructive actions ask for confirmation.</span></div>
-      </aside>
-      <section class="am-surface am-integration-workspace">
-        <div class="am-integration-workspace__heading"><div><p class="am-integration-eyebrow">SERVICE CONSOLE</p><h3>${serviceName}</h3><span class="am-field-hint">${escapeHtml(configured || "")}</span></div>
-          ${provider === "portainer" ? '<a class="am-button am-button--quiet" href="/manage-docker/" target="_blank" rel="noopener noreferrer">Open Portainer</a>' : ""}
-          <span class="am-status-pill" data-status="${isConnected ? "running" : configured ? "stopped" : "unknown"}">${isConnected ? "Connected for this session" : configured ? "Needs connection" : "Not configured"}</span>
-        </div>${panelContent}
-      </section>
-    </div>`;
     renderIcons();
-  }
-
-  async function loadIntegrationResource() {
-    const { provider } = state.integration;
-    const connection = state.integration[provider];
-    const extra = provider === "portainer" ? { endpoint_id: connection.endpointId } : {};
-    const result = await integrationCall(provider, "list", connection.resource, extra);
-    connection.data = result.data;
-  }
-
-  async function connectIntegration(form) {
-    const provider = form.dataset.integrationConnect;
-    const connection = state.integration[provider];
-    try {
-      if (provider === "portainer") {
-        connection.token = form.elements.token.value;
-        const result = await integrationCall(provider, "list", "endpoints");
-        connection.endpoints = integrationRows(result.data);
-        if (!connection.endpoints.length) throw new Error("Portainer returned no environments for this account.");
-        connection.endpointId = String(connection.endpoints[0].Id);
-        connection.resource = "containers";
-      } else {
-        connection.username = form.elements.username.value;
-        connection.password = form.elements.password.value;
-        connection.resource = "proxy-hosts";
-      }
-      await loadIntegrationResource();
-    } catch (error) {
-      connection.token = "";
-      connection.username = "";
-      connection.password = "";
-      connection.data = null;
-      throw error;
-    }
-    form.reset();
-    renderInfrastructure();
-  }
-
-  async function runIntegrationAction(button) {
-    const { provider } = state.integration;
-    const connection = state.integration[provider];
-    const action = button.dataset.resourceAction;
-    const id = button.dataset.id;
-    if (["remove", "delete", "kill"].includes(action) &&
-      !window.confirm(action === "kill"
-        ? "Force-stop this container immediately? Unsaved application work may be lost."
-        : `Permanently ${action === "delete" ? "delete" : "remove"} this ${connection.resource} resource? This cannot be undone.`)) return;
-    if (integrationReadTitles[action]) {
-      const result = await integrationCall(provider, action, connection.resource, {
-        endpoint_id: connection.endpointId, id,
-      });
-      openDialog(`${integrationReadTitles[action]}: ${id}`,
-        `<pre class="am-log-output">${escapeHtml(typeof result.data === "string" ? result.data : JSON.stringify(result.data, null, 2) || "No data returned")}</pre>`);
-      return;
-    }
-    await integrationCall(provider, action, connection.resource, {
-      endpoint_id: connection.endpointId, id,
-    });
-    await loadIntegrationResource();
-  }
-
-  async function refreshAfterDockerChange(change) {
-    try {
-      await loadIntegrationResource();
-    } catch (error) {
-      throw new Error(`Docker ${change} succeeded, but refreshing failed: ${error.message}. Check the resource list before retrying.`);
-    }
-  }
-
-  function npmRoutePayload(form) {
-    const domainNames = Array.from(new Set(form.elements.domain_names.value
-      .split(",").map((domain) => domain.trim()).filter(Boolean)));
-    if (!domainNames.length) throw new Error("Enter at least one domain name.");
-    const forwardHost = form.elements.forward_host.value.trim();
-    if (!forwardHost) throw new Error("Enter a host that NPM can reach.");
-    const forwardPort = Number(form.elements.forward_port.value);
-    if (!Number.isInteger(forwardPort) || forwardPort < 1 || forwardPort > 65535) {
-      throw new Error("Forward port must be a whole number from 1 to 65535.");
-    }
-    return {
-      domain_names: domainNames,
-      forward_scheme: form.elements.forward_scheme.value,
-      forward_host: forwardHost,
-      forward_port: forwardPort,
-      access_list_id: 0,
-      certificate_id: 0,
-      ssl_forced: false,
-      caching_enabled: false,
-      block_exploits: form.elements.block_exploits.checked,
-      advanced_config: "",
-      meta: { letsencrypt_agree: false, dns_challenge: false },
-      allow_websocket_upgrade: form.elements.allow_websocket_upgrade.checked,
-      http2_support: false,
-      hsts_enabled: false,
-      hsts_subdomains: false,
-      enabled: true,
-    };
-  }
-
-  function bindInfrastructure() {
-    const host = byId("integrationPanel");
-    host.addEventListener("click", (event) => {
-      const target = event.target instanceof Element ? event.target.closest("button") : null;
-      if (!target || state.busy) return;
-      if (target.dataset.integrationProvider) {
-        state.integration.provider = target.dataset.integrationProvider;
-        renderInfrastructure();
-      } else if (target.hasAttribute("data-go-settings")) {
-        byId("tab-settings").click();
-      } else if (target.dataset.disconnect) {
-        const connection = state.integration[target.dataset.disconnect];
-        connection.token = "";
-        connection.username = "";
-        connection.password = "";
-        connection.data = null;
-        renderInfrastructure();
-      } else if (target.hasAttribute("data-resource-refresh")) {
-        void runOperation(loadIntegrationResource, "Resource list refreshed.", false).then(renderInfrastructure);
-      } else if (target.dataset.resourceAction) {
-        const notice = integrationReadTitles[target.dataset.resourceAction] ? "" : "Infrastructure resource updated.";
-        void runOperation(() => runIntegrationAction(target), notice, false).then(renderInfrastructure);
-      }
-    });
-    host.addEventListener("change", (event) => {
-      if (state.busy) return;
-      const target = event.target;
-      const provider = state.integration.provider;
-      const connection = state.integration[provider];
-      if (target.matches("[data-route-app]")) {
-        connection.routeAppId = target.value;
-        const selected = target.selectedOptions[0];
-        target.form.elements.forward_port.value = selected?.dataset.forwardPort || "";
-        return;
-      }
-      if (target.matches("[data-integration-endpoint]")) connection.endpointId = target.value;
-      else if (target.matches("[data-integration-resource]")) connection.resource = target.value;
-      else return;
-      void runOperation(loadIntegrationResource, "", false).then(renderInfrastructure);
-    });
-    host.addEventListener("submit", (event) => {
-      const form = event.target;
-      if (!(form instanceof HTMLFormElement) || state.busy) return;
-      event.preventDefault();
-      const route = form.matches("[data-npm-route]");
-      if (form.matches("[data-integration-connect]")) {
-        void runOperation(() => connectIntegration(form), "Connected to the service.", false).then(renderInfrastructure);
-        return;
-      }
-      if (form.matches("[data-portainer-change]")) {
-        const connection = state.integration.portainer;
-        const body = Object.fromEntries(new FormData(form).entries());
-        const action = form.dataset.portainerChange === "network" ? body.action : form.dataset.portainerChange;
-        delete body.action;
-        if (action === "disconnect" && !window.confirm(`Disconnect container "${body.container}" from this network? This can interrupt existing services.`)) return;
-        if (action === "rename" && !window.confirm("Rename this container? Scripts or service automation using its old name may stop working.")) return;
-        void runOperation(async () => {
-          await integrationCall("portainer", action, connection.resource, {
-            endpoint_id: connection.endpointId, id: form.dataset.id, body,
-          });
-          await refreshAfterDockerChange(action);
-        }, "Docker resource updated.", false).then((success) => { if (success) renderInfrastructure(); });
-        return;
-      }
-      if (form.matches("[data-portainer-create]")) {
-        const connection = state.integration.portainer;
-        const resource = connection.resource;
-        const pulling = resource === "images";
-        const body = Object.fromEntries(new FormData(form).entries());
-        void runOperation(async () => {
-          if (resource === "networks") body.internal = form.elements.internal.checked;
-          if (resource === "containers") {
-            for (const key of ["host_port", "container_port"]) {
-              if (body[key] === "") delete body[key];
-              else body[key] = Number(body[key]);
-            }
-          }
-          const result = await integrationCall("portainer", pulling ? "pull" : "create", resource, {
-            endpoint_id: connection.endpointId, body,
-          });
-          await refreshAfterDockerChange(pulling ? "image pull" : "resource creation");
-          const warnings = result.data?.Warnings || (result.data?.Warning ? [result.data.Warning] : []);
-          showNotice(`${pulling ? "Image pulled." : resource === "containers" ? "Container created stopped. Review it before starting." : "Docker resource created."}${warnings.length ? ` Warnings: ${warnings.join("; ")}` : ""}`);
-        }, "", false).then((success) => { if (success) renderInfrastructure(); });
-        return;
-      }
-      const create = form.matches("[data-npm-create]");
-      const update = form.matches("[data-npm-update]");
-      if (route || create || update) {
-        void runOperation(async () => {
-          let body;
-          if (route) {
-            body = npmRoutePayload(form);
-          } else {
-            try { body = JSON.parse(form.elements.body.value); } catch (error) {
-              throw new Error(`Resource data must be valid JSON: ${error.message}`);
-            }
-          }
-          if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Resource data must be a JSON object.");
-          const connection = state.integration.npm;
-          await integrationCall("npm", route || create ? "create" : "update",
-            route ? "proxy-hosts" : connection.resource, {
-            ...(update ? { id: form.dataset.id } : {}), body,
-          });
-          await loadIntegrationResource();
-          if (route) connection.routeAppId = "";
-        }, route ? "Proxy route created in NPM." : create ? "Resource created." : "Resource updated.", false).then(renderInfrastructure);
-      }
-    });
   }
 
   function renderSettings(data) {
@@ -868,8 +415,6 @@
     state.settings = config;
     const forms = Array.from(document.querySelectorAll("#settingsForm, #integrationSettingsForm"));
     if (forms.some((form) => Array.from(form.elements).some((input) => input.name && input.value !== input.defaultValue))) return;
-    const serviceAddress = (value = "") => value.startsWith(`${window.location.origin}/`)
-      ? value.slice(window.location.origin.length) : value;
     byId("settingsPanel").innerHTML = `
       <section class="am-surface am-settings">
         <div class="am-surface-heading">
@@ -907,19 +452,17 @@
       <section class="am-surface am-integration-settings">
         <div class="am-surface-heading">
           <div>
-            <h3>Infrastructure APIs</h3>
-            <p>Portainer API calls go directly to the local service, not through the browser's Cloudflare route. API keys and passwords are requested when you connect and are kept in memory for this Cockpit page.</p>
+            <h3>External managers</h3>
+            <p>Open Portainer and Nginx Proxy Manager in their own browser tabs. Sign in there; App Manager never requests their credentials or calls their APIs.</p>
           </div>
         </div>
         <form id="integrationSettingsForm" class="am-settings-form">
           <div class="am-form-grid">
-            <label for="settingPortainerUrl">Portainer backend API URL<input id="settingPortainerUrl" name="portainer_url" type="url" inputmode="url" placeholder="http://127.0.0.1:9000" aria-describedby="portainerApiHint" value="${escapeHtml(config.integrations?.portainer_url || "")}"></label>
-            <label for="settingNpmUrl">Nginx Proxy Manager route or full URL<input id="settingNpmUrl" name="npm_url" type="text" inputmode="url" placeholder="/nginx/" aria-describedby="integrationAddressHint" value="${escapeHtml(serviceAddress(config.integrations?.npm_url))}"></label>
+            <label for="settingPortainerUrl">Portainer browser URL<input id="settingPortainerUrl" name="portainer_url" type="text" inputmode="url" placeholder="/manage-docker/" aria-describedby="integrationAddressHint" value="${escapeHtml(config.integrations?.portainer_url || "")}"></label>
+            <label for="settingNpmUrl">Nginx Proxy Manager browser URL<input id="settingNpmUrl" name="npm_url" type="text" inputmode="url" placeholder="/nginx/" aria-describedby="integrationAddressHint" value="${escapeHtml(config.integrations?.npm_url || "")}"></label>
           </div>
-          <p id="portainerApiHint" class="am-field-hint">For Portainer on this Ubuntu host, use http://127.0.0.1:9000 with no /manage-docker, /portainer, or /api suffix. Open Portainer uses /manage-docker/ in your browser; the backend uses the local API address.</p>
-          <p id="integrationAddressHint" class="am-field-hint">Nginx Proxy Manager routes starting with / use <strong>${escapeHtml(window.location.origin)}</strong>, including its port. The route must allow backend API access without browser login cookies. A full HTTP(S) API URL reachable from the host also works. Do not include /api; API paths are added automatically. Leave blank to disconnect a service.</p>
-          <p class="am-field-hint">Use the address reachable from this Ubuntu host. HTTPS certificates are verified and redirects are not followed. HTTP does not encrypt credentials; use it only on a trusted local network.</p>
-          <div class="am-form-actions"><button type="submit" class="am-button am-button--primary">Save API URLs</button></div>
+          <p id="integrationAddressHint" class="am-field-hint">Use an absolute HTTP(S) URL reachable from your browser or a root-relative path such as /nginx/. Root-relative paths use the current Cockpit browser origin, including its port. Credentials, queries, fragments, control characters, backslashes, and paths starting with // are not allowed. Trailing slashes are preserved. Leave a URL empty to keep that manager unconfigured. Prefer HTTPS for remote access.</p>
+          <div class="am-form-actions"><button type="submit" class="am-button am-button--primary">Save manager URLs</button></div>
         </form>
       </section>
     `;
@@ -942,25 +485,13 @@
       const integrations = Object.fromEntries(new FormData(form).entries());
       void runOperation(async () => {
         for (const key of Object.keys(integrations)) {
-          const value = integrations[key].trim();
-          integrations[key] = key === "npm_url" && value.startsWith("/") && !value.startsWith("//")
-            ? `${window.location.origin}${value}` : value;
+          integrations[key] = managerUrl(integrations[key]);
         }
-        const previous = state.settings.integrations || {};
         const result = await callBackend("settings", [JSON.stringify({ integrations })]);
         state.settings = result.config || state.settings;
-        if (previous.portainer_url !== state.settings.integrations?.portainer_url) {
-          state.integration.portainer.token = "";
-          state.integration.portainer.data = null;
-        }
-        if (previous.npm_url !== state.settings.integrations?.npm_url) {
-          state.integration.npm.username = "";
-          state.integration.npm.password = "";
-          state.integration.npm.data = null;
-        }
         Array.from(form.elements).forEach((input) => { if (input.name) input.defaultValue = input.value; });
-        renderInfrastructure();
-      }, "Infrastructure API URLs saved.");
+        renderManagers();
+      }, "External manager URLs saved.");
     });
   }
 
@@ -976,7 +507,7 @@
       renderOverview(overview);
       renderDeployments(deployments);
       renderSettings(settings);
-      renderInfrastructure();
+      renderManagers();
       byId("lastRefreshed").textContent = `Updated ${new Intl.DateTimeFormat(undefined, { timeStyle: "short" }).format(new Date())}`;
       renderIcons();
       updateConnection("connected", `${state.apps.length} ${state.apps.length === 1 ? "application" : "applications"}`);
@@ -1065,22 +596,12 @@
     let deployAfterSetup = true;
     const collect = (form) => {
       const values = Object.fromEntries(new FormData(form).entries());
-      const { app_directory, go_package, start_command, docker_mode, dockerfile, compose_file, compose_service, container_port, environment, deploy_now, ...payload } = values;
+      const { app_directory, output_directory = "", go_package, start_command = "", environment, deploy_now, ...payload } = values;
       payload.build_config = {};
       if (app_directory.trim()) payload.build_config.app_directory = app_directory.trim();
       if (go_package.trim()) payload.build_config.go_package = go_package.trim();
-      if (payload.framework === "docker") {
-        payload.build_config.docker_mode = docker_mode;
-        if (docker_mode === "compose") {
-          payload.build_config.compose_file = compose_file.trim();
-          payload.build_config.compose_service = compose_service.trim();
-          payload.build_config.container_port = Number(container_port);
-        } else {
-          payload.build_config.dockerfile = dockerfile.trim();
-          payload.build_config.container_port = Number(container_port);
-        }
-      }
-      if (start_command.trim()) {
+      if (payload.framework === "react" && output_directory.trim()) payload.build_config.output_directory = output_directory.trim();
+      if (payload.framework !== "react" && start_command.trim()) {
         let command;
         try { command = JSON.parse(start_command); } catch (_error) { throw new Error('Start command must be a JSON array, such as ["node", "server.js"].'); }
         if (!Array.isArray(command) || !command.length || !command.every((part) => typeof part === "string" && part && !/[\x00-\x1f\x7f]/.test(part))) {
@@ -1133,25 +654,13 @@
     const slugInput = form.elements.namedItem("slug");
     const routeInput = form.elements.namedItem("route");
     const frameworkInput = form.elements.namedItem("framework");
-    const dockerModeInput = form.elements.namedItem("docker_mode");
-    const dockerSetupFields = byId("dockerSetupFields");
-    const dockerfileInput = form.elements.namedItem("dockerfile");
-    const composeFields = byId("composeSetupFields");
-    const composeFileInput = form.elements.namedItem("compose_file");
-    const composeServiceInput = form.elements.namedItem("compose_service");
-    const containerPortInput = form.elements.namedItem("container_port");
     form.elements.namedItem("branch").value = state.settings.default_branch || "main";
-    const updateDockerFields = () => {
-      const isDocker = frameworkInput.value === "docker";
-      const isCompose = isDocker && dockerModeInput.value === "compose";
-      dockerSetupFields.hidden = !isDocker;
-      dockerModeInput.disabled = !isDocker;
-      dockerfileInput.disabled = !isDocker || isCompose;
-      composeFields.hidden = !isCompose;
-      composeFileInput.disabled = !isCompose;
-      composeServiceInput.disabled = !isCompose;
-      composeServiceInput.required = isCompose;
-      containerPortInput.disabled = !isDocker;
+    const updateFrameworkFields = () => {
+      const isReact = frameworkInput.value === "react";
+      byId("reactSetupFields").hidden = !isReact;
+      form.elements.namedItem("output_directory").disabled = !isReact;
+      form.elements.namedItem("start_command").disabled = isReact;
+      form.elements.namedItem("start_command").toggleAttribute("data-unavailable", isReact);
     };
     const showStep = () => {
       form.querySelectorAll("[data-setup-step]").forEach((section) => { section.hidden = Number(section.dataset.setupStep) !== step; });
@@ -1207,20 +716,19 @@
       if (routeInput.dataset.autogenerated === "true") routeInput.value = `/${slugInput.value}/`;
     });
     routeInput.addEventListener("input", () => { routeInput.dataset.autogenerated = "false"; });
-    frameworkInput.addEventListener("change", updateDockerFields);
-    dockerModeInput.addEventListener("change", updateDockerFields);
+    frameworkInput.addEventListener("change", updateFrameworkFields);
     form.elements.namedItem("repo_url").addEventListener("change", (event) => {
       if (!nameInput.value) {
         nameInput.value = event.target.value.split(/[/:]/).pop().replace(/\.git$/, "").replace(/[-_]/g, " ");
         nameInput.dispatchEvent(new Event("input"));
       }
     });
-    updateDockerFields();
+    updateFrameworkFields();
     renderIcons();
   }
 
   function editApplication(app) {
-    const frameworks = ["auto", "nextjs", "go", "node", "python", "static", "docker"];
+    const frameworks = ["auto", "nextjs", "react", "go", "node", "python", "static"];
     const options = frameworks.map((framework) => `
       <option value="${framework}"${app.framework === framework ? " selected" : ""}>${frameworkName(framework)}</option>
     `).join("");
@@ -1234,7 +742,7 @@
         <label>Deployment policy<select name="deployment_mode"><option value="automatic"${app.deployment_mode !== "approval" ? " selected" : ""}>Automatic</option><option value="approval"${app.deployment_mode === "approval" ? " selected" : ""}>Approval required</option></select></label>
         <label class="am-checkbox"><input type="checkbox" name="auto_deploy"${app.auto_deploy !== false ? " checked" : ""}> Automatic deployment</label>
       </div>
-      <small class="am-field-hint">App Manager only configures the application path. Configure domains and routing through NPM in Infrastructure; Next.js receives APP_BASE_PATH during build.</small>
+      <small class="am-field-hint">App Manager only configures the application path. Configure domains and routing separately in Nginx Proxy Manager; Next.js receives APP_BASE_PATH during build.</small>
       <details class="am-advanced"><summary>Build and runtime</summary><div class="am-form-grid">
         <label>Framework<select name="framework">${options}</select></label>
         <label>Port<input type="number" name="port" min="8100" max="8999" value="${escapeHtml(app.port)}" required></label>
@@ -1254,7 +762,7 @@
         <label>Model artifact paths (relative to shared/models)<textarea name="model_files" rows="3">${escapeHtml((app.python_services?.model_files || []).join("\n"))}</textarea></label>
         <label>Upload body limit (MiB)<input name="upload_limit_mb" type="number" min="1" max="1024" value="${escapeHtml(app.python_services?.upload_limit_mb ?? 101)}"></label>
       </div></details>
-      <small class="am-field-hint">Configure authentication or access restrictions through NPM in Infrastructure.</small>
+      <small class="am-field-hint">Configure authentication or access restrictions separately in Nginx Proxy Manager.</small>
       <details class="am-advanced"><summary>Deployment schedule (UTC)</summary><div class="am-form-grid">
         <label>Window start<input type="time" name="window_start" value="${escapeHtml(app.deployment_window?.start || "")}"></label>
         <label>Window end<input type="time" name="window_end" value="${escapeHtml(app.deployment_window?.end || "")}"></label>
@@ -1690,7 +1198,7 @@
     const monitor = { appId, deploymentId, promise: null };
     state.deploymentMonitor = monitor;
     monitor.promise = (async () => {
-      while (state.deploymentMonitor === monitor) {
+      while (state.deploymentMonitor === monitor && !isUnsupportedDeployment(appId, deploymentId)) {
         const logsVisible = byId("appManagerDialog").open && state.logTarget?.appId === appId
           && state.logTarget?.deploymentId === deploymentId;
         try {
@@ -1727,6 +1235,7 @@
   }
 
   async function viewDeploymentLog(appId, deploymentId) {
+    if (isUnsupportedDeployment(appId, deploymentId)) return;
     const args = deploymentId ? [appId, deploymentId] : [appId];
     const result = await callBackend("deployment-logs", args);
     if (!result.deployment_id) {
@@ -1739,7 +1248,8 @@
 
   function resumeActiveDeployment() {
     if (state.deploymentMonitor) return;
-    const active = state.deployments.find((deployment) => deployment.status === "deploying");
+    const active = state.deployments.find((deployment) => deployment.status === "deploying"
+      && !isUnsupportedDeployment(deployment.app_id, deployment.id));
     if (!active) return;
     void monitorDeployment(active.app_id, active.id);
   }
@@ -1848,6 +1358,7 @@
       showError(new Error("Application is no longer in the list. Refresh and try again."));
       return;
     }
+    if (isUnsupportedApp(app)) return;
     if (action === "edit") {
       editApplication(app);
       return;
@@ -1893,7 +1404,7 @@
         const result = await callBackend("health", [appId]);
         await refreshData();
         if (!result.healthy) throw new Error(`Health check failed (${result.url}).`);
-        showNotice(app.framework === "static" && !app.build_config?.start_command
+        showNotice(isStaticApp(app)
           ? "Static release is available."
           : `Runtime health check passed (${result.url}).`);
       }, "", false);
@@ -1958,20 +1469,16 @@
   }
 
   document.querySelector(".am-app-manager").addEventListener("click", (event) => {
+    if (event.target instanceof Element && event.target.closest("[data-go-settings]") && !state.busy) {
+      byId("tab-settings").click();
+      return;
+    }
     const target = event.target instanceof Element ? event.target.closest("[data-open-add]") : null;
     if (!target || state.busy) return;
     openAddApplicationDialog();
   });
   byId("refreshButton").addEventListener("click", () => {
     void runOperation(refreshData, "Application data refreshed.", false);
-  });
-  byId("refreshInfrastructure").addEventListener("click", () => {
-    const connection = state.integration[state.integration.provider];
-    if (!connection.data) {
-      renderInfrastructure();
-      return;
-    }
-    void runOperation(loadIntegrationResource, "Resource list refreshed.", false).then(renderInfrastructure);
   });
   byId("checkUpdateButton").addEventListener("click", checkPluginUpdates);
   byId("appSearch").addEventListener("input", (event) => {
@@ -1999,14 +1506,6 @@
     const button = event.target instanceof Element ? event.target.closest("button[data-action]") : null;
     if (button && !button.disabled && !state.busy) {
       button.closest("details")?.removeAttribute("open");
-      if (button.dataset.action === "route") {
-        state.integration.provider = "npm";
-        state.integration.npm.resource = "proxy-hosts";
-        state.integration.npm.routeAppId = button.dataset.id;
-        byId("tab-infrastructure").click();
-        renderInfrastructure();
-        return;
-      }
       void handleAppAction(button.dataset.action, button.dataset.id, button.dataset.deploymentId).catch(showError);
     }
   });
@@ -2031,6 +1530,7 @@
     if (abortButton && !abortButton.disabled) {
       const appId = abortButton.dataset.appId;
       const deploymentId = abortButton.dataset.deploymentId;
+      if (isUnsupportedDeployment(appId, deploymentId)) return;
       abortButton.dataset.pending = "true";
       abortButton.disabled = true;
       abortButton.textContent = "Aborting…";
@@ -2051,7 +1551,6 @@
   });
   byId("appManagerDialog").addEventListener("cancel", (event) => { if (state.busy) event.preventDefault(); });
   bindTabs();
-  bindInfrastructure();
   renderIcons();
   async function initialize() {
     setBusy(true);

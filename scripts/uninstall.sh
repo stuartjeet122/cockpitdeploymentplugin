@@ -133,7 +133,8 @@ for app in data["apps"]:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1)
-    print("\t".join((app_id, source, production, logs)))
+    support = "unsupported" if app.get("framework") == "docker" else "native"
+    print("\t".join((app_id, source, production, logs, support)))
 PY
 }
 
@@ -215,10 +216,15 @@ remove_managed_app_data() {
   local registry_records
   registry_records="$(parse_registry_records)" || fail "The registry could not be validated; no managed app data was removed."
   local apps_preserved=0
-  local app_id source_dir app_dir app_log_dir
-  while IFS=$'\t' read -r app_id source_dir app_dir app_log_dir; do
+  local app_id source_dir app_dir app_log_dir support
+  while IFS=$'\t' read -r app_id source_dir app_dir app_log_dir support; do
     [[ -n "$app_id" ]] || continue
     is_valid_app_id "$app_id" || fail "Invalid application ID in registry."
+    if [[ "$support" == "unsupported" ]]; then
+      log "Preserving unsupported Docker application, services, data, and account: $app_id" >&2
+      apps_preserved=1
+      continue
+    fi
 
     APP_CLEANUP_BLOCKED=0
     remove_managed_unit "$app_id" "@worker"
