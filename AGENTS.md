@@ -41,6 +41,7 @@ If detection is uncertain or the app uses a nonstandard startup pattern, supply 
 - The Cockpit UI is plain HTML/JavaScript in `cockpit/`.
 - The plugin must remain a native Cockpit integration, not a standalone site.
 - UI actions should call the backend with structured JSON input and render backend responses cleanly.
+- The project-directory picker calls `repository-tree` with `{id, repo_url, branch}` over stdin. Browse only validated Git remotes/branches in temporary no-checkout clones as the dedicated app account; never mutate the live source/release. Folder selection configures `build_config.app_directory` for Next.js/React and must preserve other build configuration.
 - Treat the application path as build/runtime configuration only. Portainer and Nginx Proxy Manager tabs only open external browser links configured in Settings; do not embed their interfaces, proxy APIs, collect credentials, create domains, or modify host web-server routing.
 
 ## Security requirements

@@ -1345,6 +1345,76 @@ def git_output(
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def _repository_directories(output: str) -> List[Dict[str, Any]]:
+    if len(output.encode("utf-8")) > 2 * 1024 * 1024:
+        raise ValueError("Repository tree is too large to browse; enter the project directory manually")
+    directories = {"": {"path": "", "has_package_json": False}}
+    if output and not output.endswith("\0"):
+        raise ValueError("Git returned an incomplete repository tree")
+    for entry in output.split("\0"):
+        if not entry:
+            continue
+        header, separator, path = entry.partition("\t")
+        fields = header.split()
+        if not separator or len(fields) != 3:
+            raise ValueError("Git returned an invalid repository tree")
+        mode, kind, _ = fields
+        if mode == "040000" and kind == "tree":
+            _validate_app_directory_setting(path)
+            if len(path) > 256 or path.count("/") >= 32:
+                raise ValueError("Repository folders are too deeply nested or long to browse; enter the project directory manually")
+            directories[path] = {"path": path, "has_package_json": False}
+            if len(directories) > 1000:
+                raise ValueError("Repository has too many folders to browse; enter the project directory manually")
+        elif mode in {"100644", "100755"} and kind == "blob" and path.rpartition("/")[2] == "package.json":
+            parent = path.rpartition("/")[0]
+            if parent not in directories:
+                raise ValueError("Git returned a package.json outside the repository folder tree")
+            directories[parent]["has_package_json"] = True
+    return sorted(directories.values(), key=lambda item: item["path"])
+
+
+def repository_tree(payload: Dict[str, Any]) -> Dict[str, Any]:
+    _require_root()
+    if not isinstance(payload, dict) or set(payload) - {"id", "repo_url", "branch"}:
+        raise ValueError("Repository browsing accepts only id, repo_url, and branch")
+    app_id = validate_app_id(payload.get("id"))
+    repo_url = payload.get("repo_url")
+    if not validate_git_url(repo_url):
+        raise ValueError("Repository URL must be a valid HTTPS or SSH Git remote")
+    config = get_config()
+    branch = validate_branch(payload.get("branch", config["default_branch"]))
+    existing = next((app for app in get_registry()["apps"] if app["id"] == app_id), None)
+    if existing is not None:
+        _find_app({"apps": [existing]}, app_id)
+    source_root = Path(config["source_root"])
+    _assert_no_symlink_components(source_root)
+    _assert_no_symlink_components(_home_path(app_id))
+    ensure_runtime_dirs()
+    try:
+        with _app_lock(app_id, blocking=False):
+            username = ensure_app_user(app_id)
+            os.chmod(_home_path(app_id).parent, 0o711)
+            with tempfile.TemporaryDirectory(prefix=f".browse-{app_id}-", dir=str(source_root)) as temporary:
+                preview = Path(temporary)
+                os.chmod(preview, 0o711)
+                repository = preview / "repository"
+                repository.mkdir(mode=0o750)
+                _chown_tree(repository, username)
+                timeout = int(config["command_timeout_seconds"])
+                clone = _run_as_user(username, [
+                    "git", "-c", "core.hooksPath=/dev/null", "clone",
+                    "--depth", "1", "--filter=blob:none", "--single-branch", "--no-checkout",
+                    "--branch", branch, "--", repo_url, str(repository),
+                ], timeout=timeout)
+                _command_error(clone, "Reading repository folders")
+                tree = _git(repository, username, ["ls-tree", "-r", "-t", "-z", "--full-tree", "HEAD"], timeout)
+                _command_error(tree, "Listing repository folders")
+                return {"ok": True, "directories": _repository_directories(tree.stdout or "")}
+    except BlockingIOError as exc:
+        raise RuntimeError("The application is busy; wait for its current operation before browsing folders") from exc
+
+
 def _routed_health_path(app: Dict[str, Any]) -> str:
     health = app.get("health_check_url") or "/"
     if not isinstance(health, str) or not health.startswith("/") or health.startswith("//"):
@@ -4321,6 +4391,7 @@ def _build_parser() -> argparse.ArgumentParser:
         command.add_argument("--exclude-framework", choices=sorted(FRAMEWORKS))
     commands.add_parser("plugin-update-check")
     commands.add_parser("plugin-update")
+    commands.add_parser("repository-tree")
     deployment_logs = commands.add_parser("deployment-logs")
     deployment_logs.add_argument("app_id")
     deployment_logs.add_argument("deployment_id", nargs="?")
@@ -4383,6 +4454,11 @@ def _dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         return plugin_update_check()
     if args.command == "plugin-update":
         return plugin_update()
+    if args.command == "repository-tree":
+        raw = sys.stdin.read(8193)
+        if len(raw.encode("utf-8")) > 8192:
+            raise ValueError("Repository browsing input must be smaller than 8 KiB")
+        return repository_tree(parse_payload(raw))
     if args.command == "settings":
         if getattr(args, "payload", None) is None:
             return get_settings()

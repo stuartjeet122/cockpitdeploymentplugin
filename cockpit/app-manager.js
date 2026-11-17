@@ -589,6 +589,133 @@
       .replace(/-$/g, "") || "app";
   }
 
+  function bindRepositoryDirectory(form, getId) {
+    const dialog = form.closest("dialog");
+    const directory = form.elements.namedItem("app_directory");
+    const config = form.elements.namedItem("build_config");
+    directory.insertAdjacentHTML("afterend", `
+      <small id="projectDirectoryHint" class="am-field-hint">Choose the folder containing package.json. Applies to Next.js and React, including auto detection of those frameworks; not Node.js or Python. Leave empty for repository root.</small>
+      <button type="button" class="am-button" data-repository-browse>Browse repository folders</button>
+      <small class="am-field-hint">Browsing uses a temporary checkout without registering or deploying an app. It may create the app service account early for private repository access.</small>
+      <p class="am-field-hint" data-repository-status role="status" aria-live="polite"></p>
+      <div class="am-repository-tree" data-repository-tree role="group" aria-label="Repository folders" hidden></div>
+    `);
+    directory.setAttribute("aria-describedby", "projectDirectoryHint");
+    const browse = form.querySelector("[data-repository-browse]");
+    const status = form.querySelector("[data-repository-status]");
+    const tree = form.querySelector("[data-repository-tree]");
+    const identity = () => JSON.stringify({
+      id: getId(), repo_url: form.elements.namedItem("repo_url").value,
+      branch: form.elements.namedItem("branch").value,
+    });
+    let currentIdentity = identity();
+    let request = 0;
+    let closed = false;
+    const syncSelection = () => {
+      tree.querySelectorAll("input[type=radio]").forEach((radio) => {
+        radio.checked = radio.value === directory.value.trim();
+      });
+    };
+    const writeDirectory = (value) => {
+      if (config) {
+        const parsed = parseBuildConfig(config.value);
+        if (value) parsed.app_directory = value;
+        else delete parsed.app_directory;
+        config.value = JSON.stringify(parsed, null, 2);
+      }
+      directory.setCustomValidity("");
+    };
+    directory.addEventListener("input", () => {
+      try { writeDirectory(directory.value.trim()); status.textContent = ""; }
+      catch (error) { directory.setCustomValidity(error.message); status.textContent = error.message; }
+      syncSelection();
+    });
+    config?.addEventListener("input", () => {
+      try {
+        const parsed = parseBuildConfig(config.value);
+        directory.value = typeof parsed.app_directory === "string" ? parsed.app_directory : "";
+        directory.setCustomValidity("");
+        status.textContent = "";
+        syncSelection();
+      } catch (_error) { /* Keep unfinished JSON intact until it is valid. */ }
+    });
+    const invalidate = () => {
+      if (currentIdentity === identity()) return;
+      currentIdentity = identity();
+      request += 1;
+      browse.disabled = false;
+      browse.textContent = "Browse repository folders";
+      tree.replaceChildren();
+      tree.hidden = true;
+      tree.removeAttribute("aria-busy");
+      status.textContent = "Repository changed. Browse again to load its folders.";
+    };
+    form.addEventListener("input", invalidate);
+    form.addEventListener("change", invalidate);
+    dialog.addEventListener("close", () => { closed = true; request += 1; }, { once: true });
+    tree.addEventListener("change", (event) => {
+      if (!event.target.matches("input[type=radio]")) return;
+      try {
+        writeDirectory(event.target.value);
+        directory.value = event.target.value;
+        status.textContent = `Selected ${directory.value || "repository root"}.`;
+      } catch (error) { status.textContent = error.message; }
+      syncSelection();
+    });
+    browse.addEventListener("click", async () => {
+      invalidate();
+      if (browse.disabled || closed) return;
+      const input = identity();
+      const { id, repo_url, branch } = JSON.parse(input);
+      if (!id || !repo_url || !branch) {
+        status.textContent = "Enter an application ID, repository URL and branch first.";
+        return;
+      }
+      const serial = ++request;
+      const isCurrent = () => serial === request && !closed && form.isConnected && dialog.open && identity() === input;
+      browse.disabled = true;
+      browse.textContent = "Loading folders…";
+      tree.hidden = true;
+      tree.setAttribute("aria-busy", "true");
+      status.textContent = "Loading repository folders… Your project directory will not be changed.";
+      try {
+        const result = await callBackendInput("repository-tree", [], input);
+        if (!isCurrent()) return;
+        if (!Array.isArray(result.directories)) throw new Error("Invalid repository folder response.");
+        const nodes = new Map([["", { path: "", children: [], has_package_json: false }]]);
+        for (const entry of result.directories) {
+          if (typeof entry.path !== "string" || entry.path.split("/").some((part) => part === "." || part === "..")) {
+            throw new Error("Invalid repository folder response.");
+          }
+          nodes.set(entry.path, { ...entry, children: [] });
+        }
+        for (const [path, node] of nodes) {
+          if (!path) continue;
+          const parent = nodes.get(path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
+          if (!parent) throw new Error("Invalid repository folder hierarchy.");
+          parent.children.push(node);
+        }
+        const renderNode = (node) => {
+          const label = `${node.path ? node.path.split("/").pop() : "Repository root"}${node.has_package_json ? " (package.json)" : ""}`;
+          const radio = `<label><input type="radio" name="repository_directory_choice" value="${escapeHtml(node.path)}"> ${escapeHtml(label)}</label>`;
+          return `<li>${node.children.length ? `<details open><summary>${escapeHtml(label)}</summary>${radio}<ul>${node.children.map(renderNode).join("")}</ul></details>` : radio}</li>`;
+        };
+        tree.innerHTML = `<ul>${renderNode(nodes.get(""))}</ul>`;
+        tree.hidden = false;
+        syncSelection();
+        status.textContent = "Select a project folder below, or enter its path manually.";
+      } catch (error) {
+        if (isCurrent()) status.textContent = `Could not load repository folders: ${error.message}`;
+      } finally {
+        if (isCurrent()) {
+          browse.disabled = false;
+          browse.textContent = tree.hidden ? "Retry loading folders" : "Reload repository folders";
+          tree.removeAttribute("aria-busy");
+        }
+      }
+    });
+  }
+
   function openAddApplicationDialog() {
     const body = byId("addAppFormTemplate").innerHTML;
     let step = 0;
@@ -596,7 +723,7 @@
     let deployAfterSetup = true;
     const collect = (form) => {
       const values = Object.fromEntries(new FormData(form).entries());
-      const { app_directory, output_directory = "", go_package, start_command = "", environment, deploy_now, ...payload } = values;
+      const { app_directory, repository_directory_choice, output_directory = "", go_package, start_command = "", environment, deploy_now, ...payload } = values;
       payload.build_config = {};
       if (app_directory.trim()) payload.build_config.app_directory = app_directory.trim();
       if (go_package.trim()) payload.build_config.go_package = go_package.trim();
@@ -655,6 +782,7 @@
     const routeInput = form.elements.namedItem("route");
     const frameworkInput = form.elements.namedItem("framework");
     form.elements.namedItem("branch").value = state.settings.default_branch || "main";
+    bindRepositoryDirectory(form, () => slugInput.value);
     const updateFrameworkFields = () => {
       const isReact = frameworkInput.value === "react";
       byId("reactSetupFields").hidden = !isReact;
@@ -690,6 +818,7 @@
           const review = [
             ["Application", setup.payload.name], ["Repository", setup.payload.repo_url], ["Branch", setup.payload.branch],
             ["Framework", frameworkName(setup.payload.framework)], ["Application path", setup.payload.route],
+            ["Project directory", setup.payload.build_config.app_directory || "Repository root"],
             ["Environment", setup.environmentRows.length ? setup.environmentRows.map((row) => row.key).join(", ") : "No variables"],
           ];
           byId("setupReview").innerHTML = review.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
@@ -743,6 +872,10 @@
         <label class="am-checkbox"><input type="checkbox" name="auto_deploy"${app.auto_deploy !== false ? " checked" : ""}> Automatic deployment</label>
       </div>
       <small class="am-field-hint">App Manager only configures the application path. Configure domains and routing separately in Nginx Proxy Manager; Next.js receives APP_BASE_PATH during build.</small>
+      <div class="am-project-directory">
+        <label for="editAppDirectory">Project directory</label>
+        <input id="editAppDirectory" name="app_directory" value="${escapeHtml(app.build_config?.app_directory || "")}" placeholder="Repository root (or apps/web)" autocomplete="off">
+      </div>
       <details class="am-advanced"><summary>Build and runtime</summary><div class="am-form-grid">
         <label>Framework<select name="framework">${options}</select></label>
         <label>Port<input type="number" name="port" min="8100" max="8999" value="${escapeHtml(app.port)}" required></label>
@@ -775,6 +908,8 @@
       const payload = Object.fromEntries(new FormData(form).entries());
       payload.port = Number(payload.port);
       payload.build_config = parseBuildConfig(payload.build_config || "");
+      delete payload.app_directory;
+      delete payload.repository_directory_choice;
       payload.runtime_requirements = parseBuildConfig(payload.runtime_requirements || "{}");
       payload.required_environment = payload.required_environment.split(/[\s,]+/).filter(Boolean);
       payload.storage_directories = payload.storage_directories.split(/[\s,]+/).filter(Boolean);
@@ -809,7 +944,9 @@
         "Application updated.",
       );
     });
-    byId("appManagerDialog").querySelector("form").addEventListener("invalid", (event) => {
+    const form = byId("appManagerDialog").querySelector("form");
+    bindRepositoryDirectory(form, () => app.id);
+    form.addEventListener("invalid", (event) => {
       event.target.closest("details")?.setAttribute("open", "");
     }, true);
   }

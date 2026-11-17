@@ -87,6 +87,30 @@ Removing an application permanently deletes that application's managed source, r
 3. Review the application path, source, and environment variable names. Leave **Deploy now** enabled to save and deploy, or disable it to register without starting a deployment. Follow the deployment log; errors leave the last working release active when recovery succeeds.
 4. Configure domains and routing separately in NPM, opened through the Nginx Proxy Manager tab. Environment edits require a restart or redeployment to affect a running process. The deployment log can be copied or downloaded as a `.txt` file from its dialog. Local health checks use the configured path and do not test external reachability.
 
+### Choosing a project subfolder
+
+For Next.js or React projects inside a repository subfolder, use **Project
+directory → Browse repository folders** during setup or in an existing app's
+**Edit configuration → Build and runtime** section. Expand the folder hierarchy
+and select the directory marked **package.json**. The selection saves
+`build_config.app_directory` and appears in the setup review. Choosing
+**Repository root** clears that setting. Manual entry remains available;
+Node.js, Python, Go, and static adapters do not use this project-directory setting.
+
+Browsing reads the selected branch in a temporary shallow Git clone without
+checking out files, running builds, registering an app, changing the existing
+source checkout, or switching the deployed release. Git runs as the app's
+dedicated unprivileged account, which may be created when you first browse.
+Cancelling setup leaves that account/home in place for private repository
+authentication, but temporary clones are removed after success or failure.
+Private repositories require Git access configured for that account.
+
+Only committed folders are listed; symlinks and submodules are not followed.
+Browsing uses the configured command timeout and rejects trees exceeding
+2 MiB of Git metadata, 1,000 folders including root, 32 folder levels, or
+256-character folder paths. If browsing fails, correct access/repository
+settings and retry, or enter the known relative project path manually.
+
 ## React deployments
 
 Select **React (Vite / Create React App)** in **New application**, or use **Auto detect** for a frontend declaring `react` and either `vite` or `react-scripts`. Next.js, Go, and Python detection take priority. An explicit start command or a nonstandard/production `start` script retains Node.js detection rather than silently dropping its server. For a nested React project, set **Project directory**, such as `frontend`; npm-style workspaces reuse their root package manager and lockfile.
@@ -219,6 +243,7 @@ env-get <app-id> | env-save <app-id>  # env-save reads content from stdin
 remove <app-id>
 settings [<json>]
 plugin-update-check | plugin-update
+repository-tree  # reads {id, repo_url, branch} JSON from stdin
 action <action> <app-id>
 ```
 

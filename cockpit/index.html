@@ -198,10 +198,13 @@
             <input id="appDescription" name="description" placeholder="What does this application do?" />
           </div>
         </div>
+        <div class="am-project-directory">
+          <label for="appDirectory">Project directory <span class="am-optional">Optional</span></label>
+          <input id="appDirectory" name="app_directory" placeholder="Repository root (or apps/web)" autocomplete="off" />
+        </div>
         <details class="am-advanced">
           <summary>Runtime options</summary>
           <div class="am-form-grid">
-            <div class="am-form-grid__wide"><label for="appDirectory">Project directory <span class="am-optional">Optional</span></label><input id="appDirectory" name="app_directory" placeholder="apps/web" autocomplete="off" /></div>
             <div id="reactSetupFields" class="am-form-grid__wide" hidden>
               <label for="appOutputDirectory">React output directory <span class="am-optional">Optional</span></label>
               <input id="appOutputDirectory" name="output_directory" placeholder="dist (Vite) or build (Create React App)" maxlength="256" autocomplete="off" disabled />

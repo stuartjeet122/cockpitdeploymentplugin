@@ -566,6 +566,231 @@ test("App Manager registers React projects with production output settings and n
   } finally { ui.dom.window.close(); }
 });
 
+const repositoryDirectories = [
+  { path: "", has_package_json: false },
+  { path: "apps", has_package_json: false },
+  { path: "apps/web", has_package_json: true },
+  { path: "docs", has_package_json: false },
+];
+
+function openRepositorySetup(ui) {
+  ui.document.querySelector("[data-open-add]").click();
+  const form = ui.document.querySelector(".am-dialog-form");
+  form.elements.repo_url.value = "https://github.com/example/nested.git";
+  form.elements.name.value = "Nested";
+  form.elements.name.dispatchEvent(new ui.window.Event("input"));
+  ui.document.querySelector("#setupNext").click();
+  return form;
+}
+
+function selectRepositoryDirectory(ui, form, path) {
+  const radio = Array.from(form.querySelectorAll("[data-repository-tree] input"))
+    .find((input) => input.value === path);
+  assert.ok(radio, `Folder ${path} should be selectable`);
+  radio.checked = true;
+  radio.dispatchEvent(new ui.window.Event("change", { bubbles: true }));
+}
+
+test("setup browses a nested folder tree and submits the selected project directory", async () => {
+  const ui = await loadUi({
+    "repository-tree": { directories: repositoryDirectories },
+    add: (record) => ({ app: { ...JSON.parse(record.values[0]), id: "nested" } }),
+  });
+  try {
+    const form = openRepositorySetup(ui);
+    assert.equal(form.elements.app_directory.closest(".am-advanced"), null);
+    assert.match(form.querySelector("#projectDirectoryHint").textContent, /Next.js and React/);
+    form.querySelector("[data-repository-browse]").click();
+    await settle(ui.window);
+    const record = ui.calls.find((call) => call.command === "repository-tree");
+    assert.deepEqual(record.values, []);
+    assert.deepEqual(JSON.parse(record.input), {
+      id: "nested", repo_url: form.elements.repo_url.value, branch: "main",
+    });
+    const web = form.querySelector('[data-repository-tree] input[value="apps/web"]');
+    assert.match(web.closest("label").textContent, /web \(package.json\)/);
+    assert.equal(web.closest("details").querySelector("summary").textContent, "apps");
+    assert.ok(web.closest("details").parentElement.closest("details"));
+    selectRepositoryDirectory(ui, form, "apps/web");
+    assert.equal(form.elements.app_directory.value, "apps/web");
+    form.elements.deploy_now.checked = false;
+    ui.document.querySelector("#setupNext").click();
+    assert.match(ui.document.querySelector("#setupReview").textContent, /Project directoryapps\/web/);
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const payload = JSON.parse(ui.calls.find((call) => call.command === "add").values[0]);
+    assert.deepEqual(payload.build_config, { app_directory: "apps/web" });
+    assert.equal("repository_directory_choice" in payload, false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("setup root selection omits app_directory from the registration payload", async () => {
+  const ui = await loadUi({
+    "repository-tree": { directories: repositoryDirectories },
+    add: () => ({ app: { id: "nested" } }),
+  });
+  try {
+    const form = openRepositorySetup(ui);
+    form.querySelector("[data-repository-browse]").click();
+    await settle(ui.window);
+    selectRepositoryDirectory(ui, form, "apps/web");
+    selectRepositoryDirectory(ui, form, "");
+    assert.equal(form.elements.app_directory.value, "");
+    form.elements.deploy_now.checked = false;
+    ui.document.querySelector("#setupNext").click();
+    assert.match(ui.document.querySelector("#setupReview").textContent, /Project directoryRepository root/);
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.deepEqual(JSON.parse(ui.calls.find((call) => call.command === "add").values[0]).build_config, {});
+  } finally { ui.dom.window.close(); }
+});
+
+test("edit synchronizes the directory and JSON while preserving other build settings", async () => {
+  const ui = await loadUi({
+    list: { apps: [{ ...fixtureApps[0], build_config: { app_directory: "old", output_directory: "dist", custom: { keep: true } } }] },
+    "repository-tree": { directories: repositoryDirectories },
+  });
+  try {
+    ui.document.querySelector('[data-action="edit"][data-id="portal"]').click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    const config = form.elements.build_config;
+    assert.equal(form.elements.app_directory.value, "old");
+    form.querySelector("[data-repository-browse]").click();
+    await settle(ui.window);
+    assert.equal(JSON.parse(ui.calls.find((call) => call.command === "repository-tree").input).id, "portal");
+    config.value = JSON.stringify({ app_directory: "manual", output_directory: "build", custom: { keep: true } });
+    config.dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+    assert.equal(form.elements.app_directory.value, "manual");
+    selectRepositoryDirectory(ui, form, "apps/web");
+    assert.deepEqual(JSON.parse(config.value), {
+      app_directory: "apps/web", output_directory: "build", custom: { keep: true },
+    });
+    form.elements.app_directory.value = "typed";
+    form.elements.app_directory.dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+    assert.equal(JSON.parse(config.value).app_directory, "typed");
+    config.value = JSON.stringify({ ...JSON.parse(config.value), app_directory: "from-json" });
+    config.dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+    assert.equal(form.elements.app_directory.value, "from-json");
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    const payload = JSON.parse(ui.calls.find((call) => call.command === "edit").values[1]);
+    assert.deepEqual(payload.build_config, {
+      app_directory: "from-json", output_directory: "build", custom: { keep: true },
+    });
+    assert.equal("app_directory" in payload, false);
+    assert.equal("repository_directory_choice" in payload, false);
+  } finally { ui.dom.window.close(); }
+});
+
+test("edit root selection removes only app_directory and does not replace invalid JSON", async () => {
+  const ui = await loadUi({
+    list: { apps: [{ ...fixtureApps[0], build_config: { app_directory: "apps/web", output_directory: "dist" } }] },
+    "repository-tree": { directories: repositoryDirectories },
+  });
+  try {
+    ui.document.querySelector('[data-action="edit"][data-id="portal"]').click();
+    const form = ui.document.querySelector(".am-dialog-form");
+    form.querySelector("[data-repository-browse]").click();
+    await settle(ui.window);
+    const config = form.elements.build_config;
+    config.value = '{"unfinished":';
+    config.dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+    selectRepositoryDirectory(ui, form, "");
+    assert.equal(config.value, '{"unfinished":');
+    assert.equal(form.elements.app_directory.value, "apps/web");
+    assert.match(form.querySelector("[data-repository-status]").textContent, /valid JSON/);
+    config.value = '{"app_directory":"apps/web","output_directory":"dist"}';
+    config.dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+    selectRepositoryDirectory(ui, form, "");
+    assert.deepEqual(JSON.parse(config.value), { output_directory: "dist" });
+    assert.equal(form.elements.app_directory.value, "");
+    form.dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true }));
+    await settle(ui.window);
+    assert.deepEqual(JSON.parse(ui.calls.find((call) => call.command === "edit").values[1]).build_config, { output_directory: "dist" });
+  } finally { ui.dom.window.close(); }
+});
+
+test("repository browsing exposes loading, errors and retry without duplicate requests or overwriting edits", async () => {
+  const pending = [];
+  const ui = await loadUi({ "repository-tree": () => new Promise((resolve) => pending.push(resolve)) });
+  try {
+    const form = openRepositorySetup(ui);
+    const browse = form.querySelector("[data-repository-browse]");
+    browse.click();
+    browse.dispatchEvent(new ui.window.Event("click"));
+    await settle(ui.window);
+    assert.equal(pending.length, 1);
+    assert.equal(browse.disabled, true);
+    assert.match(form.querySelector("[data-repository-status]").textContent, /Loading repository folders/);
+    pending.shift()({ ok: false, error: "Private repository access denied" });
+    await settle(ui.window);
+    assert.equal(browse.disabled, false);
+    assert.match(browse.textContent, /Retry/);
+    assert.match(form.querySelector("[data-repository-status]").textContent, /Private repository access denied/);
+    browse.click();
+    await settle(ui.window);
+    form.elements.app_directory.value = "typed-while-loading";
+    form.elements.app_directory.dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+    pending.shift()({ directories: repositoryDirectories });
+    await settle(ui.window);
+    assert.equal(form.elements.app_directory.value, "typed-while-loading");
+    assert.equal(form.querySelectorAll("[data-repository-tree] input:checked").length, 0);
+    assert.equal(ui.calls.filter((call) => call.command === "repository-tree").length, 2);
+    assert.equal(ui.calls.some((call) => ["add", "edit", "deploy"].includes(call.command)), false);
+  } finally { ui.dom.window.close(); }
+});
+
+for (const field of ["repo_url", "branch", "slug"]) {
+  test(`repository browsing ignores stale results after changing ${field}`, async () => {
+    const pending = [];
+    const ui = await loadUi({ "repository-tree": () => new Promise((resolve) => pending.push(resolve)) });
+    try {
+      const form = openRepositorySetup(ui);
+      const browse = form.querySelector("[data-repository-browse]");
+      browse.click();
+      await settle(ui.window);
+      form.elements[field].value += "-new";
+      form.elements[field].dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+      assert.equal(browse.disabled, false);
+      browse.click();
+      await settle(ui.window);
+      pending.shift()({ directories: repositoryDirectories });
+      await settle(ui.window);
+      assert.equal(browse.disabled, true);
+      assert.equal(form.querySelector("[data-repository-tree]").hidden, true);
+      pending.shift()({ directories: [{ path: "", has_package_json: true }] });
+      await settle(ui.window);
+      assert.equal(browse.disabled, false);
+      assert.equal(form.querySelector('[data-repository-tree] input[value="apps/web"]'), null);
+      assert.match(form.querySelector("[data-repository-tree]").textContent, /Repository root \(package.json\)/);
+    } finally { ui.dom.window.close(); }
+  });
+}
+
+for (const closeFirst of [true, false]) {
+  test(`repository browsing cannot change a ${closeFirst ? "closed and reopened" : "replaced"} dialog`, async () => {
+    let finish;
+    const ui = await loadUi({ "repository-tree": () => new Promise((resolve) => { finish = resolve; }) });
+    try {
+      const oldForm = openRepositorySetup(ui);
+      oldForm.querySelector("[data-repository-browse]").click();
+      await settle(ui.window);
+      if (closeFirst) ui.document.querySelector("#appManagerDialog").close();
+      ui.document.querySelector('[data-action="edit"][data-id="portal"]').click();
+      const form = ui.document.querySelector(".am-dialog-form");
+      form.elements.app_directory.value = "keep";
+      form.elements.app_directory.dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+      finish({ directories: repositoryDirectories });
+      await settle(ui.window);
+      assert.equal(ui.document.querySelector("#appManagerDialogTitle").textContent, "Edit application");
+      assert.equal(form.elements.app_directory.value, "keep");
+      assert.equal(form.querySelector("[data-repository-tree]").hidden, true);
+      assert.equal(form.querySelector("[data-repository-status]").textContent, "");
+      assert.equal(oldForm.querySelector("[data-repository-tree]").hidden, true);
+    } finally { ui.dom.window.close(); }
+  });
+}
+
 test("React and exported frontends display static content without runtime or NPM proxy controls", async () => {
   const apps = [
     { ...fixtureApps[0], id: "react", name: "React Shop", framework: "react", static_export: true, static_root: "frontend/dist" },

@@ -83,6 +83,114 @@ class AppManagerTests(unittest.TestCase):
                     (repo / filename).write_text(contents, encoding="utf-8")
                 self.assertEqual(detect_framework(repo), expected)
 
+    def test_repository_tree_lists_nested_projects_without_checkout_or_registration(self):
+        repository = Path(self.temp_dir.name) / "remote"
+        repository.mkdir()
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(repository), *args],
+                capture_output=True, text=True, check=True, timeout=10,
+            )
+        git("init", "-q")
+        git("checkout", "-b", "main")
+        for name, contents in {
+            "apps/web/package.json": '{"dependencies":{"react":"^19","vite":"^7"}}',
+            "apps/web/src/app.js": "export default 1;",
+            "backend/app.py": "pass",
+            "README.md": "Example",
+        }.items():
+            path = repository / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents, encoding="utf-8")
+        git("add", ".")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Fixture")
+        app_id = "nested-project"
+        live_source = Path(manager.DEFAULT_SOURCE_ROOT) / app_id
+        live_source.mkdir(parents=True)
+        sentinel = live_source / "local-changes.txt"
+        sentinel.write_text("Do not touch", encoding="utf-8")
+        manager.get_registry()
+        before = Path(manager.DEFAULT_REGISTRY_PATH).read_bytes()
+        home = manager._home_path(app_id)
+        home.mkdir(parents=True)
+        commands = []
+        def run_as_user(username, args, **kwargs):
+            self.assertEqual(username, "app-nested-project")
+            commands.append(list(args))
+            actual = list(args)
+            if "clone" in actual:
+                self.assertIn("--no-checkout", actual)
+                self.assertIn("--filter=blob:none", actual)
+                self.assertEqual(actual[-2], "https://github.com/example/nested.git")
+                actual[-2] = str(repository)
+            result = subprocess.run(actual, capture_output=True, text=True, check=False, timeout=kwargs["timeout"])
+            if "clone" in actual:
+                self.assertFalse((Path(actual[-1]) / "apps").exists())
+            return result
+        payload = {"id": app_id, "repo_url": "https://github.com/example/nested.git", "branch": "main"}
+        with patch.object(manager, "ensure_app_user", return_value="app-nested-project"), \
+                patch.object(manager, "_chown_tree"), patch.object(manager, "_run_as_user", side_effect=run_as_user):
+            with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))):
+                result = manager._dispatch(manager._build_parser().parse_args(["repository-tree"]))
+        self.assertEqual(result, {"ok": True, "directories": [
+            {"path": "", "has_package_json": False},
+            {"path": "apps", "has_package_json": False},
+            {"path": "apps/web", "has_package_json": True},
+            {"path": "apps/web/src", "has_package_json": False},
+            {"path": "backend", "has_package_json": False},
+        ]})
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "Do not touch")
+        self.assertEqual(Path(manager.DEFAULT_REGISTRY_PATH).read_bytes(), before)
+        self.assertEqual(list(Path(manager.DEFAULT_SOURCE_ROOT).iterdir()), [live_source])
+        with patch.object(manager, "ensure_app_user", return_value="app-nested-project"), \
+                patch.object(manager, "_chown_tree"), patch.object(manager, "_run_as_user", return_value=subprocess.CompletedProcess([], 128, "", "remote unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "remote unavailable"):
+                manager.repository_tree(payload)
+        self.assertEqual(list(Path(manager.DEFAULT_SOURCE_ROOT).iterdir()), [live_source])
+
+    def test_repository_tree_ignores_links_and_rejects_unsafe_or_oversized_trees(self):
+        oid = "a" * 40
+        self.assertEqual(manager._repository_directories(
+            f"100644 blob {oid}\tpackage.json\0"
+            f"040000 tree {oid}\tfrontend\0"
+            f"120000 blob {oid}\tfrontend/package.json\0"
+            f"120000 blob {oid}\tlinked\0"
+            f"160000 commit {oid}\tvendor\0"
+        ), [
+            {"path": "", "has_package_json": True},
+            {"path": "frontend", "has_package_json": False},
+        ])
+        for output in (
+            f"040000 tree {oid}\t../escape\0",
+            f"040000 tree {oid}\t/absolute\0",
+            f"040000 tree {oid}\tback\\slash\0",
+            f"040000 tree {oid}\tcontrol\nname\0",
+            f"040000 tree {oid}\t{'deep/' * 32}project\0",
+            f"040000 tree {oid}\t{'x' * 257}\0",
+            f"040000 tree {oid}\tincomplete",
+            "malformed\0",
+            "x" * (2 * 1024 * 1024 + 1),
+            "".join(f"040000 tree {oid}\tfolder-{index}\0" for index in range(1000)),
+        ):
+            with self.subTest(output=output[:100]), self.assertRaises(ValueError):
+                manager._repository_directories(output)
+
+    def test_repository_tree_validates_input_before_running_git(self):
+        payload = {"id": "demo", "repo_url": "https://github.com/example/demo.git", "branch": "main"}
+        with patch.object(manager, "ensure_app_user") as account, patch.object(manager, "_run_as_user") as run:
+            for value in (
+                {**payload, "id": "../demo"}, {**payload, "repo_url": "file:///tmp/repo"},
+                {**payload, "repo_url": "https://user:password@example.com/repo"},
+                {**payload, "branch": "--upload-pack=bad"}, {**payload, "path": "/etc"}, [],
+            ):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    manager.repository_tree(value)
+            with patch.object(sys, "stdin", io.StringIO("x" * 8193)), self.assertRaisesRegex(ValueError, "8 KiB"):
+                manager._dispatch(manager._build_parser().parse_args(["repository-tree"]))
+            account.assert_not_called()
+            run.assert_not_called()
+
     def test_container_only_repositories_and_docker_registration_are_unsupported(self):
         for filename in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
