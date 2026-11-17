@@ -277,7 +277,7 @@
             </div>
             ${renderStatus(observedStatus(app))}
           </header>
-          <div class="am-app-route">${icon("globe")}<code>${escapeHtml(app.route)}</code><span class="am-route-state">${app.nginx_route ? "Nginx snippet available; activation is manual" : "Routing is managed separately"}</span></div>
+          <div class="am-app-route">${icon("globe")}<code>${escapeHtml(app.route)}</code><span class="am-route-state">Public routing is configured separately</span></div>
           <p class="am-repository" title="${escapeHtml(app.repo_url)}">${icon("git-branch")}<span>${escapeHtml(app.repo_url)}</span></p>
           <dl class="am-app-meta">
             <div><dt>Branch</dt><dd>${escapeHtml(app.branch || "main")}</dd></div>
@@ -302,11 +302,11 @@
           ${app.deployment_mode === "approval" && app.pending_update && app.pending_update.commit !== app.deployed_commit ? `<p class="am-route-state">Awaiting approval: <code>${escapeHtml(app.pending_update.commit.slice(0, 7))}</code></p>` : ""}
           ${app.health && (app.health.local_healthy === false || app.health.service_error) ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${escapeHtml(app.health.local_error || app.health.service_error)}</span></p>` : ""}
           ${app.auto_deploy_state?.error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Automatic deployment: ${escapeHtml(app.auto_deploy_state.error)}</span></p>` : ""}
-          ${app.nginx_route_error ? `<p class="am-route-state">Nginx snippet unavailable: ${escapeHtml(app.nginx_route_error)}</p>` : ""}
           ${app.deployments?.[0]?.cleanup_error ? `<p class="am-deploy-error">${icon("circle-alert")}<span>Deployment is live; cleanup needs attention: ${escapeHtml(app.deployments[0].cleanup_error)}</span></p>` : ""}
           ${lastFailure ? `<p class="am-deploy-error">${icon("circle-alert")}<span>${app.status === "running" ? "Latest deployment failed. Previous release is still live." : "Latest deployment failed."} <button type="button" data-action="deployment-log" data-id="${appId}">View log</button></span></p>` : ""}
           <div class="am-app-actions" aria-label="Actions for ${escapeHtml(app.name)}">
             ${deployControl}
+            <button type="button" class="am-button" data-action="how-public" data-id="${appId}"${runtimeUnavailable}>${icon("globe")} How to make public</button>
             <span class="am-action-spacer"></span>
             <button type="button" class="am-button am-icon-button" data-action="environment" data-id="${appId}" title="Environment variables" aria-label="Environment variables for ${escapeHtml(app.name)}"${unavailable}>${icon("key-round")}</button>
             <button type="button" class="am-button am-icon-button" data-action="logs" data-id="${appId}" title="Application logs" aria-label="Logs for ${escapeHtml(app.name)}">${icon("square-terminal")}</button>
@@ -316,7 +316,6 @@
                 ${staticApp ? "" : `<button type="button" data-action="restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart</button>`}
                 <button type="button" data-action="health" data-id="${appId}"${runtimeUnavailable}>${icon("activity")} Check health</button>
                 <button type="button" data-action="preflight" data-id="${appId}"${unavailable}>${icon("search")} Run preflight</button>
-                <button type="button" data-action="nginx-route" data-id="${appId}"${deploying || !app.last_deploy || app.route === "/" ? " disabled data-unavailable" : ""}>${icon("globe")} Nginx route</button>
                 ${app.python_services?.worker ? `<button type="button" data-action="worker-status" data-id="${appId}">${icon("activity")} Worker status</button>
                 <button type="button" data-action="worker-logs" data-id="${appId}">${icon("square-terminal")} Worker logs</button>
                 <button type="button" data-action="worker-restart" data-id="${appId}"${runtimeUnavailable}>${icon("refresh-cw")} Restart worker</button>` : ""}
@@ -403,7 +402,7 @@
       }
       byId(`${provider}Panel`).innerHTML = `
         <div class="am-surface am-manager-landing">
-          <p>Manage ${provider === "portainer" ? "containers in Portainer" : "domains, certificates, and proxy routing in Nginx Proxy Manager"} using its own interface. App Manager does not embed it or access its API or credentials.</p>
+          <p>Manage ${provider === "portainer" ? "containers in Portainer" : "routing in Nginx Proxy Manager"} using its own interface. App Manager does not embed it or access its API or credentials.</p>
           ${address
             ? `<p class="am-manager-address">${escapeHtml(address)}</p><a class="am-button am-button--primary" href="${escapeHtml(address)}" target="_blank" rel="noopener noreferrer">Open ${name} (new tab) ${icon("arrow-up-right")}</a>`
             : `<p role="status">${escapeHtml(message)}</p><button type="button" class="am-button" data-go-settings>Open Settings</button>`}
@@ -461,9 +460,9 @@
         <form id="integrationSettingsForm" class="am-settings-form">
           <div class="am-form-grid">
             <label for="settingPortainerUrl">Portainer browser URL<input id="settingPortainerUrl" name="portainer_url" type="text" inputmode="url" placeholder="/manage-docker/" aria-describedby="integrationAddressHint" value="${escapeHtml(config.integrations?.portainer_url || "")}"></label>
-            <label for="settingNpmUrl">Nginx Proxy Manager browser URL<input id="settingNpmUrl" name="npm_url" type="text" inputmode="url" placeholder="/nginx/" aria-describedby="integrationAddressHint" value="${escapeHtml(config.integrations?.npm_url || "")}"></label>
+            <label for="settingNpmUrl">Nginx Proxy Manager browser URL<input id="settingNpmUrl" name="npm_url" type="text" inputmode="url" placeholder="https://npm.example.com/" aria-describedby="integrationAddressHint" value="${escapeHtml(config.integrations?.npm_url || "")}"></label>
           </div>
-          <p id="integrationAddressHint" class="am-field-hint">Use an absolute HTTP(S) URL reachable from your browser or a root-relative path such as /nginx/. Root-relative paths use the current Cockpit browser origin, including its port. Credentials, queries, fragments, control characters, backslashes, and paths starting with // are not allowed. Trailing slashes are preserved. Leave a URL empty to keep that manager unconfigured. Prefer HTTPS for remote access.</p>
+          <p id="integrationAddressHint" class="am-field-hint">Use an absolute HTTP(S) URL reachable from your browser or a root-relative path such as /manage-docker/. Root-relative paths use the current Cockpit browser origin, including its port. Credentials, queries, fragments, control characters, backslashes, and paths starting with // are not allowed. Trailing slashes are preserved. Leave a URL empty to keep that manager unconfigured. Prefer HTTPS for remote access.</p>
           <div class="am-form-actions"><button type="submit" class="am-button am-button--primary">Save manager URLs</button></div>
         </form>
       </section>
@@ -873,7 +872,7 @@
         <label>Deployment policy<select name="deployment_mode"><option value="automatic"${app.deployment_mode !== "approval" ? " selected" : ""}>Automatic</option><option value="approval"${app.deployment_mode === "approval" ? " selected" : ""}>Approval required</option></select></label>
         <label class="am-checkbox"><input type="checkbox" name="auto_deploy"${app.auto_deploy !== false ? " checked" : ""}> Automatic deployment</label>
       </div>
-      <small class="am-field-hint">Deployment configures the base path and generates an Nginx snippet. Activate it separately in Nginx Proxy Manager; the existing root site is not changed.</small>
+      <small class="am-field-hint">Deployment configures the base path only. After deployment, How to make public shows the connection details and manual routing steps. No web-server configuration is generated or changed.</small>
       <div class="am-project-directory">
         <label for="editAppDirectory">Project directory</label>
         <input id="editAppDirectory" name="app_directory" value="${escapeHtml(app.build_config?.app_directory || "")}" placeholder="Repository root (or apps/web)" autocomplete="off">
@@ -897,7 +896,7 @@
         <label>Model artifact paths (relative to shared/models)<textarea name="model_files" rows="3">${escapeHtml((app.python_services?.model_files || []).join("\n"))}</textarea></label>
         <label>Upload body limit (MiB)<input name="upload_limit_mb" type="number" min="1" max="1024" value="${escapeHtml(app.python_services?.upload_limit_mb ?? 101)}"></label>
       </div></details>
-      <small class="am-field-hint">Configure authentication or access restrictions separately in Nginx Proxy Manager.</small>
+      <small class="am-field-hint">Configure authentication or access restrictions separately in your external reverse proxy.</small>
       <details class="am-advanced"><summary>Deployment schedule (UTC)</summary><div class="am-form-grid">
         <label>Window start<input type="time" name="window_start" value="${escapeHtml(app.deployment_window?.start || "")}"></label>
         <label>Window end<input type="time" name="window_end" value="${escapeHtml(app.deployment_window?.end || "")}"></label>
@@ -1223,6 +1222,12 @@
     }
     const outputState = byId("deploymentOutputState");
     if (outputState) outputState.textContent = result.active ? "Live" : "Finished";
+    const publicationButton = byId("publicationGuideButton");
+    if (publicationButton) {
+      publicationButton.hidden = result.active || result.status !== "deployed";
+      publicationButton.toggleAttribute("data-unavailable", publicationButton.hidden);
+      publicationButton.disabled = publicationButton.hidden || state.busy;
+    }
     const abortButton = byId("abortDeploymentButton");
     if (abortButton) {
       abortButton.hidden = !result.active || result.abortable === false;
@@ -1309,7 +1314,8 @@
     dialog.classList.add("am-dialog--deployment");
     byId("appManagerDialogTitle").insertAdjacentHTML("afterbegin", '<span class="am-deployment-eyebrow">Deployment</span>');
     dialog.querySelector(".am-dialog-footer").insertAdjacentHTML("afterbegin",
-      '<button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort deployment</button>');
+      `<button id="publicationGuideButton" type="button" class="am-button" data-action="how-public" data-id="${escapeHtml(appId)}" hidden data-unavailable>How to make public</button>
+       <button id="abortDeploymentButton" type="button" class="am-button am-button--danger" data-action="abort-deployment" hidden>Abort deployment</button>`);
     state.logTarget = { appId, deploymentId: null };
     byId("copyDeploymentLogButton").addEventListener("click", async (event) => {
       const button = event.currentTarget;
@@ -1482,33 +1488,33 @@
       ${(report.warnings || []).map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}`);
   }
 
-  async function showNginxRoute(app) {
-    const result = await callBackend("nginx-route", [app.id]);
-    if (typeof result.snippet !== "string" || !result.snippet.trim() || typeof result.filename !== "string") {
-      throw new Error("The backend did not return an Nginx route snippet.");
-    }
-    openDialog(`Nginx route: ${app.name}`, `
-      <p>Generated for <code>${escapeHtml(result.route)}</code>. This snippet is not active.</p>
-      <p>In the existing Nginx Proxy Manager proxy host, add it to <strong>Advanced</strong>, replacing only this application's previous snippet. Check for conflicting custom locations, test the configuration, then save/reload through NPM. Keep the root site and other applications unchanged.</p>
-      <p>${isStaticApp(app)
-        ? "NPM must be able to read the generated /opt/webapps content path. React browser navigations fall back to index.html; asset requests must resolve to real files."
-        : "Next.js keeps the prefix upstream; other runtimes receive a stripped path and X-Forwarded-Prefix. Dynamic redeployments can change the port: replace this snippet after every deployment, including automatic deployments."}</p>
-      <p>Vite/CRA and Next.js builds use the base path. Application routers and computed API/asset URLs must also honor it; React Router needs a matching basename.</p>
-      <p>Review access controls and WebSocket settings for these locations; settings on the existing / location do not automatically carry over.</p>
-      <pre id="nginxRouteSnippet" class="am-log-output" tabindex="0" aria-label="Nginx route snippet">${escapeHtml(result.snippet)}</pre>
-      <button id="copyNginxRouteButton" type="button" class="am-button">${icon("copy")} Copy snippet</button>
-      <button id="downloadNginxRouteButton" type="button" class="am-button">${icon("download")} Download .conf</button>
-      <button id="nginxRouteManagerButton" type="button" class="am-button">Nginx Proxy Manager ${icon("arrow-up-right")}</button>`);
-    byId("copyNginxRouteButton").addEventListener("click", () => {
-      void runOperation(() => copyText(result.snippet), "Nginx route snippet copied.", false);
-    });
-    byId("downloadNginxRouteButton").addEventListener("click", () => {
-      try { downloadText(result.snippet, result.filename); } catch (error) { showError(error); }
-    });
-    byId("nginxRouteManagerButton").addEventListener("click", () => {
-      byId("appManagerDialog").close();
-      byId("tab-npm").click();
-    });
+  function showPublicationGuide(app) {
+    const info = app.publication;
+    if (!info) throw new Error("Deploy or redeploy this application to record its connection details, then open How to make public again.");
+    const runtime = info.kind === "runtime";
+    const fields = [
+      ["Public path", info.route],
+      ["Public URL pattern (after routing)", `https://YOUR-DOMAIN${info.route}`],
+      ...(runtime ? [
+        ["Upstream scheme", info.scheme], ["Upstream IP (same host)", info.host], ["Upstream port", info.port],
+        ["Local target", `${info.scheme}://${info.host}:${info.port}${info.upstream_path}`],
+      ] : [["Static content directory", info.content_root], ["Runtime port", "None - static files only"]]),
+    ];
+    openDialog(`How to make public: ${app.name}`, `
+      <p>These are the last successful deployment's details, not a live public URL. App Manager does not create, manage or reload web-server configuration.</p>
+      <dl class="am-settings-paths">${fields.map(([name, value]) => `<div><dt>${escapeHtml(name)}</dt><dd><code>${escapeHtml(value)}</code></dd></div>`).join("")}</dl>
+      <ol>
+        <li>Choose a domain you control and point its DNS or existing tunnel at your reverse proxy. Configure HTTPS there. YOUR-DOMAIN above is a placeholder, not a detected domain.</li>
+        <li>${info.route === "/" ? "Use a separate hostname for this root-path app; do not replace the existing root site or Cockpit route." : `In your existing Nginx server, add a route only for <code>${escapeHtml(info.route)}</code>, including a redirect from the path without its trailing slash. Leave the root site, Cockpit, Portainer and other application routes unchanged.`}</li>
+        <li>${runtime
+          ? `Proxy to the HTTP upstream IP and port above. ${info.route === "/" ? "Forward the root path unchanged." : info.upstream_path === info.route ? "Preserve the application prefix upstream (Next.js basePath)." : "Strip the public prefix before forwarding to this runtime."} Forward Host and X-Forwarded-Proto, and set X-Forwarded-Prefix to the public prefix. Configure the app's trusted-proxy/root-path handling.`
+          : `Serve files from the exact content directory above under the public path, mapping the prefix to that directory. Use index.html for directory indexes. ${info.spa_fallback ? "For React client-side navigation, fall back to this app's index.html; missing assets should return 404." : "Unknown paths should return 404."} Deny dotfiles and never expose the entire repository or environment files.`}</li>
+        <li>Review access controls and WebSocket settings for the new route. Validate and reload through your proxy's normal workflow; for host Nginx, run <code>sudo nginx -t</code> before <code>sudo systemctl reload nginx</code>. App Manager does not run these commands.</li>
+        <li>Visit your domain plus the public path. Check assets, deep links and API requests, then verify the existing root site still works. React Router needs a matching basename; computed API and asset URLs must honor the base path.</li>
+      </ol>
+      <p>${runtime
+        ? "127.0.0.1 is the deployment server, not your browser or an isolated proxy container. A separate/containerized proxy needs administrator-arranged connectivity; do not expose the app port publicly. Redeployment, including automatic updates, can change the port: reopen this guide and update your external route."
+        : "Static builds have no listening IP or port. The web server needs read access to this directory; do not start an unnecessary runtime. Reopen this guide after changing the output directory or application path."}</p>`);
   }
 
   async function showUpdateReview(app) {
@@ -1543,8 +1549,13 @@
       showLogs(appId);
       return;
     }
-    if (action === "nginx-route") {
-      await runOperation(() => showNginxRoute(app), "", false);
+    if (action === "how-public") {
+      await runOperation(async () => {
+        await refreshData();
+        const current = state.apps.find((item) => item.id === appId);
+        if (!current) throw new Error("Application was removed. Refresh and try again.");
+        showPublicationGuide(current);
+      }, "", false);
       return;
     }
     if (["worker-status", "worker-logs", "worker-restart"].includes(action)) {
@@ -1702,9 +1713,9 @@
     if (button) void runOperation(() => viewDeploymentLog(button.dataset.id, button.dataset.deploymentId), "", false);
   });
   byId("appManagerDialog").addEventListener("click", (event) => {
-    const metricsButton = event.target instanceof Element ? event.target.closest('[data-action="metrics"]') : null;
-    if (metricsButton && !metricsButton.disabled && !state.busy) {
-      void handleAppAction("metrics", metricsButton.dataset.id).catch(showError);
+    const infoButton = event.target instanceof Element ? event.target.closest('[data-action="metrics"], [data-action="how-public"]') : null;
+    if (infoButton && !infoButton.disabled && !state.busy) {
+      void handleAppAction(infoButton.dataset.action, infoButton.dataset.id).catch(showError);
     }
     const abortButton = event.target instanceof Element ? event.target.closest('[data-action="abort-deployment"]') : null;
     if (abortButton && !abortButton.disabled) {

@@ -6,12 +6,10 @@ import io
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 import urllib.error
 import urllib.request
@@ -209,9 +207,8 @@ class AppManagerTests(unittest.TestCase):
     def test_external_manager_settings_preserve_browser_paths_and_reject_unsafe_urls(self):
         self.assertEqual(manager.get_settings()["config"]["integrations"], {"portainer_url": "", "npm_url": ""})
         for portainer, npm in (
-            ("/manage-docker/", "/nginx/"),
-            ("https://stuserver.online/portainer/", "https://proxy.example:81/"),
-            ("https://portainer.example:9443/", "/"),
+            ("/manage-docker/", "/manage-nginx/"),
+            ("https://portainer.example:9443/", "https://npm.example.com/"),
             ("", ""),
         ):
             with self.subTest(portainer=portainer, npm=npm):
@@ -343,14 +340,13 @@ class AppManagerTests(unittest.TestCase):
                 self.assertEqual(result["app"]["static_root"], "frontend/site")
                 self.assertTrue(result["app"]["static_export"])
                 self.assertEqual(result["deployment"]["status"], "deployed")
-                self.assertEqual(result["routing"], result["app"]["nginx_route"])
-                if route == "/":
-                    self.assertIsNone(result["routing"])
-                    self.assertIn("root path /", result["routing_error"])
-                else:
-                    self.assertTrue(result["routing"]["activation_required"])
-                    self.assertIn("/current/app/frontend/site", result["routing"]["snippet"])
-                    self.assertIsNone(result["routing_error"])
+                self.assertEqual(result["publication"], result["app"]["publication"])
+                self.assertEqual(result["publication"]["route"], route)
+                self.assertEqual(result["publication"]["kind"], "static")
+                self.assertTrue(result["publication"]["spa_fallback"])
+                self.assertEqual(Path(result["publication"]["content_root"]), paths["current"] / "app" / "frontend" / "site")
+                self.assertNotIn("port", result["publication"])
+                self.assertNotIn("nginx_route", result["app"])
                 self.assertEqual((Path(result["deployment"]["release"]) / "app" / "frontend" / "site" / "index.html").read_text(), "<h1>React release</h1>")
                 self.assertTrue(seal.call_args.kwargs["public"])
                 self.assertIsNone(manager.app_health_url(result["app"]))
@@ -364,166 +360,51 @@ class AppManagerTests(unittest.TestCase):
                     self.assertEqual(environment["CI"], "true")
                     self.assertEqual(environment["npm_config_registry"], "http://127.0.0.1:4873/")
 
-    def test_nginx_route_snippets_scope_static_files_and_proxy_prefixes(self):
+    def test_publication_details_describe_static_exports_and_native_upstreams_without_host_changes(self):
+        app = self.add_app("Music", framework="nextjs", route="/music/")["app"]
         config = manager.get_config()
-        app = self.add_app("Music", framework="react", route="/apps/music/")["app"]
-        app["static_root"] = "frontend/site output"
         with patch.object(manager, "_systemctl") as systemctl, patch.object(manager, "_atomic_json_write") as write:
-            routing = manager._render_nginx_route(app, config)
-        snippet = routing["snippet"]
-        root = manager._app_paths(app["id"], config)["current"] / "app" / app["static_root"]
-        self.assertIn(f'root "{root.as_posix()}";', snippet)
-        self.assertIn("location = /apps/music {", snippet)
-        self.assertIn("return 308 /apps/music/$is_args$args;", snippet)
-        self.assertIn("location ^~ /apps/music/ {", snippet)
-        self.assertIn("rewrite ^/apps/music/(.*)$ /$1 break;", snippet)
-        self.assertIn("try_files $uri/index.html $uri @app_manager_music;", snippet)
-        self.assertIn('if ($http_accept !~* "text/html") { return 404; }', snippet)
-        self.assertIn('if ($uri ~ "(^|/)\\.") { return 404; }', snippet)
-        self.assertNotIn("location / {", snippet)
-        self.assertNotIn("proxy_pass", snippet)
+            for framework in ("nextjs", "node", "go", "python"):
+                info = manager._publication_info(dict(app, framework=framework), config)
+                self.assertEqual(info, {
+                    "kind": "runtime", "route": "/music/", "scheme": "http",
+                    "host": "127.0.0.1", "port": app["port"],
+                    "upstream_path": "/music/" if framework == "nextjs" else "/",
+                })
+            info = manager._publication_info(dict(app, static_export=True, static_root="frontend/out"), config)
+        self.assertEqual(info["kind"], "static")
+        self.assertFalse(info["spa_fallback"])
+        self.assertNotIn("port", info)
+        self.assertEqual(Path(info["content_root"]), manager._app_paths(app["id"], config)["current"] / "app" / "frontend" / "out")
         systemctl.assert_not_called()
         write.assert_not_called()
-        for framework in ("static", "nextjs"):
-            exported = manager._render_nginx_route(dict(app, framework=framework, static_export=True), config)["snippet"]
-            self.assertIn("try_files $uri/index.html $uri =404;", exported)
-            self.assertNotIn("@app_manager_", exported)
-        for framework in ("nextjs", "node", "go", "python"):
-            with self.subTest(framework=framework):
-                dynamic = dict(app, framework=framework, static_export=False)
-                proxy = manager._render_nginx_route(dynamic, config)["snippet"]
-                suffix = "" if framework == "nextjs" else "/"
-                self.assertIn(f"proxy_pass http://127.0.0.1:{app['port']}{suffix};", proxy)
-                self.assertIn("proxy_set_header X-Forwarded-Prefix /apps/music;", proxy)
-                self.assertNotIn("    root ", proxy)
 
-    def test_nginx_route_export_rejects_root_unsafe_paths_and_invalid_ports(self):
-        app = self.add_app(framework="react")["app"]
+    def test_retired_nginx_data_is_ignored_and_export_command_is_removed(self):
         config = manager.get_config()
-        with self.assertRaisesRegex(ValueError, "root path"):
-            manager._render_nginx_route(dict(app, route="/"), config)
-        for path in ("../secrets", "/tmp/output", 'dist/$host', 'dist/"injected', "dist/\n"):
-            with self.subTest(path=path), self.assertRaises(ValueError):
-                manager._render_nginx_route(dict(app, static_root=path), config)
-        for port in (8080, 9000, True, "8100"):
-            with self.subTest(port=port), self.assertRaisesRegex(ValueError, "invalid port"):
-                manager._render_nginx_route(dict(app, framework="node", port=port), config)
-
-    def test_registry_rejects_corrupted_nginx_route_exports(self):
+        config["integrations"]["npm_url"] = "https://proxy.example/"
+        manager._atomic_json_write(Path(manager.DEFAULT_CONFIG_PATH), config)
+        self.assertEqual(manager.get_config()["integrations"]["npm_url"], "https://proxy.example/")
+        result = manager.update_settings({"integrations": {"portainer_url": "/manage-docker/"}})
+        self.assertEqual(result["config"]["integrations"]["npm_url"], "https://proxy.example/")
         app = self.add_app()["app"]
-        for fields in ({"nginx_route": []}, {"nginx_route": {"snippet": 1}}, {"nginx_route_error": {}}):
-            with self.subTest(fields=fields):
-                manager.save_registry({"apps": [dict(app, **fields)]})
-                with self.assertRaisesRegex(ValueError, "Application nginx_route"):
-                    manager.get_registry()
-
-    def test_nginx_route_cli_requires_a_current_matching_deployment_and_is_read_only(self):
-        app = self.add_app(framework="react")["app"]
-        with self.assertRaisesRegex(ValueError, "Deploy this application"):
-            manager.nginx_route_app(app["id"])
-        config = manager.get_config()
-        app.update(static_root="frontend/dist", static_export=True, last_deploy=manager.now_iso())
-        app["nginx_route"] = manager._render_nginx_route(app, config)
-        output = manager._app_paths(app["id"], config)["current"] / "app" / "frontend" / "dist"
-        output.mkdir(parents=True)
-        index = output / "index.html"
-        index.write_text("Ready", encoding="utf-8")
-        manager.save_registry({"apps": [app]})
-        before = Path(manager.DEFAULT_REGISTRY_PATH).read_bytes()
+        app.update(nginx_route={"snippet": "old"}, nginx_route_error="old")
+        self.assertNotIn("nginx_route", manager.app_metadata(app))
+        self.assertNotIn("nginx_route_error", manager.app_metadata(app))
         stdout, stderr = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), patch.object(manager, "_systemctl") as systemctl:
-            self.assertEqual(manager.main(["nginx-route", app["id"]]), 0)
-        self.assertEqual(json.loads(stdout.getvalue()), {"ok": True, **app["nginx_route"]})
-        self.assertEqual(stderr.getvalue(), "")
-        self.assertEqual(Path(manager.DEFAULT_REGISTRY_PATH).read_bytes(), before)
-        systemctl.assert_not_called()
-        index.unlink()
-        with self.assertRaisesRegex(ValueError, "missing index.html"):
-            manager.nginx_route_app(app["id"])
-        index.write_text("Ready", encoding="utf-8")
-        manager.edit_app(app["id"], {"route": "/changed/"})
-        with self.assertRaisesRegex(ValueError, "configuration changed; redeploy"):
-            manager.nginx_route_app(app["id"])
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(manager.main(["nginx-route", app["id"]]), 1)
+        self.assertFalse(json.loads(stdout.getvalue())["ok"])
+        self.assertTrue(stderr.getvalue())
 
-    @unittest.skipUnless(shutil.which("nginx"), "requires an Nginx executable for isolated HTTP checks")
-    def test_nginx_route_serves_assets_directory_indexes_and_spa_without_changing_root(self):
-        app = self.add_app("Music", framework="react", route="/apps/music/")["app"]
-        app["static_root"] = "frontend/dist"
-        content = manager._app_paths(app["id"], manager.get_config())["current"] / "app" / app["static_root"]
-        for filename, value in {
-            "index.html": "<h1>React frontend</h1>",
-            "assets/app.js": "console.log('scoped');",
-            "assets/style.css": "body {color: red}",
-            "guide/index.html": "<h1>Guide</h1>",
-            ".env": "SECRET=not-public",
-        }.items():
-            path = content / filename
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(value, encoding="utf-8")
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            port = reservation.getsockname()[1]
-        prefix = (Path(self.temp_dir.name) / "nginx").resolve()
-        prefix.mkdir()
-        configuration = prefix / "nginx.conf"
-        configuration.write_text(
-            f'pid "{(prefix / "nginx.pid").as_posix()}";\n'
-            f'error_log "{(prefix / "error.log").as_posix()}";\n'
-            "events {}\nhttp {\naccess_log off;\n"
-            "types { text/html html; text/css css; application/javascript js; }\n"
-            + "".join(f'{kind}_temp_path "{(prefix / kind).as_posix()}";\n'
-                      for kind in ("client_body", "proxy", "fastcgi", "uwsgi", "scgi"))
-            + f"server {{ listen 127.0.0.1:{port};\n"
-            "location = / { return 200 'root-site-preserved'; }\n"
-            "location / { return 404; }\n"
-            + manager._render_nginx_route(app, manager.get_config())["snippet"]
-            + "}\n}\n", encoding="utf-8",
-        )
-        command = [shutil.which("nginx"), "-p", prefix.as_posix(), "-c", configuration.as_posix(), "-e", "stderr"]
-        checked = subprocess.run([*command, "-t"], capture_output=True, text=True, timeout=10)
-        self.assertEqual(checked.returncode, 0, checked.stderr)
-        process = subprocess.Popen([*command, "-g", "daemon off; master_process off;"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-        def fetch(path, accept="*/*"):
-            request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"Accept": accept})
-            try:
-                response = opener.open(request, timeout=1)
-            except urllib.error.HTTPError as error:
-                response = error
-            with response:
-                return response.status, response.read().decode(), response.headers
-
-        try:
-            for attempt in range(50):
-                if process.poll() is not None:
-                    self.fail("Isolated Nginx exited: " + process.stderr.read().decode())
-                try:
-                    fetch("/")
-                    break
-                except urllib.error.URLError:
-                    if attempt == 49:
-                        raise
-                    time.sleep(0.1)
-            self.assertEqual(fetch("/")[:2], (200, "root-site-preserved"))
-            self.assertEqual(fetch("/apps/music/")[:2], (200, "<h1>React frontend</h1>"))
-            script = fetch("/apps/music/assets/app.js")
-            self.assertEqual(script[:2], (200, "console.log('scoped');"))
-            self.assertEqual(script[2]["Content-Type"], "application/javascript")
-            self.assertEqual(fetch("/apps/music/assets/style.css")[2]["Content-Type"], "text/css")
-            self.assertEqual(fetch("/apps/music/guide/")[:2], (200, "<h1>Guide</h1>"))
-            self.assertEqual(fetch("/apps/music/player/123?mode=play", "text/html")[:2], (200, "<h1>React frontend</h1>"))
-            self.assertEqual(fetch("/apps/music/assets/missing.js")[0], 404)
-            self.assertEqual(fetch("/apps/music/.env", "text/html")[0], 404)
-            self.assertEqual(fetch("/assets/app.js")[0], 404)
-            self.assertEqual(fetch("/apps/music?keep=1")[0], 200)
-            (content / "index.html").unlink()
-            self.assertEqual(fetch("/apps/music/missing", "text/html")[0], 404)
-        finally:
-            process.terminate()
-            process.communicate(timeout=10)
-
+    def test_registry_validates_deployed_publication_details(self):
+        app = self.add_app(framework="node")["app"]
+        info = manager._publication_info(app, manager.get_config())
+        for value in ([], dict(info, host="0.0.0.0"), dict(info, port=8080), dict(info, port=True),
+                      {"kind": "static", "route": "/", "content_root": str(Path(self.temp_dir.name)), "spa_fallback": False}):
+            with self.subTest(value=value):
+                manager.save_registry({"apps": [dict(app, publication=value)]})
+                with self.assertRaisesRegex(ValueError, "publication"):
+                    manager.get_registry()
 
     def python_payload(self, **overrides):
         payload = self.add_payload("Drums", framework="python", health_check_url="/api/health",
@@ -2658,7 +2539,10 @@ class AppManagerTests(unittest.TestCase):
                 secondary = Path(self.temp_dir.name) / (app["id"] + "-secondary.service")
                 primary.write_text(f"# Managed by Cockpit App Manager\nDescription=Cockpit App Manager - {app['id']}\nUser={app['service_user']}\n", encoding="utf-8")
                 with manager._registry_transaction() as registry:
-                    manager._find_app(registry, app["id"]).update(status="running", deployed_commit="a" * 40)
+                    manager._find_app(registry, app["id"]).update(
+                        status="running", deployed_commit="a" * 40,
+                        publication=manager._publication_info(app, config),
+                    )
                 events = []
                 adapter = Mock()
                 def build(candidate, source, release, **kwargs):
@@ -2703,8 +2587,10 @@ class AppManagerTests(unittest.TestCase):
                         stored = manager._find_app(manager.get_registry(), app["id"])
                         self.assertEqual(stored["service_slot"], "secondary")
                         self.assertEqual(stored["deployed_commit"], "b" * 40)
-                        self.assertIn(f"proxy_pass http://127.0.0.1:{stored['port']};", result["routing"]["snippet"])
-                        self.assertNotIn(f"127.0.0.1:{app['port']};", result["routing"]["snippet"])
+                        self.assertEqual(result["publication"]["port"], stored["port"])
+                        self.assertNotEqual(result["publication"]["port"], app["port"])
+                        manager.edit_app(app["id"], {"route": "/pending-change/"})
+                        self.assertEqual(manager._find_app(manager.get_registry(), app["id"])["publication"]["route"], app["route"])
                         self.assertFalse(paths["source"].exists())
                     else:
                         with self.assertRaisesRegex(RuntimeError, "health check"):
@@ -2714,6 +2600,7 @@ class AppManagerTests(unittest.TestCase):
                         self.assertTrue(primary.exists())
                         self.assertFalse(secondary.exists())
                         self.assertTrue(paths["source"].exists())
+                        self.assertEqual(manager._find_app(manager.get_registry(), app["id"])["publication"]["port"], app["port"])
                     self.assertNotIn("candidate_port", manager._find_app(manager.get_registry(), app["id"]))
 
     def test_alternate_service_slot_cannot_collide_with_an_application_id(self):

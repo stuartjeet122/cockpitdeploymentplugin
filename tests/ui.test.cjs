@@ -369,7 +369,7 @@ test("applications are the initial view without embedded proxy routing actions",
   } finally { ui.dom.window.close(); }
 });
 
-test("external managers have separate native tabs with safe links and no API or credential UI", async () => {
+test("external manager tabs open configured safe links without Nginx automation", async () => {
   const ui = await loadUi({
     settings: { config: { integrations: { portainer_url: "/manage-docker/", npm_url: "https://proxy.example:9443/admin/" } } },
   }, undefined, "https://server.example:9090/cockpit/@host/app-manager/index.html");
@@ -398,6 +398,8 @@ test("external managers have separate native tabs with safe links and no API or 
     assert.equal(ui.document.activeElement.id, "tab-npm");
     assert.equal(ui.document.querySelector("#tab-npm").getAttribute("aria-selected"), "true");
     assert.equal(ui.document.querySelector("#portainer").hidden, true);
+    assert.ok(ui.document.querySelector("#settingNpmUrl"));
+    assert.equal(ui.document.querySelector("[data-action='nginx-route']"), null);
     assert.equal(ui.calls.some((record) => record.command === "integration"), false);
   } finally { ui.dom.window.close(); }
 });
@@ -431,8 +433,8 @@ test("manager settings save browser URLs, preserve root-relative paths, and perm
   });
   try {
     for (const addresses of [
-      { portainer_url: "https://portainer.example:9443/", npm_url: "/nginx/" },
-      { portainer_url: "/manage-docker/", npm_url: "http://proxy.example:81/" },
+      { portainer_url: "https://portainer.example:9443/", npm_url: "/manage-nginx/" },
+      { portainer_url: "/manage-docker/", npm_url: "https://npm.example.com/" },
       { portainer_url: "", npm_url: "" },
     ]) {
       const form = ui.document.querySelector("#integrationSettingsForm");
@@ -467,6 +469,7 @@ test("unsafe manager addresses are neither rendered as links nor saved", async (
   });
   try {
     assert.equal(ui.document.querySelector("#portainerPanel a, #npmPanel a"), null);
+    assert.match(ui.document.querySelector("#portainerPanel").textContent, /URL is invalid/);
     assert.match(ui.document.querySelector("#npmPanel").textContent, /URL is invalid/);
     const form = ui.document.querySelector("#integrationSettingsForm");
     form.elements.portainer_url.value = "";
@@ -1111,62 +1114,63 @@ test("deployment logs can be copied and downloaded as plain text", async () => {
   } finally { ui.dom.window.close(); }
 });
 
-test("Nginx snippets can be read, copied and downloaded without activating host routing", async () => {
-  const snippet = 'location ^~ /portal/ {\n    proxy_pass http://127.0.0.1:8100;\n}\n# <script>not HTML</script>\n';
+test("How to make public uses the latest deployed IP, port and prefix without changing the proxy", async () => {
+  const app = { ...fixtureApps[0], route: "/pending/", port: 8100, publication: {
+    kind: "runtime", scheme: "http", host: "127.0.0.1", port: 8112, route: "/portal/", upstream_path: "/portal/",
+  } };
   const ui = await loadUi({
-    "nginx-route": { route: "/portal/", filename: "app-manager-portal.conf", snippet, activation_required: true },
+    list: { apps: [app] },
   });
-  let copied, downloaded, downloadName;
-  Object.defineProperty(ui.window.navigator, "clipboard", {
-    configurable: true, value: { writeText: async (text) => { copied = text; } },
-  });
-  Object.defineProperty(ui.window.URL, "createObjectURL", {
-    configurable: true, value: (blob) => { downloaded = blob; return "blob:nginx-route"; },
-  });
-  Object.defineProperty(ui.window.URL, "revokeObjectURL", { configurable: true, value: () => {} });
-  ui.window.HTMLAnchorElement.prototype.click = function () { downloadName = this.download; };
   try {
-    ui.document.querySelector('[data-action="nginx-route"][data-id="portal"]').click();
+    ui.document.querySelector('[data-action="how-public"]').click();
     await settle(ui.window);
-    assert.equal(ui.document.querySelector("#nginxRouteSnippet").textContent, snippet);
-    assert.equal(ui.document.querySelector("#nginxRouteSnippet script"), null);
     const body = ui.document.querySelector(".am-dialog-body").textContent;
-    assert.match(body, /not active/);
-    assert.match(body, /existing Nginx Proxy Manager proxy host/);
-    assert.match(body, /after every deployment, including automatic deployments/);
-    ui.document.querySelector("#copyNginxRouteButton").click();
-    await settle(ui.window);
-    assert.equal(copied, snippet);
-    ui.document.querySelector("#downloadNginxRouteButton").click();
-    assert.equal(downloadName, "app-manager-portal.conf");
-    assert.equal(downloaded.type, "text/plain;charset=utf-8");
-    ui.document.querySelector("#nginxRouteManagerButton").click();
-    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
-    assert.equal(ui.document.querySelector("#tab-npm").getAttribute("aria-selected"), "true");
-    assert.deepEqual(ui.calls.filter(call => call.command === "nginx-route").map(call => call.values), [["portal"]]);
-    assert.ok(!ui.calls.some(call => /reload|activate|infrastructure/.test(call.command)));
+    assert.match(body, /http:\/\/127\.0\.0\.1:8112\/portal\//);
+    assert.match(body, /https:\/\/YOUR-DOMAIN\/portal\//);
+    assert.doesNotMatch(body, /8100|\/pending\//);
+    assert.match(body, /Preserve the application prefix upstream/);
+    assert.match(body, /not a live public URL/);
+    assert.match(body, /can change the port/);
+    assert.match(body, /sudo nginx -t/);
+    assert.ok(ui.calls.every(call => ["list", "overview", "settings", "deployments"].includes(call.command)));
   } finally { ui.dom.window.close(); }
 });
 
-test("Nginx route export disables unsafe states and surfaces missing or stale deployment errors", async () => {
+test("How to make public explains static hosting without inventing a runtime port", async () => {
   const ui = await loadUi({
-    list: { apps: [
-      ...fixtureApps,
-      { ...fixtureApps[0], id: "root", route: "/" },
-      { ...fixtureApps[0], id: "busy", status: "deploying" },
-      { ...fixtureApps[0], id: "legacy", framework: "docker" },
-    ] },
-    "nginx-route": { ok: false, error: "Application routing configuration changed; redeploy before exporting its Nginx route" },
+    list: { apps: [{ ...fixtureApps[0], framework: "react", port: 8122, publication: {
+      kind: "static", route: "/portal/", content_root: "/opt/webapps/portal/current/app/frontend/dist", spa_fallback: true,
+    } }] },
+    "deployment-logs": { app_id: "portal", deployment_id: "latest", status: "deployed", active: false, logs: "Done" },
   });
   try {
-    for (const id of ["docs", "root", "busy"]) {
-      assert.equal(ui.document.querySelector(`[data-action="nginx-route"][data-id="${id}"]`).disabled, true, id);
-    }
-    assert.equal(ui.document.querySelector('[data-action="nginx-route"][data-id="legacy"]'), null);
-    ui.document.querySelector('[data-action="nginx-route"][data-id="portal"]').click();
+    ui.document.querySelector('[data-action="how-public"]').click();
     await settle(ui.window);
-    assert.match(ui.document.querySelector("#appManagerError").textContent, /redeploy before exporting/);
-    assert.equal(ui.document.querySelector("#appManagerDialog").open, false);
+    const body = ui.document.querySelector(".am-dialog-body").textContent;
+    assert.match(body, /\/opt\/webapps\/portal\/current\/app\/frontend\/dist/);
+    assert.match(body, /None - static files only/);
+    assert.match(body, /For React client-side navigation/);
+    assert.doesNotMatch(body, /8122|Upstream IP|Proxy to the HTTP upstream/);
+  } finally { ui.dom.window.close(); }
+});
+
+test("publication help is enabled on completed logs, disabled while deploying and explicit for old apps", async () => {
+  const ui = await loadUi({
+    list: { apps: [fixtureApps[0], fixtureApps[1], { ...fixtureApps[0], id: "busy", status: "deploying" }] },
+    deployments: { deployments: [{ app_id: "portal", id: "latest", status: "deployed" }] },
+    "deployment-logs": { app_id: "portal", deployment_id: "latest", status: "deployed", active: false, logs: "Done" },
+  });
+  try {
+    assert.equal(ui.document.querySelector('[data-action="how-public"][data-id="docs"]').disabled, true);
+    assert.equal(ui.document.querySelector('[data-action="how-public"][data-id="busy"]').disabled, true);
+    ui.document.querySelector('#deploymentHistory [data-action="deployment-log"]').click();
+    await settle(ui.window);
+    const button = ui.document.querySelector("#publicationGuideButton");
+    assert.equal(button.hidden, false);
+    assert.equal(button.disabled, false);
+    button.click();
+    await settle(ui.window);
+    assert.match(ui.document.querySelector(".am-dialog-error").textContent, /Deploy or redeploy/);
   } finally { ui.dom.window.close(); }
 });
 

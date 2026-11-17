@@ -122,7 +122,6 @@
         </div>
         <div id="portainerPanel"></div>
       </section>
-
       <section id="npm" class="am-panel tab-panel hidden" role="tabpanel" aria-labelledby="tab-npm" tabindex="0" hidden>
         <div class="am-section-heading">
           <div>
@@ -187,7 +186,7 @@
           <div class="am-form-grid__wide">
             <label for="appRoute">Application path prefix</label>
             <input id="appRoute" required name="route" autocomplete="off" spellcheck="false" placeholder="/customer-portal/ or /" maxlength="256" pattern="/|/([a-z0-9]([a-z0-9\-]{0,62}[a-z0-9])?/)+" />
-            <small class="am-field-hint">Builds use this base path. Deployment generates an Nginx snippet; activate it separately in Nginx Proxy Manager without replacing the existing root site.</small>
+            <small class="am-field-hint">Builds use this base path. After deployment, How to make public shows the connection details and manual routing steps. App Manager does not generate or change web-server configuration.</small>
           </div>
           <div>
             <label for="appHealthCheck">Health-check path</label>
